@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import tarfile
 import threading
 import time
 from collections.abc import Iterator
@@ -23,7 +25,7 @@ from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import REPO, BarePublisher
 from vigild.api.app import create_app
 from vigild.config import RepoPolicy
-from vigild.devimage import DevImages, DockerImages
+from vigild.devimage import DevImages, DockerImages, SessionImages
 from vigild.executors.runtime import DockerRuntime, DockerTestRunner
 from vigild.gateway.app import create_gateway_app
 from vigild.jobs.runner import JobRunner
@@ -59,14 +61,33 @@ def live(
         backends=["claude-haiku"],
         dev_dockerfile="images/dev/fixture.Dockerfile",
         dev_lockfiles=["README.md"],
-        dev_suites={"smoke": "git --version && grep -q fixture README.md"},
-        dev_image_tools=["git", "grep"],
+        dev_suites={"smoke": "git --version && python -m pytest --version"},
+        dev_image_tools=["git", "grep", "python", "pytest"],
     )
     client = docker.from_env()
     ws = Workspace(tmp_path / "work", remote_url=lambda r: str(fixture_repo["bare"]))
     tests = DockerTestRunner(cfg, client)
     images = DevImages(cfg, v.store, DockerImages(client), ws, tests)
     images.ensure_fresh(REPO, ws.head_sha(REPO, "main"))
+    # the session image: the executor layer over the fixture's dev image (round 3)
+    mods = tmp_path / "claude-mods"
+
+    def claude_mods() -> Path:
+        if not mods.exists():
+            src = Path.home() / "Documents" / "claude-mods"
+            tar = tmp_path / "mods.tar"
+            with tar.open("wb") as f:
+                subprocess.run(
+                    ["git", "-C", str(src), "archive", "--format=tar",
+                     cfg.vigild.github.claude_mods_sha],
+                    stdout=f, check=True,
+                )  # fmt: skip
+            mods.mkdir()
+            with tarfile.open(tar) as t:
+                t.extractall(mods, filter="data")
+        return mods
+
+    sessions = SessionImages(images, claude_mods)
     publisher = BarePublisher(ws)
     runner = JobRunner(
         cfg,
@@ -80,6 +101,7 @@ def live(
         images,
         Verifier(ws, tests),
         background=False,
+        session_images=sessions,
     )
     v.services.jobs.runner = runner
     runner.jobs = v.services.jobs
@@ -113,9 +135,12 @@ def test_two_workers_build_in_their_own_containers(
             "title": "Document the rate limit",
             "request": (
                 "Two independent doc edits. (1) Add a line containing the words 'rate limit' to "
-                "docs/feature-map.md. (2) Add a line containing RATE_LIMIT to docs/runbook.md "
-                "saying it is the env var that sets the limit. One worker per file, in parallel, "
-                "each with a grep test command. Keep max_cost_usd at 0.25 per worker."
+                "docs/feature-map.md, with a pytest test tests/test_feature_map.py that reads "
+                "the file and asserts it. (2) Add a line containing RATE_LIMIT to "
+                "docs/runbook.md saying it is the env var that sets the limit, with a pytest "
+                "test tests/test_runbook.py that asserts it. One worker per doc and its test, in "
+                "parallel; each test_cmd is `pytest -q tests/<its test file>`. Keep max_cost_usd "
+                "at 0.25 per worker."
             ),
             "notes": ["keep it to one line per file"],
             "why": "the limit is undocumented",

@@ -87,6 +87,7 @@ COPY --chmod=0555 <<'EOF' /usr/local/bin/vigil-session-prepare
 #!/bin/sh
 set -eu
 for d in . server executor; do
+  [ -d "/work/$d" ] || continue  # a checkout without that package
   [ -e "/work/$d/node_modules" ] || cp -a "/opt/deps/$d/node_modules" "/work/$d/"
 done
 PGDATA=/tmp/pg; export PGDATA
