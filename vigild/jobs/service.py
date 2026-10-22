@@ -26,6 +26,7 @@ from vigild.jobs.artifacts import parse_plan, parse_spec
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.provenance import Provenance
+from vigild.router.rules import RoutingError, route
 
 
 class Runner(Protocol):
@@ -150,6 +151,9 @@ class JobService:
         try:
             task = Task.model_validate(raw)
             self.cfg.repo(task.repo)
+            route(task, self.cfg)  # refuse what can't be routed (rule 2 overrides, policy)
+        except RoutingError as e:
+            raise SubmitError([str(e)]) from e
         except ValidationError as e:
             raise SubmitError(
                 [f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()]

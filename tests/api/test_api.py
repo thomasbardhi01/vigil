@@ -243,3 +243,10 @@ def test_sessions_reads(client: TestClient, tokens: Tokens, store: Store) -> Non
 @pytest.mark.parametrize("path", ["/api/jobs/x/state", "/api/jobs/x/approve"])
 def test_no_backdoor_routes(client: TestClient, tokens: Tokens, path: str) -> None:
     assert client.post(path, headers=auth(tokens.admin)).status_code in (404, 405)
+
+
+def test_money_path_with_local_ok_label_is_refused(client: TestClient, tokens: Tokens) -> None:
+    t = _task(labels=["vigil:local-ok"])
+    t["spec"]["files_in_scope"] = ["src/billing/fee.py"]
+    r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
+    assert r.status_code == 422 and "local-ok" in r.text
