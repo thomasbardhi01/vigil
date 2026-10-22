@@ -24,21 +24,22 @@ These CSS variables are the only colours:
 | `--ink` | `#E8EDF2` | Primary text. |
 | `--dim` | `#6B7580` | Secondary text, borders, idle state. |
 | `--sonar` | `#9FD8F0` | Accent: live activity, links, the selected row, the logo. |
-| `--sonar-2` | `#3A7CA5` | Dark accent: fills, graph bodies, hover. |
+| `--sonar-2` | `#346E93` | Dark accent: fills, graph bodies, hover. |
 | `--warn` | `--ink` text on a `--sonar-2` background | Anything that needs you: cap reached, guard denial, failed, escalated. |
 
 - **Borders** are hairlines only: 1px `--dim` at 30% opacity.
 - **Corners** are never rounded more than 2px.
 - **Icons:** none from icon packs.
 
-**Contrast, measured.** The palette stands as written unless you change
-it.
-- `--dim` on black is 4.48:1, a hair under WCAG AA's 4.5:1 for 12px text.
-  `#707A85` would give about 4.8:1.
-- The warn pair (`--ink` on `--sonar-2`) is about 3.9:1. WCAG AA allows
-  that only for large text (18.7px bold or 24px regular), so 12–13px warn
-  text fails. This is question Q3 in `docs/architecture.md`; until you
-  answer, phase 3 uses the palette as written.
+**Contrast, measured** (owner decision Q3, 2026-10-22). The final hexes:
+`--bg #000000`, `--ink #E8EDF2`, `--dim #6B7580`, `--sonar #9FD8F0`,
+`--sonar-2 #346E93`.
+- `--sonar-2` was `#3A7CA5`, which gave the warn pair (`--ink` on
+  `--sonar-2`) 3.87:1. At `#346E93` it is **4.69:1**, which passes WCAG AA
+  for 12–13px text.
+- `--dim` on black is 4.48:1, a hair under AA; it stays `#6B7580` by the
+  owner's choice.
+- `--sonar` on black is 13.55:1.
 
 ### Type
 
@@ -114,11 +115,26 @@ reference: a shape made of characters that breathes while it's live.
 - **Live data.** There is one stream per page: `GET /api/stream?topics=…`,
   in server-sent events format. The browser's `EventSource` can't send an
   `Authorization` header, so the UI reads the stream with `fetch()` and a
-  roughly 30-line line parser. That keeps one auth mechanism, the bearer
-  token, for everything.
-- **Token.** The UI asks for the token and keeps it in page memory only,
-  so it lasts until the tab is closed or reloaded. It is cleared on a 401.
-  P7 in `docs/architecture.md` would keep it in `localStorage`.
+  roughly 30-line line parser. The session cookie rides along with it.
+- **Login, not a stored token** (P7 is no, owner 2026-10-22). The UI never
+  keeps a token, in storage or in page memory:
+  - The login form posts the admin (or read) token once to
+    `POST /api/login`. vigild answers with a `vigil_session` cookie and the
+    page forgets the token.
+  - The cookie is a random id, stored hashed in vigild: `HttpOnly`,
+    `SameSite=Strict`, `Path=/`, 12 hours, absolute (log in again after).
+  - `Secure` is set when the UI is reached over HTTPS through
+    `tailscale serve` (`api.cookie_secure: true` in `configs/vigild.yaml`).
+    Over plain HTTP on the tailnet it can't be set, because the browser
+    would never send the cookie back; the tailnet's WireGuard encryption is
+    the transport there.
+  - Every write the UI makes carries `X-Vigil-UI: 1`; vigild refuses a
+    cookie-authenticated write without it, so a cross-site form can't
+    write even if a browser ignored SameSite.
+  - On a 401 the UI shows the login form. `POST /api/logout` ends the
+    session.
+- **Where it's served.** The UI binds to the Mac's Tailscale address only,
+  never `0.0.0.0`. The CLI and MCP keep bearer tokens.
 - **A live row pulses** in `--sonar` once per update, for 600 ms.
 - **Keyboard:**
   - `/` focuses the filter.
@@ -325,7 +341,7 @@ the stream's `talk:{id}` topic.
 vigild/web/
   index.html        one shell; routes by path
   app.css           the palette, type and hairlines; nothing else
-  js/api.js         fetch + bearer token + stream reader
+  js/api.js         fetch (session cookie, X-Vigil-UI on writes) + stream reader
   js/glyphs.js      sparkline, bar, timeline, meter, histogram as pure functions over numbers → strings
   js/keys.js        / j k Enter Esc l
   js/pages/*.js     one module per page
