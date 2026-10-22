@@ -169,3 +169,36 @@ def test_issues_read_is_allowed_for_label_intake(app: GitHubApp, fake: FakeGitHu
     app.mint("thomasbardhi01/parkagent", {"issues": "read", "metadata": "read"})
     with pytest.raises(TokenPolicyError):
         app.mint("thomasbardhi01/parkagent", {"issues": "write"})
+
+
+def test_github_adding_metadata_read_is_accepted_but_more_is_revoked(
+    keypair: tuple[bytes, rsa.RSAPublicKey],
+) -> None:
+    extra: dict[str, str] = {"metadata": "read"}
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        if req.url.path.endswith("/installation"):
+            return httpx2.Response(200, json={"id": 1})
+        if req.url.path.endswith("/access_tokens"):
+            body = json.loads(req.content)
+            return httpx2.Response(
+                201,
+                json={
+                    "token": "ghs_y",
+                    "expires_at": "z",
+                    "permissions": {**body["permissions"], **extra},
+                },
+            )
+        return httpx2.Response(204)
+
+    app = GitHubApp(
+        "1",
+        keypair[0],
+        http=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        claude_mods=CLAUDE_MODS,
+        allowed_repos=[],
+    )
+    app.mint_claude_mods()  # contents:read + GitHub's metadata:read is fine
+    extra["contents"] = "write"
+    with pytest.raises(TokenPolicyError, match="revoked"):
+        app.mint_claude_mods()

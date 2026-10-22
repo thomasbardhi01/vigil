@@ -138,7 +138,8 @@ class GitHubApp:
             raise GitHubError(f"minting a token for {repo} failed (HTTP {r.status_code})")
         data = r.json()
         granted = data.get("permissions", {})
-        if granted != dict(permissions):
+        # GitHub adds metadata:read to every token; anything else extra is refused.
+        if {**granted, "metadata": "read"} != {**dict(permissions), "metadata": "read"}:
             self.revoke(data["token"])
             raise TokenPolicyError(f"GitHub granted {granted}, asked {dict(permissions)}; revoked")
         return InstallationToken(repo, granted, data.get("expires_at", ""), data["token"])
