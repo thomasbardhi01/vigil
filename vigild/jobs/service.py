@@ -23,7 +23,7 @@ from vigild.db import Store
 from vigild.devimage import missing_tools
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
-from vigild.intake.spec_gate import check_job_spec, check_task
+from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
@@ -305,6 +305,10 @@ class JobService:
                         "goal": w.goal,
                         "test_cmd": w.test_cmd,
                         "must_fail_first": w.must_fail_first,
+                        # round 3, F1: the spec lets this worker change how tests run
+                        "changes_how_tests_run": runner_files_named(
+                            w.files_in_scope, self.cfg.repo(job.repo).runner_config, w.test_cmd
+                        ),
                         "size": w.size.value,
                         "files_in_scope": w.files_in_scope,
                         "depends_on": w.depends_on,

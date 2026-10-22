@@ -84,6 +84,16 @@ def test_cmd_problem(cmd: str | None) -> str | None:
     return None
 
 
+def runner_files_named(
+    scope: Sequence[str], runner_config: Sequence[str], test_cmd: str
+) -> list[str]:
+    """The literal entries in a worker's scope that decide how tests run."""
+    from vigild.verifier import invoked_scripts
+
+    globs = [*runner_config, *invoked_scripts(test_cmd)]
+    return [f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)]
+
+
 def check_task(task: Task) -> GateResult:
     errors = [
         f"{key} is required before a task can run"

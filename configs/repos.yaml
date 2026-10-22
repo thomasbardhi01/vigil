@@ -58,6 +58,31 @@ repos:
         No Linux container has either. The Linux-runnable ios/Tools node test is
         in `scripts`.
     dev_image_tools: [pnpm, node, npx, uv, python, git, grep, sh, bash, cat, head, tail, wc, diff, test]
+    # What decides how ParkAgent's tests run, read from its tree: the
+    # manifests and lockfiles, the vitest and TypeScript configs, the vitest
+    # setup files, eslint (the lint suites), prisma's config, lefthook, and the
+    # scripts its suites run.
+    runner_config:
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - server/package.json
+      - executor/package.json
+      - "**/vitest*.config.*"
+      - "**/vite.config.*"
+      - "**/tsconfig*.json"
+      - "**/eslint.config.*"
+      - server/test/setup/**
+      - server/prisma7.config.ts
+      - lefthook.yml
+      - scripts/boot-check.sh
+      - scripts/check-city-neutral.sh
+      - scripts/check-feature-map.mjs
+      - scripts/audit.mjs
+      - data/pyproject.toml
+      - data/uv.lock
+      - data/.python-version
+      - "**/conftest.py"
   thomasbardhi01/vigil:
     visibility: private
     decider: [haiku, jev-cloudflare]
@@ -73,3 +98,11 @@ repos:
         The `-m docker` and `-m live` tests start containers and call the model;
         the verifier's container has no Docker socket and no network.
     dev_image_tools: [uv, python, pytest, git, grep, sh, cat, head, tail, wc, diff, test]
+    runner_config:
+      - pyproject.toml
+      - uv.lock
+      - "**/conftest.py"
+      - pytest.ini
+      - setup.cfg
+      - tox.ini
+      - tests/harness.py

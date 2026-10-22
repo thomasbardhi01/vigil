@@ -990,3 +990,58 @@ def test_cancel_a_spec_pending_job(world: World) -> None:  # N6
     r = w.client.post(f"/api/inbox/{item['id']}/abandon", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert w.store.get_job(job).state.value == "abandoned"
+
+
+# --- review round 3, F1: runner config ------------------------------------------------------
+
+
+def test_an_unnamed_runner_config_change_is_rejected(world: World) -> None:
+    w = world
+    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        (spec.clone / "conftest.py").write_text("collect_ignore = ['tests']\n")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.publisher.prs == []
+    item = _failure_item(w, job)
+    assert "changes how tests run" in json.dumps(item["body"])
+
+
+def test_a_named_runner_config_change_is_flagged_and_still_runs_the_base_copy(
+    world: World,
+) -> None:
+    w = world
+    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+
+    def named(j: str) -> tuple[str, str]:
+        sp = SPEC.replace(
+            "- `tests/test_runbook.py`\n", "- `tests/test_runbook.py`\n- `conftest.py`\n"
+        )
+        pl = plan(j).replace(
+            '"tests/test_feature_map.py"\n   ]',
+            '"tests/test_feature_map.py",\n    "conftest.py"\n   ]',
+        )
+        assert "conftest.py" in pl
+        return sp, pl
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            # would hide every test if the verifier ran it
+            (spec.clone / "conftest.py").write_text("collect_ignore_glob = ['*']\n")
+
+    w.standin.coord_drafts = [named]
+    w.standin.worker_edit = edit
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    flags = {x["task_id"]: x["changes_how_tests_run"] for x in item["body"]["workers"]}
+    assert flags == {f"{job}-w1": ["conftest.py"], f"{job}-w2": []}
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
+    assert "changes how tests run" in pr["body"] and "`conftest.py`" in pr["body"]
+    record = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
+    assert record["runner_config"]["pinned_to_base"] == ["conftest.py"]
+    assert record["after"]["outcome"] == "pass" and record["ran"]["ok"]

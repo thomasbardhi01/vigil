@@ -63,6 +63,10 @@ class RepoPolicy(_M):
     dev_lockfiles: list[str] = Field(min_length=1)
     dev_suites: dict[str, str] = Field(min_length=1)
     dev_excluded: dict[str, str] = Field(default_factory=dict)
+    # Files that decide how tests run (round 3, F1): the verifier lays the
+    # base's copies over every run, and a worker's change to one is rejected
+    # unless the approved spec names its exact path. Strict globs.
+    runner_config: list[str] = Field(default_factory=list)
     # Commands a test_cmd may use in the image. A test_cmd that needs anything
     # else is refused at the spec gate (review r1, blocker 4).
     dev_image_tools: list[str]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import secrets
 import shlex
 import shutil
 import socket
@@ -22,7 +23,7 @@ from typing import Any
 from vigild.config import Config
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
-from vigild.verifier import RunResult
+from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
@@ -128,11 +129,41 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
 PREPARE = (
     "if [ -x /usr/local/bin/vigil-prepare ]; then /usr/local/bin/vigil-prepare || exit 125; "
     "else cp -a /src/. /work/ || exit 125; fi; "
-    'cd /work && exec sh -c "$0"'
+    f"mkdir -p {REPORT_DIR}; cd /work; "
+    # round 3, F2: a failure anywhere in a pipe or a list fails the run
+    'bash -o pipefail -o errexit -c "$0"; rc=$?; '
+    # then any JUnit reports, after a per-run marker, over the same stream
+    f'for f in {REPORT_DIR}/*.xml; do [ -f "$f" ] || continue; '
+    'printf "\\n%s %s\\n" "$1" "$(basename "$f")"; '
+    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; exit $rc'
 )
 
 
-def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
+def split_reports(text: str, marker: str) -> tuple[str, dict[str, bytes]]:
+    """The test output, and the reports streamed after it under `marker`."""
+    import base64
+    import binascii
+
+    lines = text.split("\n")
+    out: list[str] = []
+    reports: dict[str, bytes] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(marker + " ") and i + 1 < len(lines):
+            name = line[len(marker) + 1 :].strip()
+            with contextlib.suppress(binascii.Error, ValueError):
+                reports[name] = base64.b64decode(lines[i + 1], validate=True)
+            i += 2
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out), reports
+
+
+def verifier_kwargs(
+    cfg: Config, image: str, source: Path, command: str, marker: str = "VIGIL-REPORT"
+) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
     image, vigild's checkout read-only at /src, no network at all, the agent
     uid with no capabilities, and nothing else mounted. The suites write (build
@@ -143,7 +174,7 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [PREPARE, command],
+        "command": [PREPARE, command, marker],
         "user": f"{uid}:{uid}",
         "network_mode": "none",
         "mounts": [_mount(str(source), "/src", read_only=True)],
@@ -158,6 +189,8 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": "/tmp/pycache",  # noqa: S108
             "NO_COLOR": "1",
+            "PYTEST_ADDOPTS": f"--junitxml={REPORT_DIR}/pytest.xml -p no:cacheprovider",
+            "pnpm_config_verify_deps_before_run": "false",
         },
         "stdin_open": False,
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
@@ -181,7 +214,8 @@ class DockerTestRunner:
     ) -> RunResult:
         import docker.errors
 
-        kw = verifier_kwargs(self.cfg, image, source, command)
+        marker = f"VIGIL-REPORT-{secrets.token_hex(8)}"
+        kw = verifier_kwargs(self.cfg, image, source, command, marker)
         kw["mounts"] = _docker_mounts(kw["mounts"])
         c = self.client.containers.create(**kw)
         timed_out = threading.Event()
@@ -207,10 +241,10 @@ class DockerTestRunner:
             timer.cancel()
             with suppress(docker.errors.APIError):
                 c.remove(force=True)
-        text = bytes(buf).decode(errors="replace")
+        text, reports = split_reports(bytes(buf).decode(errors="replace"), marker)
         if timed_out.is_set():
             return RunResult(None, text, timed_out=True, truncated=seen > max_output)
-        return RunResult(code, text, truncated=seen > max_output)
+        return RunResult(code, text, truncated=seen > max_output, reports=reports)
 
 
 def write_session_files(cfg: Config, spec: SessionSpec) -> None:

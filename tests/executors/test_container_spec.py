@@ -143,5 +143,20 @@ def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
     ]
     assert set(kw["tmpfs"]) == {"/tmp", "/work"} and kw["read_only"] is True
     assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
-    assert kw["command"] == [PREPARE, "pytest -q"]  # test_cmd is an argument, never spliced
+    # test_cmd and the report marker are arguments, never spliced into the script
+    assert kw["command"] == [PREPARE, "pytest -q", "VIGIL-REPORT"]
+    assert "bash -o pipefail -o errexit" in PREPARE
+    assert kw["environment"]["PYTEST_ADDOPTS"].startswith("--junitxml=/tmp/vigil-report/")
     assert kw["mem_limit"] == cfg.vigild.container.verifier_memory
+
+
+def test_reports_are_split_from_the_output() -> None:
+    import base64
+
+    from vigild.executors.runtime import split_reports
+
+    xml = b"<testsuite><testcase classname='t' name='a'/></testsuite>"
+    text = f"line 1\nM-x pytest.xml\n{base64.b64encode(xml).decode()}\nline 2"
+    out, reports = split_reports(text, "M-x")
+    assert out == "line 1\nline 2" and reports == {"pytest.xml": xml}
+    assert split_reports(text, "M-other")[1] == {}  # another run's marker is plain output

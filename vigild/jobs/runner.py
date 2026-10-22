@@ -58,7 +58,7 @@ from vigild.devimage import DevImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
-from vigild.jobs.acceptance import check_worker
+from vigild.jobs.acceptance import check_worker, runner_config_changes
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
@@ -903,8 +903,9 @@ class JobRunner:
                     task_id=task_id,
                     base_sha=base_sha,
                     head=head,
-                    test_cmd=test_cmd,
+                    test_cmd=test_cmd,  # the approved spec's, never the worker's tree
                     must_fail_first=bool(contract["spec"].get("must_fail_first", True)),
+                    runner_config=self.cfg.repo(job.repo).runner_config,
                 )
             except Exception as e:  # docker or git trouble: no verdict, nothing accepted
                 log.exception("verifier failed on %s", task_id)
@@ -937,13 +938,29 @@ class JobRunner:
             report,
             tests,
             cost=session_cost(self.store, s.id),
+            runner_config=self.cfg.repo(job.repo).runner_config,
         )
         if errors:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: stage 3 acceptance failed", {"errors": errors}
             )
+        _, changed_cfg = runner_config_changes(
+            self.workspace,
+            job.repo,
+            base_sha,
+            head,
+            contract,
+            self.cfg.repo(job.repo).runner_config,
+        )
+        runner_note = (
+            "**This task changes how tests run:** "
+            + ", ".join(f"`{p}`" for p in changed_cfg)
+            + ". The spec names each path; the verifier ran the base's copies.\n\n"
+            if changed_cfg
+            else ""
+        )
         body = (
-            f"{report.summary}\n\nJob `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
+            f"{report.summary}\n\n{runner_note}Job `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
             f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
