@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -66,6 +65,7 @@ from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
 from vigild.packets.assemble import assemble_coord, assemble_worker
 from vigild.provenance import Provenance
+from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend
 from vigild.router.rules import RoutingError, route
 from vigild.telemetry.spans import Telemetry
@@ -76,7 +76,6 @@ log = logging.getLogger("vigild.runner")
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
-SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
 MIN_RETRY_USD = 0.05  # less than this left of a task's cap: no retry is offered
@@ -116,17 +115,6 @@ def as_outcome(run: dict[str, Any] | None) -> TestOutcome:
     if got in ("fail", "timeout"):
         return TestOutcome.FAIL
     return TestOutcome.UNKNOWN
-
-
-def redact(value: Any) -> Any:
-    """Drop anything token-shaped from what an executor reports (item 13)."""
-    if isinstance(value, str):
-        return SECRETISH.sub("[redacted]", value)
-    if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v) for v in value]
-    return value
 
 
 class JobRunner:

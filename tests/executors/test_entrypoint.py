@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from vigild.jobs.runner import redact as vigild_redact
+from vigild.redact import redact as vigild_redact
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -185,3 +185,12 @@ def test_the_harness_runs_no_test_and_names_the_head_on_its_result_line(
     assert result["head"] == _run(work, "rev-parse", BRANCH) != "0" * 40
     files = _run(work, "ls-tree", "-r", "--name-only", result["head"]).split()
     assert "b.txt" in files
+
+
+def test_one_redactor_and_the_harness_matches_it() -> None:
+    from vigild.gateway import service
+    from vigild.jobs import runner
+    from vigild.redact import SECRETISH, redact
+
+    assert runner.redact is redact and service.redact is redact
+    assert _entrypoint().SECRETISH.pattern == SECRETISH.pattern

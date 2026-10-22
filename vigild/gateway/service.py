@@ -37,6 +37,7 @@ from vigild.db import Store, iso, utcnow
 from vigild.metering.calls import CallUsage, SSEUsageTap, record_call, usage_from_anthropic
 from vigild.metering.prices import PriceTable
 from vigild.provenance import Provenance
+from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend, check_decider_route
 
 FORWARD_HEADERS = ("anthropic-version", "anthropic-beta", "content-type", "accept")
@@ -355,7 +356,7 @@ class Gateway:
     def _refuse(self, gs: GatewaySession, err: GatewayError) -> GatewayError:
         self.store.add_event(
             "gateway_refused",
-            {"status": err.status, "reason": err.message},
+            redact({"status": err.status, "reason": err.message}),
             Provenance.HUMAN,
             job_id=gs.job_id,
             session_id=gs.session_id,

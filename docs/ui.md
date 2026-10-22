@@ -109,6 +109,9 @@ reference: a shape made of characters that breathes while it's live.
   `--sonar-2` on a 2 s cycle.
 - A stale source (no sample for 10 s) goes still in `--dim`.
 - `prefers-reduced-motion` turns all motion off.
+- **The one exception** is `/watch`'s CRT effects (flicker, scanlines,
+  beam, glow): on that page only, CSS only, off under
+  `prefers-reduced-motion`, and toggled with `f`.
 
 ## Behaviour
 
@@ -116,6 +119,19 @@ reference: a shape made of characters that breathes while it's live.
   in server-sent events format. The browser's `EventSource` can't send an
   `Authorization` header, so the UI reads the stream with `fetch()` and a
   roughly 30-line line parser. The session cookie rides along with it.
+  The UI never polls: a page paints from its GETs once, then the stream
+  keeps it current.
+- **Stream topics.** A page asks only for the topics it shows:
+  - `job` and `job:{id}`: jobs and one job's timeline;
+  - `session`: live sessions and heartbeats;
+  - `summary`: the header-strip numbers (queue, WIP, $ today, rates);
+  - `talk:{id}`: one coordinator's thread;
+  - new for `/watch` (phase 3): `code`, the active worker's latest edit;
+    `events`, every event as it is stored; `tower`, GPU, VRAM, W and slots
+    (empty before phase 5).
+  - Every event and every `code` payload passes through one redactor,
+    `vigild.redact.redact`, the same function the event log and the
+    gateway use, before it is stored or published.
 - **Login, not a stored token** (P7 is no, owner 2026-10-22). The UI never
   keeps a token, in storage or in page memory:
   - The login form posts the admin (or read) token once to
@@ -143,6 +159,8 @@ reference: a shape made of characters that breathes while it's live.
   - `Esc` clears the filter.
   - `x` on `/job/:id` asks to kill the running session.
   - On `/job/:id`, `Enter` on a timeline line expands it.
+  - `f` on `/watch` (only there) turns the CRT effects on and off; the
+    choice isn't saved.
 - **Pages, not overlays.** No modals: detail is a page, and expanding a
   timeline line opens it in place.
 - **Width.** No page scrolls horizontally at 1280px. Long values (branch
@@ -156,8 +174,8 @@ reference: a shape made of characters that breathes while it's live.
 
 ## Pages
 
-These eight pages, and nothing else. The Vigil UI canvas is the visual
-reference for all eight, Talk included. Each page lists the API calls
+These nine pages, and nothing else. The Vigil UI canvas is the visual
+reference for all nine, Talk and Watch included. Each page lists the API calls
 behind it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
 contract, and every session (attempt, review, audit) it has spawned.
 
@@ -335,6 +353,53 @@ coordinators from anywhere").
 `POST /api/coords/{id}/messages`, `POST /api/coords/{id}/backend`, and
 the stream's `talk:{id}` topic.
 
+### 9. `/watch`: Watch
+
+A full-screen ambient display, made to be left open on a screen. The page
+fills the viewport and has no nav chrome. Going fullscreen is the
+browser's own control: the page never calls the Fullscreen API.
+
+**Layout.** A 12-column pane grid. No horizontal scroll at 1280px, and it
+reads well at 1920px and wider (the panes grow; the type doesn't).
+
+| Row | Panes (column span) |
+|---|---|
+| 1–2 | Live code stream (8, two rows tall) · Throughput (4) · Funnel (4) |
+| 3 | Cost burn (4) · Tower meters (4) · Sessions (4) |
+| 4 | Quality strip (12) |
+| 5 | Event log (12) |
+
+**Panes:**
+- **Live code stream:** the active worker's latest edit, from the
+  session proxy (phase 2), with its repo, file path and worker id. It is
+  redacted on the server by `vigild.redact.redact`, the one redactor the
+  event log and the gateway use, before it enters the stream. With no
+  active worker, the last edit stays, in `--dim`.
+- **Throughput:** jobs started and finished, and PRs opened and merged,
+  per hour, as sparklines.
+- **Funnel:** the count of jobs in each state, `spec_pending` through
+  `done`, as bars.
+- **Cost burn:** $ per hour, and today against the daily cap as a bar.
+- **Tower meters:** GPU, VRAM, W and slots; `—` before phase 5, as
+  everywhere.
+- **Sessions:** a compact `/sessions`: one line per live session.
+- **Quality strip:** the KPIs: first-pass merge rate, findings per PR by
+  severity, revert + fix-job rate, cost per merged PR, median spec→merge.
+- **Event log:** a tail of the event stream.
+
+**CRT effects** (flicker, scanlines, beam, glow), on this page only:
+- CSS only: no `<canvas>`, no SVG, no library, as everywhere.
+- Off under `prefers-reduced-motion`.
+- `f` toggles them; the toggle isn't saved.
+
+**API:** the same API as every page. First paint from `GET /api/summary`,
+`GET /api/tasks`, `GET /api/sessions?live=1` and `GET /api/budgets`; then
+one stream, `GET /api/stream?topics=code,summary,session,events,tower`.
+No polling. The 100 KB page-weight limit applies.
+
+**Depends on:** the phase 2 session proxy (the code stream) and phase 2
+review data (the quality strip's findings); tower meters wait for phase 5.
+
 ## Files
 
 ```text
@@ -343,7 +408,7 @@ vigild/web/
   app.css           the palette, type and hairlines; nothing else
   js/api.js         fetch (session cookie, X-Vigil-UI on writes) + stream reader
   js/glyphs.js      sparkline, bar, timeline, meter, histogram as pure functions over numbers → strings
-  js/keys.js        / j k Enter Esc l
+  js/keys.js        / j k Enter Esc l, and f on /watch
   js/pages/*.js     one module per page
   assets/mark.txt   the logo, both sizes
 ```
@@ -359,4 +424,10 @@ string.
 - `/metrics` shows its counters.
 - Each page is under 100 KB, with no horizontal scroll at 1280px.
 - `/`, `j`, `k` and `Enter` work.
-- The PR includes a screenshot of each of the eight pages.
+- The PR includes a screenshot of each of the nine pages.
+- `/watch` (`tests/web/test_watch.py`):
+  - a secret-shaped string planted in a worker's edit never reaches the
+    `code` topic;
+  - under `prefers-reduced-motion` the CRT effects are off;
+  - after first paint the page makes no request but its one stream (no
+    polling).

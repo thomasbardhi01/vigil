@@ -60,7 +60,7 @@ Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built
 | --- | --- | --- |
 | `vigild` (orchestrator) | Mac mini, native under launchd | Task queue, dependency graph, routing, backends, budgets, metering, container lifecycle, status issue, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `vigil run`, `vigil ls`, `vigil trace`, `vigil kill`; the same calls exposed as MCP tools so a Claude Code session can dispatch |
-| Web UI | served by `vigild`, Tailscale only | Eight pages (board, job detail, sessions, decider, review, new session, budget, talk) per `docs/ui.md`; same API as the CLI and MCP |
+| Web UI | served by `vigild`, Tailscale only | Nine pages (board, job detail, sessions, decider, review, new session, budget, talk, watch) per `docs/ui.md`; same API as the CLI and MCP |
 | Claude executor | Mac mini, one container per task | Claude Agent SDK, headless, a per-session gateway token (no provider key, no GitHub token), guard plugin, OTel on |
 | OpenCode executor | Mac mini, one container per task | `opencode serve` (v2) + the task's clone, pointed at the session's backend |
 | `llama-server` | tower host (GPU) | Qwen3.6-35B-A3B main, gpt-oss-20b for small jobs, LFM2.5 decider; 2 slots |
@@ -330,7 +330,7 @@ A local backend is still allowed only on shapes at trust rung 3.
 - **Parallel writers only with disjoint files and pinned interfaces in `spec.md`.** The spec gate checks the disjointness: two workers with no `depends_on` path between them may not share a file, and parallel workers need a `## Interfaces` section.
 - **Escalation forks full context.** An escalated attempt starts from the failed attempt's whole context, not a summary (phase 2, with escalation).
 - **A per-repo knowledge base** (code map, lessons store, search subagent): phase 2.
-- **A pinned dev image per repo, validated nightly, with dispatch refused on a stale image: phase 1.**
+- **A dev image per repo, built by vigild from the repo's lockfiles when they change and validated by running its suites offline, with dispatch refused on a stale or failed image: phase 1** (owner direction, review round 2; this replaced the nightly validation).
 - **KPIs drive the ladder, routing and the cost model:** first-pass merge rate, findings per PR by severity, revert + fix-job rate, cost per merged PR, median spec→merge. They are defined now and their raw data is stored now; each is computed where data exists.
 - **`ask_coord` in the worker packet: phase 1.** A blocked worker asks its coord instead of guessing; the question also lands in your inbox.
 
@@ -596,8 +596,8 @@ Phoenix ingests OTLP over HTTP (`/v1/traces`) and keeps traces in SQLite under i
 Tool content is off by default; the Claude tier turns on `OTEL_LOG_TOOL_DETAILS=1` so commands and file paths show, and `OTEL_LOG_TOOL_CONTENT=1` only for the reviewer, whose inputs are a diff you already own. Prompts are logged for both tiers because you own the repos.
 
 **Web UI.** Phoenix's trace view is the drill-down. The fleet view is `vigild`'s own web UI (phase 3), specified in `docs/ui.md`:
-- these eight pages and nothing else: board, job detail, sessions, decider, review ladder, new session, budget, talk;
-- the Vigil UI canvas is the visual reference for all eight, Talk included;
+- these nine pages and nothing else: board, job detail, sessions, decider, review ladder, new session, budget, talk, watch (a full-screen ambient display; owner direction, 2026-10-22);
+- the Vigil UI canvas is the visual reference for all nine, Talk and Watch included;
 - plain HTML, CSS and a little vanilla JS, with no build step;
 - served on Tailscale only, from the same API as the CLI and MCP server.
 
