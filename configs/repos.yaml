@@ -83,6 +83,8 @@ repos:
       - data/uv.lock
       - data/.python-version
       - "**/conftest.py"
+      - "**/.npmrc"
+      - "**/node_modules/**"
   thomasbardhi01/vigil:
     visibility: private
     decider: [haiku, jev-cloudflare]
@@ -106,3 +108,8 @@ repos:
       - setup.cfg
       - tox.ini
       - tests/harness.py
+      - pytest.toml
+      - .pytest.toml
+      - .pytest.ini
+      - uv.toml
+      - .python-version

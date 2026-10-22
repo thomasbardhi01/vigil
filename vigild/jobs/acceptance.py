@@ -109,6 +109,12 @@ def check_worker(
 ) -> list[str]:
     spec = contract["spec"]
     errors: list[str] = []
+    vendored = sorted(
+        p for _, p in ws.changed(repo, base_sha, head) if "node_modules" in p.split("/")
+    )
+    if vendored:
+        # round 4, item 5: installed packages are the image's, never the worker's
+        errors.append(f"node_modules is never committed: {vendored[:20]}")
     refused, _ = runner_config_changes(ws, repo, base_sha, head, contract, runner_config)
     if refused:
         errors.append(

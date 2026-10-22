@@ -464,3 +464,23 @@ def test_with_no_report_at_base_or_before_what_ran_is_unknown(
     }
     errors = check_tests({"test_cmd": "x", "must_fail_first": True}, rec)
     assert any("can't be compared" in e for e in errors), errors
+
+
+# --- review round 4, item 5: runner-config gaps --------------------------------------------
+
+
+def test_a_root_pytest_toml_cannot_change_how_tests_run(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        _turn_on(c)
+        (c / "tests" / "test_old.py").write_text(
+            "def test_old():\n    assert 1 + 1 == 3\n\n\ndef test_old_2():\n    assert True\n"
+        )
+        (c / "pytest.toml").write_text(
+            '[pytest]\naddopts = ["--deselect", "tests/test_old.py::test_old"]\n'
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    vigil = __import__("vigild.config", fromlist=["load"]).load().repo("thomasbardhi01/vigil")
+    rec = _verify(ws, base, head, config=list(vigil.runner_config))
+    assert "pytest.toml" in rec["runner_config"]["pinned_to_base"]
+    assert rec["after"]["outcome"] == "fail"  # the regression is still run

@@ -232,3 +232,36 @@ def test_source_files_are_not_tests() -> None:
 
     for path in ("server/src/app.ts", "src/testing_utils.py", "docs/test-plan.md"):
         assert not TEST_FILE.search(path), path
+
+
+def test_committed_node_modules_are_rejected_outright(ws: Workspace, tmp_path: Path) -> None:
+    """Round 4, item 5: a committed node_modules/.bin/vitest would run instead
+    of the real one; nothing under node_modules is ever accepted, named or not."""
+
+    def edit(c: Path) -> None:
+        (c / "node_modules" / ".bin").mkdir(parents=True)
+        (c / "node_modules" / ".bin" / "vitest").write_text("#!/bin/sh\nexit 0\n")
+
+    base, head = _result(ws, tmp_path, edit)
+    named = _with(CONTRACT, ["docs/feature-map.md", "node_modules/.bin/vitest"])
+    errors = check_worker(ws, REPO, base, head, named, _report(), TESTS_OK, cost=0.1)
+    assert any("node_modules" in e and "never" in e for e in errors), errors
+
+
+def test_repo_runner_config_covers_the_round4_gaps() -> None:
+    from vigild import config
+    from vigild.intake.paths import in_scope
+
+    cfg = config.load()
+    vigil = cfg.repo("thomasbardhi01/vigil").runner_config
+    for f in ("pytest.toml", ".pytest.toml", ".pytest.ini", "uv.toml", ".python-version"):
+        assert in_scope(f, vigil), f
+    pa = cfg.repo("thomasbardhi01/parkagent").runner_config
+    for f in (
+        ".npmrc",
+        "server/.npmrc",
+        "node_modules/.bin/vitest",
+        "server/node_modules/vitest/index.js",
+        "server/test/setup/reasonsGate.ts",
+    ):
+        assert in_scope(f, pa), f
