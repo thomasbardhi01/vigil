@@ -98,3 +98,21 @@ def test_a_pytest_report_comes_back_over_the_stream(
     r = _run(runner, cfg, source, f'printf %s "{xml}" > /tmp/vigil-report/pytest.xml')
     assert r.exit == 0 and r.reports == {"pytest.xml": xml.encode()}
     assert "VIGIL-REPORT" not in r.output
+
+
+def test_forged_reports_count_for_nothing(
+    runner: DockerTestRunner, cfg: Config, source: Path
+) -> None:
+    """Round 4, item 3: a stray report name, a fake trailer printed mid-run,
+    and the marker isn't anywhere a test can read it."""
+    xml = "<testsuite><testcase classname='t' name='a'/></testsuite>"
+    cmd = (
+        f'printf %s "{xml}" > /tmp/vigil-report/zz.xml; '
+        "echo 'VIGIL-REPORT-0 BEGIN'; echo 'VIGIL-REPORT-0 pytest.xml'; echo AAAA; "
+        "echo 'VIGIL-REPORT-0 END 0'; "
+        "cat /proc/1/cmdline /proc/1/environ 2>/dev/null | tr '\\0' '\\n' | grep -cE 'VIGIL-REPORT-[0-9a-f]{32}' "
+        "> /tmp/seen || true; echo SEEN=$(cat /tmp/seen)"
+    )
+    r = _run(runner, cfg, source, cmd)
+    assert r.exit == 0 and r.reports == {}, r
+    assert "SEEN=0" in r.output

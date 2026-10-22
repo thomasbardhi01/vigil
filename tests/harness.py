@@ -128,6 +128,8 @@ class LocalTestRunner:
             )
         except subprocess.TimeoutExpired:
             return RunResult(None, "", timed_out=True)
-        found = {f.name: f.read_bytes() for f in reports.glob("*.xml")}
+        from vigild.executors.runtime import REPORT_NAME
+
+        found = {f.name: f.read_bytes() for f in reports.glob("*.xml") if REPORT_NAME.match(f.name)}
         shutil.rmtree(reports, ignore_errors=True)
         return RunResult(p.returncode, (p.stdout + p.stderr)[-max_output:], reports=found)

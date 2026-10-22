@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import secrets
 import shlex
 import shutil
@@ -127,44 +128,59 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
 # into /work with the dependencies it installed, and starts what the suites
 # need (a database on loopback); an image without one gets a plain copy.
 # Exit 125 means the tree couldn't be prepared: the outcome is `unknown`.
+# The verifier's container script (rounds 2-4). The per-run marker arrives on
+# stdin and stdin is closed before anything else runs, so the marker is in no
+# argv, environment or file a test can read. The checkout is prepared (exit 125
+# means it couldn't be: `unknown`), test_cmd runs under pipefail and errexit,
+# and then one trailer: BEGIN, each expected report (pytest.xml, vitest-N.xml)
+# in base64, and END with the exit code. vigild accepts reports only from a
+# trailer that ends the stream.
 PREPARE = (
+    "read -r m || exit 125; exec </dev/null; "
     "if [ -x /usr/local/bin/vigil-prepare ]; then /usr/local/bin/vigil-prepare || exit 125; "
     "else cp -a /src/. /work/ || exit 125; fi; "
     f"mkdir -p {REPORT_DIR}; cd /work; "
-    # round 3, F2: a failure anywhere in a pipe or a list fails the run
     'bash -o pipefail -o errexit -c "$0"; rc=$?; '
-    # then any JUnit reports, after a per-run marker, over the same stream
-    f'for f in {REPORT_DIR}/*.xml; do [ -f "$f" ] || continue; '
-    'printf "\\n%s %s\\n" "$1" "$(basename "$f")"; '
-    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; exit $rc'
+    'printf "\\n%s BEGIN\\n" "$m"; '
+    f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
+    '[ -f "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
+    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
+    'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
 )
+REPORT_NAME = re.compile(r"^(pytest|vitest-[0-9]{1,3})\.xml$")
 
 
 def split_reports(text: str, marker: str) -> tuple[str, dict[str, bytes]]:
-    """The test output, and the reports streamed after it under `marker`."""
+    """The test output, and the reports from the trailer that ends it (round
+    4, item 3). A marker block anywhere else, a trailer that isn't last, or a
+    report name the script doesn't write, counts for nothing."""
     import base64
     import binascii
 
-    lines = text.split("\n")
-    out: list[str] = []
+    lines = text.rstrip("\n").split("\n")
+    if not lines or not lines[-1].startswith(f"{marker} END "):
+        return text, {}
+    begin = f"{marker} BEGIN"
+    starts = [i for i, line in enumerate(lines) if line == begin]
+    if not starts:
+        return text, {}
+    k = starts[-1]
+    body = lines[k + 1 : -1]
     reports: dict[str, bytes] = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith(marker + " ") and i + 1 < len(lines):
-            name = line[len(marker) + 1 :].strip()
+    if len(body) % 2:
+        return text, {}
+    for name_line, data in zip(body[0::2], body[1::2], strict=True):
+        if not name_line.startswith(marker + " "):
+            return text, {}
+        name = name_line[len(marker) + 1 :].strip()
+        if REPORT_NAME.match(name):
             with contextlib.suppress(binascii.Error, ValueError):
-                reports[name] = base64.b64decode(lines[i + 1], validate=True)
-            i += 2
-            continue
-        out.append(line)
-        i += 1
-    return "\n".join(out), reports
+                reports[name] = base64.b64decode(data, validate=True)
+    out = "\n".join(lines[:k])
+    return (out[:-1] if out.endswith("\n") else out), reports
 
 
-def verifier_kwargs(
-    cfg: Config, image: str, source: Path, command: str, marker: str = "VIGIL-REPORT"
-) -> dict[str, Any]:
+def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
     image, vigild's checkout read-only at /src, no network at all, the agent
     uid with no capabilities, and nothing else mounted. The suites write (build
@@ -175,7 +191,7 @@ def verifier_kwargs(
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [PREPARE, command, marker],
+        "command": [PREPARE, command],
         "user": f"{uid}:{uid}",
         "network_mode": "none",
         "mounts": [_mount(str(source), "/src", read_only=True)],
@@ -193,7 +209,7 @@ def verifier_kwargs(
             "PYTEST_ADDOPTS": f"--junitxml={REPORT_DIR}/pytest.xml -p no:cacheprovider",
             "pnpm_config_verify_deps_before_run": "false",
         },
-        "stdin_open": False,
+        "stdin_open": True,  # the report marker, then closed
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
         **_hardening(cfg),
         "mem_limit": cfg.vigild.container.verifier_memory,
@@ -223,8 +239,8 @@ class DockerTestRunner:
     ) -> RunResult:
         import docker.errors
 
-        marker = f"VIGIL-REPORT-{secrets.token_hex(8)}"
-        kw = verifier_kwargs(self.cfg, image, source, command, marker)
+        marker = f"VIGIL-REPORT-{secrets.token_hex(16)}"
+        kw = verifier_kwargs(self.cfg, image, source, command)
         kw["mounts"] = _docker_mounts(kw["mounts"])
         c = self.client.containers.create(**kw)
         timed_out = threading.Event()
@@ -238,7 +254,13 @@ class DockerTestRunner:
         buf = bytearray()
         seen = 0
         try:
+            sock = c.attach_socket(params={"stdin": 1, "stream": 1})
             c.start()
+            raw = getattr(sock, "_sock", sock)
+            raw.sendall((marker + "\n").encode())
+            with suppress(OSError):
+                raw.shutdown(socket.SHUT_WR)
+            sock.close()
             timer.start()
             for chunk in c.logs(stream=True, follow=True, stdout=True, stderr=True):
                 seen += len(chunk)

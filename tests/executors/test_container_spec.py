@@ -144,23 +144,33 @@ def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
     ]
     assert set(kw["tmpfs"]) == {"/tmp", "/work"} and kw["read_only"] is True
     assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
-    # test_cmd and the report marker are arguments, never spliced into the script
-    assert kw["command"] == [PREPARE, "pytest -q", "VIGIL-REPORT"]
+    # test_cmd is an argument, never spliced; the report marker comes on stdin
+    assert kw["command"] == [PREPARE, "pytest -q"] and kw["stdin_open"] is True
+    assert PREPARE.startswith("read -r m || exit 125; exec </dev/null;")
     assert "bash -o pipefail -o errexit" in PREPARE
     assert kw["environment"]["PYTEST_ADDOPTS"].startswith("--junitxml=/tmp/vigil-report/")
     assert kw["mem_limit"] == cfg.vigild.container.verifier_memory
 
 
-def test_reports_are_split_from_the_output() -> None:
+def test_reports_come_only_from_the_final_trailer() -> None:  # round 4, item 3
     import base64
 
     from vigild.executors.runtime import split_reports
 
+    m = "VIGIL-REPORT-abc"
     xml = b"<testsuite><testcase classname='t' name='a'/></testsuite>"
-    text = f"line 1\nM-x pytest.xml\n{base64.b64encode(xml).decode()}\nline 2"
-    out, reports = split_reports(text, "M-x")
-    assert out == "line 1\nline 2" and reports == {"pytest.xml": xml}
-    assert split_reports(text, "M-other")[1] == {}  # another run's marker is plain output
+    b64 = base64.b64encode(xml).decode()
+    real = f"line 1\nline 2\n\n{m} BEGIN\n{m} pytest.xml\n{b64}\n{m} zz.xml\n{b64}\n{m} END 0\n"
+    out, reports = split_reports(real, m)
+    assert out == "line 1\nline 2" and reports == {"pytest.xml": xml}  # zz.xml dropped
+    # a block printed mid-output, before more output: plain output
+    fake = f"{m} BEGIN\n{m} pytest.xml\n{b64}\n{m} END 0\nmore output\n"
+    assert split_reports(fake, m)[1] == {}
+    # a test that prints a fake trailer early doesn't displace the real one
+    both = f"{m} BEGIN\n{m} vitest-1.xml\n{b64}\n{m} END 0\n" + real
+    assert split_reports(both, m)[1] == {"pytest.xml": xml}
+    # another run's marker, or none at all: no reports
+    assert split_reports(real, "VIGIL-REPORT-other")[1] == {}
 
 
 def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> None:
@@ -173,7 +183,17 @@ def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> N
 
     live, peak, lock = [0], [0], threading.Lock()
 
+    class Sock:
+        def sendall(self, data: bytes) -> None: ...
+
+        def shutdown(self, how: int) -> None: ...
+
+        def close(self) -> None: ...
+
     class Container:
+        def attach_socket(self, **kw: object) -> Sock:
+            return Sock()
+
         def start(self) -> None:
             with lock:
                 live[0] += 1
