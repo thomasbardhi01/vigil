@@ -364,3 +364,63 @@ def test_runner_exits_that_are_not_test_results(
     cmd: str, code: int, output: str, want: str
 ) -> None:
     assert judge(cmd, code, False, output) == want
+
+
+# --- review round 4, item 1: a report with failures is a fail, whatever the exit ----------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pytest -q tests && echo ok; echo done",
+        "! pytest -q tests",
+        "if pytest -q tests; then :; fi",
+        "set +e; pytest -q tests; true",
+        'trap "exit 0" EXIT; pytest -q tests',
+    ],
+)
+def test_errexit_exempt_forms_cannot_hide_a_failing_test(
+    ws: Workspace, tmp_path: Path, cmd: str
+) -> None:
+    def edit(c: Path) -> None:
+        _turn_on(c)
+        (c / "tests" / "test_old.py").write_text(
+            "def test_old():\n    assert 1 + 1 == 3\n\n\ndef test_old_2():\n    assert True\n"
+        )  # a regression in an existing test
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, cmd, mff=False)
+    assert rec["after"]["outcome"] == "fail", rec["after"]
+
+
+@pytest.mark.parametrize(
+    ("cmd", "scripts"),
+    [
+        ("uv run --offline pytest -q tests/test_new.py", []),  # the reviewer's example
+        ("pytest -q tests/test_new.py", []),
+        ("python -m pytest tests/test_a.py", []),
+        ("sh run_tests.sh", ["run_tests.sh"]),
+        ("bash -e scripts/check.sh", ["scripts/check.sh"]),
+        ("python tools/check.py --strict", ["tools/check.py"]),
+        ("node scripts/check.mjs", ["scripts/check.mjs"]),
+        ("./scripts/check-city-neutral.sh", ["scripts/check-city-neutral.sh"]),
+        ("uv run tools/check.py", ["tools/check.py"]),
+        ("uv run python tools/check.py", ["tools/check.py"]),
+        ("cd server && pnpm test", []),
+    ],
+)
+def test_only_programs_and_interpreter_scripts_are_invoked_scripts(
+    cmd: str, scripts: list[str]
+) -> None:  # round 4, item 2
+    from vigild.verifier import invoked_scripts
+
+    assert invoked_scripts(cmd) == scripts
+
+
+def test_a_new_test_named_on_the_command_line_is_not_pinned_away(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    base, head = _session(ws, tmp_path, _turn_on)
+    rec = _verify(ws, base, head, "pytest -q tests/test_flag.py")
+    assert rec["runner_config"]["pinned_to_base"] == []
+    assert rec["after"]["outcome"] == "pass" and rec["before"]["outcome"] == "fail"

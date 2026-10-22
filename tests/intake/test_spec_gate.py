@@ -440,3 +440,17 @@ def test_a_reporting_runner_is_accepted(cmd: str) -> None:
     from vigild.verifier import can_report
 
     assert can_report(cmd), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "! pytest -q",
+        "if pytest -q; then :; fi",
+        "set +e; pytest -q",
+        'trap "exit 0" EXIT; pytest -q',
+        "while pytest -q; do :; done",
+    ],
+)
+def test_control_flow_that_hides_an_exit_is_refused(cmd: str) -> None:  # round 4, item 1
+    assert bad_test_cmd(cmd), cmd

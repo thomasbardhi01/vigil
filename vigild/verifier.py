@@ -107,25 +107,45 @@ def judge(test_cmd: str, code: int | None, timed_out: bool, output: str) -> str:
     return got
 
 
+def _script(words: list[str]) -> str:
+    """The repo file a command runs as its program, if any: the program
+    itself when it's a relative path, or an interpreter's script argument.
+    Never a test runner's arguments (round 4, item 2)."""
+    if not words:
+        return ""
+    prog, rest = words[0], words[1:]
+    base = prog.rsplit("/", 1)[-1]
+    if "/" in prog and not prog.startswith("/") and base not in INTERPRETERS:
+        return prog
+    if base in INTERPRETERS:
+        for a in rest:
+            if a in ("-c", "-m"):
+                return ""  # code or a module, not a file
+            if not a.startswith("-"):
+                return a
+        return ""
+    if base == "uv" and rest[:1] == ["run"]:
+        args = [a for a in rest[1:] if not a.startswith("-")]
+        if args and args[0].endswith((".py", ".sh")):
+            return args[0]
+        return _script(args)  # `uv run python x.py`; `uv run pytest …` names no script
+    if base == "make":
+        return "Makefile"
+    return ""
+
+
 def invoked_scripts(test_cmd: str) -> list[str]:
     """Repo files `test_cmd` runs as programs: `./x.sh`, `sh run_tests.sh`,
     `python tools/check.py`, `uv run x.py`, a Makefile. Arguments to a test
-    runner (`pytest tests/test_a.py`) are tests, not runner config."""
+    runner (`pytest tests/test_a.py`, `uv run pytest tests/test_a.py`) are
+    tests, not runner config."""
     out: list[str] = []
     for c in parse(test_cmd).commands:
-        words = [c.program, *c.args] if c.program else []
-        if not words:
-            continue
-        first = next((w for w in c.words if w.rsplit("/", 1)[-1] == c.program), "")
-        if "/" in first and not first.startswith("/"):
-            out.append(first)
-        script = ""
-        if c.program in INTERPRETERS and "-c" not in c.args and "-m" not in c.args:
-            script = next((a for a in c.args if not a.startswith("-")), "")
-        elif c.program == "uv" and c.args[:1] == ("run",):
-            script = next((a for a in c.args[1:] if a.endswith((".py", ".sh"))), "")
-        elif c.program == "make":
-            script = "Makefile"
+        script = _script([c.program, *c.args] if c.program else [])
+        if not script:
+            first = next((w for w in c.words if w.rsplit("/", 1)[-1] == c.program), "")
+            if "/" in first and not first.startswith("/"):
+                script = first
         if script and not script.startswith("/"):
             out.append(script)
     return sorted({p.removeprefix("./") for p in out})
@@ -400,6 +420,12 @@ class Verifier:
         if r.reports and not cases and got == "pass":
             out["outcome"] = "unknown"  # exit 0 with no test run is not a pass (round 3)
             out["note"] = "the report lists no tests"
+        failing = [c.id for c in cases if c.status in ("failure", "error")]
+        if failing and got == "pass":
+            # round 4, item 1: `! pytest`, `if pytest; …`, `set +e`, a trap or
+            # `&& …; echo` can exit 0 while tests fail; the report decides
+            out["outcome"] = "fail"
+            out["note"] = f"exit 0, but the report has {len(failing)} failing test(s)"
         if r.truncated:
             out["truncated"] = True
         return out

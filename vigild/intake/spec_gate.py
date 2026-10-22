@@ -36,6 +36,10 @@ class GateResult:
 # whatever the code does, or hide the real command from the gate.
 NO_OP = {"true", ":", "echo", "printf", "exit", "test", "[", "cat", "head", "tail"}
 SHELLS = {"sh", "bash", "dash", "zsh"}
+CONTROL = {
+    "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "case", "esac",
+    "for", "set", "trap", "function", "eval",
+}  # fmt: skip
 
 
 def _trivial(c: Command) -> bool:
@@ -65,6 +69,11 @@ def bad_test_cmd(cmd: str | None) -> str | None:
         return f"test_cmd `{shown}` runs something in the background (`&`), so it exits 0"
     if "||" in line.ops:
         return f"test_cmd `{shown}` catches a failure with `||`; a test must fail when it fails"
+    for c in line.commands:
+        # round 4, item 1: forms that change or hide an exit status
+        if c.text.strip().startswith("!") or (c.words and c.words[0] in CONTROL):
+            word = "!" if c.text.strip().startswith("!") else c.words[0]
+            return f"test_cmd `{shown}` uses `{word}`, which can hide a failing exit"
     if all(_trivial(c) for c in line.commands):
         return f"test_cmd `{shown}` can't fail on the code's account: it's a no-op"
     return None
