@@ -1,0 +1,18 @@
+# Which backends and decider routes may see each repo's text (design
+# "Decider"; architecture "Backends"). vigild refuses to start if a private
+# repo lists a hosted entry other than jev-cloudflare. The one exception,
+# `anthropic` for thomasbardhi01/vigil (owner, 2026-10-22, Q2), is hard-coded
+# in vigild/repos.py and can't be extended from this file.
+repos:
+  thomasbardhi01/parkagent:
+    visibility: public
+    decider: [haiku, jev-cloudflare]      # jev-openrouter once its key exists
+    backends: [claude-sonnet, claude-opus, claude-haiku]
+    worker_overflow: []
+    auto_merge: false
+  thomasbardhi01/vigil:
+    visibility: private
+    decider: [haiku, jev-cloudflare]
+    backends: [claude-sonnet, claude-opus, claude-haiku]
+    worker_overflow: []
+    auto_merge: false

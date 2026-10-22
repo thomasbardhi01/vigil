@@ -36,6 +36,15 @@ doesn't exist, or an API route in no row, fails it.
 | Backends | 1 | A session's model backend is `{kind, base_url, model, key_ref}`; presets for Claude API, tower, OpenRouter, custom. | `POST /api/tasks` (`backend`); UI New session | `vigild/backends.py`, `configs/backends.yaml` | an executor/backend pair not in the compatibility table is refused; a private repo is refused a backend not listed for it | `tests/test_backends.py` | planned (phase 1; OpenRouter phase 4, blocked by its key; tower phase 5) |
 | GitHub label intake | 2 | An issue labeled `vigil:ready` becomes a task. | GitHub label (polled) | `vigild/intake/github.py` | WIP limit; intake gate | `tests/intake/test_github.py` | planned (phase 2) |
 
+## Jobs and the inbox
+
+| Feature | Phase | What it does | Entry points | Core code | Guardrails | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| Jobs and the job tree | 1 | One approved spec is one job: a coord session, worker sessions, subagents, reviewer, auditor, each with state, cost, tokens and PR; fix jobs are children with lineage. | `POST /api/jobs`; `GET /api/jobs`, `GET /api/jobs/{id}`, `GET /api/jobs/{id}/tree` | `vigild/jobs/model.py`, `vigild/jobs/tree.py`, `vigild/jobs/service.py`, `vigild/db.py` | fix-job depth ≤ 3 | `tests/jobs/test_tree.py`, `tests/api/test_api.py` | shipped |
+| Job state machine | 1 | `spec_pending → approved → planning → building → in_review → ready → merged → verifying → done`, plus `blocked` / `escalated` from any live state; each edge has a machine check. | internal | `vigild/jobs/fsm.py` | approval only by the owner from the inbox; the owner's override is logged and never skips approval | `tests/jobs/test_fsm.py` (one test per transition) | shipped |
+| Stage artifacts | 1 | `intake.json`, `spec.md`, `plan.md`, `approval.json`, `worker_report.json`, … under `.vigil/<job>/` (per-worker ones under `.vigil/<job>/<task>/`), each with provenance. | — | `vigild/jobs/artifacts.py` | a missing or invalid artifact means the stage isn't done | `tests/jobs/test_artifacts.py` | shipped |
+| Inbox | 1 | Three queues: specs to approve, ready to merge, questions and pages. Approving is the only way a job leaves `spec_pending`; each approval is recorded with its edits. | `GET /api/inbox`, `POST /api/inbox/{id}/approve` | `vigild/jobs/service.py`, `vigild/api/app.py` | admin token; approve only an open spec item | `tests/api/test_api.py` | shipped |
+
 ## Running sessions
 
 | Feature | Phase | What it does | Entry points | Core code | Guardrails | Tests | Status |
@@ -74,7 +83,7 @@ doesn't exist, or an API route in no row, fails it.
 | Feature | Phase | What it does | Entry points | Core code | Guardrails | Tests | Status |
 |---|---|---|---|---|---|---|---|
 | REST API | 1 | The one API behind CLI, MCP and the web UI. | `/api/*` on the Mac's Tailscale address | `vigild/api/` | bearer token (admin or read) | `tests/api/` | planned (phase 1; `/api/tasks` and `/api/sessions` first) |
-| Read views | 1–3 | The GET endpoints the CLI, MCP and UI read: tasks, their events and sessions, summary strip, repos, backends, ladder, decisions, calibration, budgets. | `GET /api/tasks`, `/api/tasks/{id}`, `/api/tasks/{id}/events`, `/api/events/{id}`, `/api/sessions`, `/api/summary`, `/api/repos`, `/api/backends`, `/api/ladder`, `/api/decisions`, `/api/decider/calibration`, `/api/budgets`, `/api/health` | `vigild/api/` | read or admin token | `tests/api/` | planned (`/api/tasks*`, `/api/sessions`, `/api/budgets`, `/api/health` phase 1; the rest with the phase that adds their data) |
+| Read views | 1–3 | The GET endpoints the CLI, MCP and UI read: tasks, their events and sessions, summary strip, repos, backends, ladder, decisions, calibration, budgets. | `GET /api/tasks`, `/api/tasks/{id}`, `/api/tasks/{id}/events`, `/api/events/{id}`, `/api/sessions`, `/api/sessions/{id}`, `/api/summary`, `/api/repos`, `/api/backends`, `/api/ladder`, `/api/decisions`, `/api/decider/calibration`, `/api/budgets`, `/api/health` | `vigild/api/` | read or admin token | `tests/api/` | planned (`/api/tasks*`, `/api/sessions`, `/api/budgets`, `/api/health` phase 1; the rest with the phase that adds their data) |
 | Batch | 2 | Submit several tasks from one YAML file; each goes through the same gates as a single task. | `POST /api/batches`; `vigil batch`; UI `/new` (paste YAML) | `vigild/api/tasks.py` | same gates per task | `tests/api/test_batch.py` | planned (phase 2) |
 | CLI | 2 | `vigil run · batch · ls --live · trace · kill`. | `vigil …` | `cli/vigil/` | — | `tests/cli/` | planned (phase 2) |
 | MCP server | 2 | The same calls as MCP tools over stdio, so a Claude Code session can dispatch. | `vigil mcp`; tools `vigil_run`, `vigil_status`, `vigil_trace`, `vigil_kill` | `cli/vigil/mcp.py` | — | `tests/cli/test_mcp.py` | planned (phase 2) |
