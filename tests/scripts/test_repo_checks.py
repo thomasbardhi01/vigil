@@ -103,3 +103,19 @@ def test_nested_flow_files_match() -> None:
     assert ds.touched_flows(["images/claude-executor/Dockerfile"]) == {
         "isolation and deploy": ["images/claude-executor/Dockerfile"]
     }
+
+
+def test_a_planned_page_row_with_no_route_or_code_yet_passes(tmp_path: Path) -> None:
+    """/watch (round 2): a phase-3 row names a page, a stream topic and code
+    that don't exist yet. Planned, that's fine; shipped, the paths must exist."""
+    row = (
+        "| Watch page | 3 | x | `/watch`; `GET /api/stream?topics=code,tower` | `vigild/web/`, "
+        "`vigild/api/stream.py` | — | `tests/web/test_watch.py` | {status} |\n"
+    )
+    root = _tree(tmp_path, ["pkg/a.py", "pkg/b.py", "pkg/c.py", "tests/test_a.py"])
+    fmap = root / "docs" / "feature-map.md"
+    fmap.write_text(MAP + row.format(status="planned (phase 3)"))
+    assert fm.check(root, code_dirs=["pkg"]) == []
+    fmap.write_text(MAP + row.format(status="shipped"))
+    errors = fm.check(root, code_dirs=["pkg"])
+    assert any("vigild/api/stream.py" in e for e in errors)

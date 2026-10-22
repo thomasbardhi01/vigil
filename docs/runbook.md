@@ -165,21 +165,31 @@ docker compose --env-file ~/.config/vigil/env up -d --build
 
 ### Dev images
 
-A session runs only in its repo's pinned dev image, validated less than 26
-hours ago. **vigild validates every repo's image itself, at start and every
-24 hours**: the repo's `dev_image_check`, plus `command -v` for each tool in
-`dev_image_tools`. No launchd job. To validate by hand (after a rebuild):
+Each repo's tests run only in its own dev image (`images/dev/<repo>.Dockerfile`,
+named in `configs/repos.yaml`). **vigild builds and validates it itself**,
+when the repo's lockfiles change at the base commit (the first job after a
+lockfile change waits for it; ParkAgent's takes about 3 minutes cold and is
+about 3.8 GB): the build installs from the lockfiles, with the network; the
+validation runs every suite in `dev_suites` on a clean checkout, in the
+image, with no network. There is no timer and no launchd job.
 
-```sh
-uv run python cli/vigil validate-images
-```
+- **When it fails**, every session for that repo is refused and the inbox
+  gets one item per image saying what failed (the build's tail, or each
+  suite's outcome and tail), with **Rebuild** and **Dismiss**. Fix the cause
+  (often the Dockerfile or the suite command in `repos.yaml`, through a
+  PR), then press Rebuild, then retry the blocked job from its own item.
+- **By hand**, the same build and validation at the base branch's tip:
 
-`dev_image_tools` is also what a `test_cmd` may use: the spec gate refuses a
-test that needs anything else. **ParkAgent today:** its dev image is the
-executor image, which has no pnpm and none of ParkAgent's dependencies, so
-only doc- and grep-style tasks can run there. A ParkAgent dev image (Node 24,
-pnpm, its lockfile's dependencies baked in, since workers have no npm egress)
-needs ParkAgent's lockfile, which waits on your go-ahead.
+  ```sh
+  uv run python cli/vigil dev-image --repo thomasbardhi01/vigil
+  uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
+  ```
+
+- `dev_image_tools` is what a `test_cmd` may use; the spec gate refuses a
+  test that needs anything else. `dev_excluded` says which suites can't run
+  in a Linux container and why: for ParkAgent, the iOS app (Xcode).
+- Builds take Debian packages from `snapshot.debian.org` as of 2026-10-08
+  (the pin rule), which is slow, not broken.
 
 ### Check everything
 
@@ -202,10 +212,17 @@ uv run python -m vigild
     can't check (so the App must be configured). A repo the YAML keeps
     private that is public on GitHub only logs a warning: the YAML's stricter
     rule stays in force;
+  - migrates an older `vigil.db` in place (`PRAGMA user_version`);
   - reconciles anything a previous run left behind: tokens revoked, session
     containers removed, reservations settled, mid-flight jobs blocked with a
-    resumable page in the inbox;
-  - validates the dev images.
+    page in the inbox (retry, re-plan or abandon), a draft whose coord died
+    paged (retry or cancel);
+  - starts approved builds that never began, once the gateway is listening.
+- **When a worker fails**, its job is blocked after its wave with one inbox
+  item: **Retry** runs the failed tasks again on what's left of each task's
+  cap (offered only when there is at least $0.05 left), **Re-plan** sends
+  the job back to its coord with the failures, **Abandon** ends it (any open
+  PRs stay for you to close).
 - The API is at 127.0.0.1:8787, bearer tokens only (the CLI and MCP).
 - The web UI's login exists only on the Mac's Tailscale address
   (`api.tailscale_host`; unset means no UI login). Behind `tailscale serve`
