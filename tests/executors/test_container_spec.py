@@ -1,0 +1,120 @@
+"""The container a session runs in, as data: hardening, mounts, env, network.
+These run without Docker; tests/security/ runs the same spec for real."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from vigild.config import Config
+from vigild.executors.base import SessionSpec
+from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
+from vigild.executors.runtime import proxy_kwargs, worker_kwargs
+from vigild.jobs.model import Role
+from vigild.workspace import Workspace
+
+
+@pytest.fixture
+def spec(tmp_path: Path, fixture_repo: dict[str, Path], cfg: Config) -> SessionSpec:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone("o/fixture", "fx-0001-w1", branch="vigil/fx-0001-w1", base="main")
+    return SessionSpec(
+        session_id="s-abc123",
+        role=Role.WORKER,
+        job_id="fx-0001",
+        task_id="fx-0001-w1",
+        repo="thomasbardhi01/vigil",
+        preset="claude-sonnet",
+        model="claude-sonnet-5-5",
+        clone=clone,
+        session_dir=tmp_path / "sess",
+        max_turns=30,
+        max_minutes=20,
+        max_budget_usd=1.0,
+        mounts=ws.overlays(clone),
+        traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+    )
+
+
+def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
+    kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
+    assert kw["user"] == "10001:10001"
+    assert kw["read_only"] is True
+    assert kw["cap_drop"] == ["ALL"]
+    assert "no-new-privileges" in kw["security_opt"]
+    assert kw["pids_limit"] == 512
+    assert kw["mem_limit"] == "4g"
+    assert set(kw["tmpfs"]) == {"/tmp"}
+    assert kw["network"] == "vigil-s-abc123"
+    assert kw["stdin_open"] is True and kw["privileged"] is False
+
+
+def test_only_the_clone_packet_and_read_only_overlays_are_mounted(
+    cfg: Config, spec: SessionSpec
+) -> None:
+    kw = worker_kwargs(cfg, spec, network="n")
+    binds = {m["Target"]: m for m in kw["mounts"]}
+    assert binds["/work"]["Source"] == str(spec.clone) and not binds["/work"]["ReadOnly"]
+    assert binds["/vigil/packet.md"]["ReadOnly"]
+    for target in (
+        "/work/.github",
+        "/work/.claude",
+        "/work/.opencode",
+        "/work/.git/hooks",
+        "/work/.git/config",
+    ):
+        assert binds[target]["ReadOnly"], target
+    assert set(binds) == {
+        "/work",
+        "/vigil/packet.md",
+        "/work/.github",
+        "/work/.claude",
+        "/work/.opencode",
+        "/work/.git/hooks",
+        "/work/.git/config",
+    }
+    assert not any(
+        "docker.sock" in m["Source"] or ".config/vigil" in m["Source"] for m in kw["mounts"]
+    )
+
+
+def test_no_secret_in_the_environment(cfg: Config, spec: SessionSpec) -> None:
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    for name in env:
+        assert "KEY" not in name and "TOKEN" not in name and "SECRET" not in name, name
+    assert env["VIGIL_GATEWAY_URL"] == "http://host.docker.internal:8788"
+    assert env["HTTPS_PROXY"] == env["HTTP_PROXY"] == "http://egress:4750"
+    assert "otel-collector" in env["NO_PROXY"]
+    assert env["TRACEPARENT"] == spec.traceparent
+    assert "vigil.task_id=fx-0001-w1" in env["OTEL_RESOURCE_ATTRIBUTES"]
+    assert env["VIGIL_REQUIRE_PLUGIN"] == "guard"
+
+
+def test_worker_allowlist_has_registries_but_no_github(cfg: Config) -> None:
+    hosts = allowlist(cfg, Role.WORKER)
+    assert "pypi.org" in hosts and "host.docker.internal" in hosts
+    assert "github.com" not in hosts and "api.github.com" not in hosts
+    assert not any("anthropic" in h or "openrouter" in h for h in hosts)
+
+
+def test_coord_allowlist_is_the_gateway_only(cfg: Config) -> None:
+    assert allowlist(cfg, Role.COORD) == ["host.docker.internal"]
+
+
+def test_acl_and_proxy_config(cfg: Config) -> None:
+    acl = yaml.safe_load(acl_yaml(["pypi.org", "host.docker.internal"]))
+    assert acl["default"]["action"] == "enforce"
+    assert acl["default"]["allowed_domains"] == ["pypi.org", "host.docker.internal"]
+    conf = yaml.safe_load(proxy_config_yaml(cfg))
+    assert conf["allow_addresses"] == ["192.168.65.254:8788"]
+    assert conf["allow_missing_role"] is True
+    assert "allow_ranges" not in conf and "unsafe_allow_private_ranges" not in conf
+
+
+def test_proxy_container(cfg: Config, spec: SessionSpec) -> None:
+    kw = proxy_kwargs(cfg, spec)
+    assert kw["read_only"] is True and kw["cap_drop"] == ["ALL"]
+    assert kw["image"] == cfg.vigild.images.egress_proxy
+    assert kw["mounts"][0]["Target"] == "/etc/smokescreen" and kw["mounts"][0]["ReadOnly"]

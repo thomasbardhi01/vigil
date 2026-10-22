@@ -111,7 +111,12 @@ class Prices(_M):
 class GatewayEgress(_M):
     host: str
     port: int
-    allow_range: str
+    allow_address: str
+
+
+class ProxyEgress(_M):
+    alias: str
+    port: int
 
 
 class CollectorEgress(_M):
@@ -122,6 +127,7 @@ class CollectorEgress(_M):
 class Egress(_M):
     gateway: GatewayEgress
     collector: CollectorEgress
+    proxy: ProxyEgress
     roles: dict[str, list[str]]
 
 

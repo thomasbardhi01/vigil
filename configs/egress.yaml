@@ -1,17 +1,22 @@
 # Per-session egress allowlists for the smokescreen sidecar (B4, B5).
-# No model host is listed: hosted model calls go through vigild's gateway
-# (P1), so the gateway is the only model endpoint a container can reach.
+# No model host and no GitHub host is listed: hosted model calls go through
+# vigild's gateway (P1), and vigild pushes and opens PRs from the host (P2), so
+# a worker needs neither. Package registries stay for workers.
 gateway:
   host: host.docker.internal
   port: 8788
-  # smokescreen blocks private ranges by default, and host.docker.internal
-  # is one. Docker Desktop's host range is allowed, for the gateway only.
-  allow_range: 192.168.65.0/24
+  # smokescreen blocks private ranges by default, and host.docker.internal is
+  # one (Docker Desktop's host address, checked 2026-10-22). Only this
+  # address:port is opened; vigild's API port on the same host stays refused.
+  allow_address: "192.168.65.254:8788"
 collector:
   host: otel-collector       # attached to each session network; never proxied
   port: 4318
+proxy:
+  alias: egress
+  port: 4750
 roles:
-  coord:    [api.github.com, github.com]
-  worker:   [api.github.com, github.com, pypi.org, files.pythonhosted.org, registry.npmjs.org]
-  reviewer: [api.github.com, github.com]
-  auditor:  [api.github.com, github.com]
+  coord:    []
+  worker:   [pypi.org, files.pythonhosted.org, registry.npmjs.org]
+  reviewer: []
+  auditor:  []
