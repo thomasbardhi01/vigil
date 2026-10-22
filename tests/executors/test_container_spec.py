@@ -161,3 +161,58 @@ def test_reports_are_split_from_the_output() -> None:
     out, reports = split_reports(text, "M-x")
     assert out == "line 1\nline 2" and reports == {"pytest.xml": xml}
     assert split_reports(text, "M-other")[1] == {}  # another run's marker is plain output
+
+
+def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> None:
+    """Round 4, item 12: two ParkAgent verifiers (6 GiB each, plus tmpfs) don't
+    fit the 11.7 GiB Docker VM; vigild runs one at a time unless configured."""
+    import threading
+    import time
+
+    from vigild.executors.runtime import DockerTestRunner
+
+    live, peak, lock = [0], [0], threading.Lock()
+
+    class Container:
+        def start(self) -> None:
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+
+        def logs(self, **kw: object) -> list[bytes]:
+            time.sleep(0.2)
+            return [b"ok\n"]
+
+        def wait(self, **kw: object) -> dict[str, int]:
+            with lock:
+                live[0] -= 1
+            return {"StatusCode": 0}
+
+        def kill(self) -> None: ...
+
+        def remove(self, **kw: object) -> None: ...
+
+    class Containers:
+        def create(self, **kw: object) -> Container:
+            return Container()
+
+    class Client:
+        containers = Containers()
+
+    assert cfg.vigild.container.verifier_concurrency == 1
+    runner = DockerTestRunner(cfg, Client())
+    src = tmp_path / "verify" / "x" / "src"
+    src.mkdir(parents=True)
+    threads = [
+        threading.Thread(
+            target=runner.run,
+            args=("img", src, "true"),
+            kwargs={"timeout_s": 30, "max_output": 1000},
+        )
+        for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert peak[0] == 1

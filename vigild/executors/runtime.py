@@ -209,8 +209,16 @@ class DockerTestRunner:
     def __init__(self, cfg: Config, client: Any) -> None:
         self.cfg = cfg
         self.client = client
+        # one runner per vigild, shared by the verifier and dev-image validation
+        self._slots = threading.BoundedSemaphore(cfg.vigild.container.verifier_concurrency)
 
     def run(
+        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+    ) -> RunResult:
+        with self._slots:  # round 4, item 12: verifier containers one at a time
+            return self._run(image, source, command, timeout_s=timeout_s, max_output=max_output)
+
+    def _run(
         self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
     ) -> RunResult:
         import docker.errors

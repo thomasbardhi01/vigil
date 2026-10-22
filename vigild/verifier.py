@@ -49,8 +49,10 @@ from vigild.shellwords import Command, parse
 from vigild.workspace import Workspace
 
 VERIFY_SECONDS = 15 * 60
-MAX_OUTPUT = 4 << 20  # the output's tail plus the reports
-MAX_REPORT = 2 << 20
+# ParkAgent's full server suite reports 1853 cases in a 376 KB JUnit file
+# (measured 2026-10-22); 8 MiB per report is ~20x headroom.
+MAX_OUTPUT = 24 << 20  # the output's tail plus the reports, base64
+MAX_REPORT = 8 << 20
 TAIL = 2000
 REPORT_DIR = "/tmp/vigil-report"  # noqa: S108  (the verifier container's own tmpfs)
 TEST_FILE = re.compile(

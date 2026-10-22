@@ -178,6 +178,9 @@ class ContainerLimits(_M):
     # The verifier's container holds the checkout, the repo's dependencies and
     # a database in tmpfs, so it gets more (review round 2).
     verifier_memory: str = "6g"
+    # Verifier containers at once on this machine (round 4): two ParkAgent
+    # verifiers at 6 GiB plus tmpfs don't fit the 11.7 GiB Docker VM.
+    verifier_concurrency: int = Field(default=1, ge=1)
 
 
 class Vigild(_M):
