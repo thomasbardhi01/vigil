@@ -89,6 +89,12 @@ ALLOWED_BETAS = frozenset(
 # Thinking blocks are the model's own output, echoed back in assistant turns.
 MESSAGE_BLOCKS = frozenset({"text", "image", "document", "tool_use", "tool_result"})
 ASSISTANT_ONLY_BLOCKS = frozenset({"thinking", "redacted_thinking"})
+# Owner decision 2026-10-22 (review round 3): thinking blocks are allowed, in
+# assistant turns only, with exactly their own fields and nothing else.
+THINKING_FIELDS = {
+    "thinking": frozenset({"type", "thinking", "signature"}),
+    "redacted_thinking": frozenset({"type", "data"}),
+}
 TOOL_RESULT_BLOCKS = frozenset({"text", "image", "document"})
 SYSTEM_BLOCKS = frozenset({"text"})
 SOURCED_BLOCKS = frozenset({"image", "document"})
@@ -117,6 +123,9 @@ def _check_blocks(blocks: Any, allowed: frozenset[str], where: str) -> None:
         kind = b.get("type") if isinstance(b, dict) else None
         if kind not in allowed:
             raise _refuse_block(at, f"content block {kind!r} is not allowed")
+        if kind in THINKING_FIELDS and set(b) - THINKING_FIELDS[kind]:
+            extra = sorted(set(b) - THINKING_FIELDS[kind])
+            raise _refuse_block(at, f"{kind} block fields not allowed: {extra}")
         if kind in SOURCED_BLOCKS:
             src = b.get("source")
             if not isinstance(src, dict) or src.get("type") != "base64":

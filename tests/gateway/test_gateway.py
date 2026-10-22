@@ -588,3 +588,51 @@ def test_the_call_is_booked_before_its_hold_is_released(
     else:
         client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
     assert seen and seen[0] == 1
+
+
+# --- owner decision 2026-10-22 (round 3): thinking blocks, in assistant turns, exact fields ---
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "thinking", "thinking": "hm", "signature": "s", "source": {"type": "url"}},
+        {
+            "type": "thinking",
+            "thinking": "hm",
+            "signature": "s",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "redacted_thinking", "data": "abc", "extra": 1},
+        {"type": "redacted_thinking", "data": "abc", "thinking": "x"},
+    ],
+)
+def test_thinking_blocks_carry_only_their_own_fields(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream, block: Any
+) -> None:
+    _, tok = _session(store, budget, gw)
+    body = _msg(
+        messages=[{"role": "user", "content": "go"}, {"role": "assistant", "content": [block]}]
+    )
+    r = client.post("/v1/messages", json=body, headers={"x-api-key": tok})
+    assert r.status_code == 403, r.text
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "thinking", "thinking": "hm", "signature": "s"},
+        {"type": "redacted_thinking", "data": "abc"},
+    ],
+)
+def test_thinking_blocks_in_a_user_turn_are_refused(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream, block: Any
+) -> None:
+    _, tok = _session(store, budget, gw)
+    r = client.post(
+        "/v1/messages",
+        json=_msg(messages=[{"role": "user", "content": [block]}]),
+        headers={"x-api-key": tok},
+    )
+    assert r.status_code == 403 and upstream.requests == []
