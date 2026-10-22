@@ -50,9 +50,11 @@ RUN ln -sf /opt/claude-cli/node_modules/.bin/claude /usr/local/bin/claude \
 # from anything the repo uses.
 COPY --from=uv /uv /usr/local/bin/vigil-uv
 COPY requirements.txt /tmp/requirements.txt
-RUN UV_PYTHON_INSTALL_DIR=/opt/vigil-python vigil-uv python install 3.14.8 \
- && UV_PYTHON_INSTALL_DIR=/opt/vigil-python vigil-uv venv --python 3.14.8 /opt/vigil-venv \
- && vigil-uv pip install --python /opt/vigil-venv/bin/python --require-hashes --no-cache \
+# (the base's own uv settings, e.g. a dev image's UV_OFFLINE, don't apply here)
+ARG VIGIL_UV="env UV_OFFLINE=false UV_PYTHON_DOWNLOADS=manual UV_NO_CONFIG=1 UV_PYTHON_INSTALL_DIR=/opt/vigil-python"
+RUN $VIGIL_UV vigil-uv python install 3.14.8 \
+ && $VIGIL_UV vigil-uv venv --python 3.14.8 /opt/vigil-venv \
+ && $VIGIL_UV vigil-uv pip install --python /opt/vigil-venv/bin/python --require-hashes --no-cache \
       -r /tmp/requirements.txt \
  && rm /tmp/requirements.txt /usr/local/bin/vigil-uv \
  && chmod -R a+rX /opt/vigil-python /opt/vigil-venv \
