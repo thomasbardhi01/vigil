@@ -1,0 +1,114 @@
+{
+  "$defs": {
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "SelfCheck": {
+      "additionalProperties": false,
+      "description": "The five questions every worker answers before returning.",
+      "properties": {
+        "could_delete": {
+          "title": "Could Delete",
+          "type": "string"
+        },
+        "not_done": {
+          "title": "Not Done",
+          "type": "string"
+        },
+        "outside_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Outside Scope",
+          "type": "array"
+        },
+        "reviewer_would_flag": {
+          "title": "Reviewer Would Flag",
+          "type": "string"
+        },
+        "test_failed_first": {
+          "title": "Test Failed First",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "test_failed_first",
+        "outside_scope",
+        "not_done",
+        "reviewer_would_flag",
+        "could_delete"
+      ],
+      "title": "SelfCheck",
+      "type": "object"
+    },
+    "TestOutcome": {
+      "enum": [
+        "fail",
+        "pass",
+        "unknown"
+      ],
+      "title": "TestOutcome",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "files_changed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Files Changed",
+      "type": "array"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "self_check": {
+      "$ref": "#/$defs/SelfCheck"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "test_after": {
+      "$ref": "#/$defs/TestOutcome"
+    },
+    "test_before": {
+      "$ref": "#/$defs/TestOutcome"
+    }
+  },
+  "required": [
+    "task_id",
+    "job_id",
+    "test_before",
+    "test_after",
+    "files_changed",
+    "summary",
+    "self_check",
+    "provenance"
+  ],
+  "title": "WorkerReport",
+  "type": "object"
+}
