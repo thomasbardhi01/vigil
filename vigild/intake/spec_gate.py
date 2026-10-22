@@ -15,6 +15,7 @@ the ones the path rules find.
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -30,12 +31,56 @@ class GateResult:
     errors: list[str] = field(default_factory=list)
 
 
+LIST_OPS = re.compile(r"(&&|\|\||;|\||\n)")
+ALWAYS_ZERO = {"true", ":", "echo", "printf"}
+
+
+def _words(segment: str) -> list[str]:
+    seg = segment.strip().strip("(){} \t")
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    return [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+
+
+def _always_zero(words: list[str]) -> bool:
+    if not words:
+        return True
+    return words[0] in ALWAYS_ZERO or words == ["exit", "0"]
+
+
+def bad_test_cmd(cmd: str | None) -> str | None:
+    """Why a test_cmd can't be a test, or None (review round 2, N2): it's
+    empty, every part of it is a no-op (`true`, `:`, `exit 0`, `echo ...`),
+    or it ends in a no-op after `;`, `||` or `|`, so it exits 0 whatever ran
+    before. vigild runs test_cmd to decide; one that can't fail decides nothing."""
+    if not (cmd or "").strip():
+        return "test_cmd is empty"
+    assert cmd is not None
+    parts = LIST_OPS.split(cmd)
+    segments, ops = parts[0::2], parts[1::2]
+    words = [_words(seg) for seg in segments]
+    if all(_always_zero(w) or w == ["exit"] for w in words):
+        return f"test_cmd `{cmd.strip()}` can't fail: it's a no-op"
+    # drop empty trailing segments (a trailing `;` or newline)
+    while len(words) > 1 and not words[-1]:
+        words.pop()
+        ops.pop()
+    if ops and ops[-1] in (";", "||", "|", "\n") and _always_zero(words[-1]):
+        return f"test_cmd `{cmd.strip()}` always exits 0: it ends in `{ops[-1].strip() or 'newline'} {' '.join(words[-1])}`"
+    return None
+
+
 def check_task(task: Task) -> GateResult:
     errors = [
         f"{key} is required before a task can run"
         for key in ("test_cmd", "done_when")
         if not (getattr(task.spec, key) or "").strip()
     ]
+    if task.spec.test_cmd and task.spec.test_cmd.strip():
+        if why := bad_test_cmd(task.spec.test_cmd):
+            errors.append(why)
     return GateResult(ok=not errors, needs_spec=bool(errors), errors=errors)
 
 
@@ -119,6 +164,8 @@ def check_job_spec(
     for c in spec.criteria:
         if not c.test_cmd:
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
+        elif why := bad_test_cmd(c.test_cmd):
+            errors.append(f"spec.md {c.ident}: {why}")
 
     errors.extend(plan.errors)
     if not plan.workers and not plan.errors:
@@ -127,6 +174,8 @@ def check_job_spec(
     for dup in sorted({i for i in ids if ids.count(i) > 1}):
         errors.append(f"plan.md repeats worker {dup}")
     for w in plan.workers:
+        if why := bad_test_cmd(w.test_cmd):
+            errors.append(f"worker {w.task_id}: {why}")
         for dep in w.depends_on:
             if dep not in ids:
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")

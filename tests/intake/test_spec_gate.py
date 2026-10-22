@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from vigild.contract.models import Task
-from vigild.intake.spec_gate import check_job_spec, check_task
+from vigild.intake.spec_gate import check_job_spec, check_task, bad_test_cmd
 from vigild.jobs.artifacts import parse_plan, parse_spec
 
 MONEY = ["src/billing/**", "src/auth/**", "**/payments/**", "**/consent/**"]
@@ -317,3 +319,66 @@ def test_a_test_cmd_the_dev_image_cannot_run_fails() -> None:  # blocker 4
         missing_tools=lambda cmd: ["pnpm"] if "pnpm" in cmd else [],
     )
     assert any("pnpm" in e and "dev image" in e for e in errors), errors
+
+
+# --- review round 2, N2: a test_cmd that can't fail is refused before approval ------------
+
+NO_OPS = [
+    "",
+    "   ",
+    "true",
+    ":",
+    "exit 0",
+    "exit",
+    "echo ok",
+    "printf done",
+    "true && echo ok",
+    "true; :",
+    "(true)",
+    "{ true; }",
+    "pytest -q || true",
+    "grep -q x docs/a.md; exit 0",
+    "make test || echo failed",
+    "TERM=dumb true",
+]
+
+
+@pytest.mark.parametrize("cmd", NO_OPS)
+def test_a_no_op_test_cmd_is_refused(cmd: str) -> None:
+    assert bad_test_cmd(cmd), cmd
+    r = check_task(_task(test_cmd=cmd))
+    assert not r.ok and any("test_cmd" in e for e in r.errors)
+    plan = PLAN.replace("\"test_cmd\": \"grep -q 'RATE_LIMIT' docs/runbook.md\"",
+                        f'"test_cmd": {json.dumps(cmd)}')  # fmt: skip
+    spec = SPEC.replace("test: `grep -q 'RATE_LIMIT' docs/runbook.md`", f"test: `{cmd}`")
+    errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY)
+    assert any("pa-0001-w2" in e and "test_cmd" in e for e in errors), errors
+    if cmd.strip():
+        assert any("AC2" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "grep -q 'rate limit' docs/feature-map.md",
+        "pytest -q tests/test_a.py",
+        "true && pytest -q",
+        "echo start; pytest -q",
+        "test -f docs/a.md",
+        "sh scripts/check.sh && echo ok",
+    ],
+)
+def test_a_real_test_cmd_passes(cmd: str) -> None:
+    assert bad_test_cmd(cmd) is None, cmd
+
+
+def test_the_worker_contract_refuses_a_blank_test_cmd() -> None:
+    from pydantic import ValidationError
+
+    from vigild.contract.models import WorkerContract
+
+    base = {"task_id": "pa-0001-w1", "goal": "g", "why": "w", "value": 3, "risk": 1,
+            "size": "XS", "done_when": "d", "files_in_scope": ["docs/a.md"]}  # fmt: skip
+    for bad in ("", "  \n"):
+        with pytest.raises(ValidationError):
+            WorkerContract.model_validate({**base, "test_cmd": bad})

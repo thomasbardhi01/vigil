@@ -194,7 +194,7 @@ class WorkerContract(Strict):
     value: Score
     risk: Score
     size: Size
-    test_cmd: str
+    test_cmd: str = Field(min_length=1, pattern=r"\S")  # never blank (review round 2, N2)
     done_when: str
     files_in_scope: list[str] = Field(min_length=1)
     out_of_scope: list[str] = Field(default_factory=list)

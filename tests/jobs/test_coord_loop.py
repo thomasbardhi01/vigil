@@ -335,6 +335,12 @@ def test_end_to_end(world: World) -> None:
     (item,) = inbox["specs"]
     assert item["job_id"] == job
     assert [x["task_id"] for x in item["body"]["workers"]] == [f"{job}-w1", f"{job}-w2"]
+    # the owner sees the exact command the verifier will run (round 2, N2)
+    assert [x["test_cmd"] for x in item["body"]["workers"]] == [
+        "grep -q 'rate limit' docs/feature-map.md",
+        "grep -q 'RATE_LIMIT' docs/runbook.md",
+    ]
+    assert all(x["must_fail_first"] for x in item["body"]["workers"])
     assert w.store.get_job(job).state.value == "spec_pending"
     assert [c[0] for c in w.standin.calls] == ["coord"]
 

@@ -302,6 +302,8 @@ class JobService:
                     {
                         "task_id": w.task_id,
                         "goal": w.goal,
+                        "test_cmd": w.test_cmd,
+                        "must_fail_first": w.must_fail_first,
                         "size": w.size.value,
                         "files_in_scope": w.files_in_scope,
                         "depends_on": w.depends_on,
