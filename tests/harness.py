@@ -33,10 +33,38 @@ def _pinned(clone: Path, *args: str) -> str:
     return p.stdout.strip()
 
 
-def finish_session(clone: Path, out_dir: Path, *, branch: str, base_sha: str) -> dict[str, Any]:
+def finish_session(
+    clone: Path,
+    out_dir: Path,
+    *,
+    branch: str,
+    base_sha: str,
+    scope: list[str] | None = None,
+) -> dict[str, Any]:
+    """With `scope`, commit as the harness does (round 4, item 7): tracked
+    files, and new files in scope or under .vigil/. Without, everything (for
+    tests that build a history by hand)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    if _pinned(clone, "status", "--porcelain"):
+    left_out: list[str] = []
+    if scope is None:
         _pinned(clone, "add", "-A")
+    else:
+        from vigild.intake.paths import in_scope
+
+        _pinned(clone, "add", "-u")
+        untracked = _pinned(clone, "ls-files", "--others", "--exclude-standard").split("\n")
+        keep = [
+            p
+            for p in untracked
+            if p
+            and (p.startswith(".vigil/") or in_scope(p, scope))
+            and "__pycache__" not in p.split("/")
+            and not p.endswith((".pyc", ".pyo"))
+        ]
+        left_out = sorted(p for p in untracked if p and p not in keep)
+        if keep:
+            _pinned(clone, "add", "--", *keep)
+    if _pinned(clone, "diff", "--cached", "--name-only"):
         _pinned(clone, "commit", "-q", "--no-verify", "-m", "harness: leftovers")
     bundle = out_dir / "result.bundle"
     if bundle.is_symlink() or bundle.exists():
@@ -46,6 +74,7 @@ def finish_session(clone: Path, out_dir: Path, *, branch: str, base_sha: str) ->
         "status": "done",
         "plugins": ["guard"],
         "head": _pinned(clone, "rev-parse", f"refs/heads/{branch}"),
+        "not_committed": left_out,
     }
 
 

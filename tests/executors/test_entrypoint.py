@@ -55,7 +55,7 @@ def test_the_bundle_replaces_a_planted_symlink(tmp_path: Path) -> None:
     target = tmp_path / "elsewhere.txt"
     target.write_text("untouched")
     os.symlink(target, ep.OUT / "result.bundle")
-    ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+    ep.snapshot(_task(base), "worker")
     assert target.read_text() == "untouched"
     assert not (ep.OUT / "result.bundle").is_symlink()
 
@@ -89,6 +89,16 @@ def _work(tmp_path: Path) -> tuple[Path, str]:
     return work, base
 
 
+def _task(base: str, scope: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "branch": BRANCH,
+        "base_sha": base,
+        "task_id": "fx-0001-w1",
+        "job_id": "fx-0001",
+        "spec": {"files_in_scope": scope if scope is not None else ["b.txt"]},
+    }
+
+
 def _hostile_git(work: Path, marker: Path) -> None:
     """What the reviewer reproduced: code git runs on status, add and commit."""
     script = work.parent / "evil.sh"
@@ -117,7 +127,7 @@ def test_harness_git_runs_no_repo_hook_or_fsmonitor(tmp_path: Path) -> None:
     _hostile_git(work, marker)
     (work / "b.txt").write_text("b\n")
     ep = _harness(tmp_path, work)
-    head = ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+    head, _ = ep.snapshot(_task(base), "worker")
     assert not marker.exists(), "git ran the repo's fsmonitor or hook"
     assert len(head) == 40 and head != base
     assert (ep.OUT / "result.bundle").is_file()
@@ -130,7 +140,7 @@ def test_harness_refuses_a_git_dir_that_points_elsewhere(tmp_path: Path, plant: 
     (work / ".git" / plant).write_text(str(tmp_path / "elsewhere") + "\n")
     ep = _harness(tmp_path, work)
     with pytest.raises(ep.HarnessRefused):
-        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+        ep.snapshot(_task(base), "worker")
     assert not (ep.OUT / "result.bundle").exists()
 
 
@@ -140,7 +150,7 @@ def test_harness_refuses_a_git_file_in_place_of_the_dir(tmp_path: Path) -> None:
     (work / ".git").write_text(f"gitdir: {tmp_path / 'moved.git'}\n")
     ep = _harness(tmp_path, work)
     with pytest.raises(ep.HarnessRefused):
-        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+        ep.snapshot(_task(base), "worker")
 
 
 def test_harness_refuses_a_head_off_the_task_branch(tmp_path: Path) -> None:
@@ -148,7 +158,7 @@ def test_harness_refuses_a_head_off_the_task_branch(tmp_path: Path) -> None:
     _run(work, "checkout", "-q", "-b", "other")
     ep = _harness(tmp_path, work)
     with pytest.raises(ep.HarnessRefused):
-        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+        ep.snapshot(_task(base), "worker")
 
 
 def test_the_harness_runs_no_test_and_names_the_head_on_its_result_line(
@@ -164,7 +174,7 @@ def test_the_harness_runs_no_test_and_names_the_head_on_its_result_line(
         "job_id": "fx-0001",
         "branch": BRANCH,
         "base_sha": base,
-        "spec": {"test_cmd": f"echo ran >> {marker}"},
+        "spec": {"test_cmd": f"echo ran >> {marker}", "files_in_scope": ["b.txt"]},
     }
     (work / ".vigil" / "task.json").write_text(json.dumps(task))
     ep = _harness(tmp_path, work)
@@ -213,3 +223,46 @@ def test_the_session_prepare_hook_runs_before_the_agent(tmp_path: Path) -> None:
         ep.prepare_session()
     ep.SESSION_PREPARE = str(tmp_path / "absent")
     ep.prepare_session()  # no hook (the generic image): nothing to do
+
+
+# --- review round 4, item 7: only what the task may change is committed ------------------
+
+
+def test_build_output_outside_scope_is_left_out_not_committed(tmp_path: Path) -> None:
+    """A worker that ran pytest leaves __pycache__ and build output behind:
+    they stay out of the commit (and are listed), so scope still passes."""
+    work, base = _work(tmp_path)
+    (work / "src").mkdir()
+    (work / "src" / "a.py").write_text("x = 1\n")
+    (work / "src" / "__pycache__").mkdir()
+    (work / "src" / "__pycache__" / "a.cpython-314.pyc").write_bytes(b"\0")
+    (work / "build").mkdir()
+    (work / "build" / "out.txt").write_text("built\n")
+    report = work / ".vigil" / "fx-0001" / "fx-0001-w1"
+    report.mkdir(parents=True)
+    (report / "worker_report.json").write_text("{}")
+    (work / "a.txt").write_text("a, changed\n")  # tracked: always committed
+    ep = _harness(tmp_path, work)
+    head, left_out = ep.snapshot(_task(base, ["src/**"]), "worker")
+    files = _run(work, "diff", "--name-only", base, head).split()
+    assert sorted(files) == [".vigil/fx-0001/fx-0001-w1/worker_report.json", "a.txt", "src/a.py"]
+    assert left_out == ["build/out.txt", "src/__pycache__/a.cpython-314.pyc"]
+
+
+def test_left_out_files_are_named_on_the_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work, base = _work(tmp_path)
+    (work / ".vigil" / "task.json").write_text(json.dumps(_task(base)))
+    ep = _harness(tmp_path, work)
+
+    async def agent(packet: str, role: str, token: str) -> dict[str, Any]:
+        (work / "b.txt").write_text("b\n")
+        (work / "junk.log").write_text("x\n")
+        return {"plugins": ["guard"]}
+
+    monkeypatch.setattr(ep, "run_agent", agent)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"gateway_token": TOKEN}) + "\n"))
+    assert ep.main() == 0
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])["vigil_result"]
+    assert result["not_committed"] == ["junk.log"]

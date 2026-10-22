@@ -44,6 +44,7 @@ def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
     # runs as the agent uid (review round 2, N1 and N11)
     assert kw["user"] == "0:0"
     assert kw["environment"]["VIGIL_AGENT_UID"] == "10001"
+    assert kw["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert kw["read_only"] is True
     assert kw["cap_drop"] == ["ALL"]
     assert sorted(kw["cap_add"]) == ["KILL", "SETGID", "SETUID"]

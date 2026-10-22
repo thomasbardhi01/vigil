@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import fnmatch
 import json
 import os
 import re
@@ -148,6 +149,7 @@ def git_env() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LITERAL_PATHSPECS": "1",
         }
     )
     return env
@@ -186,9 +188,29 @@ def check_git_dir() -> None:
             raise HarnessRefused(f".git/{rel} is a symlink")
 
 
-def snapshot(task: dict[str, Any], role: str) -> str:
+def _match_segs(p: list[str], g: list[str]) -> bool:
+    if not g:
+        return not p
+    if g[0] == "**":
+        return any(_match_segs(p[i:], g[1:]) for i in range(len(p) + 1))
+    return bool(p) and fnmatch.fnmatchcase(p[0], g[0]) and _match_segs(p[1:], g[1:])
+
+
+def in_scope(path: str, scope: list[str]) -> bool:
+    """vigild's strict scope globs (vigild/intake/paths.py), which the
+    harness can't import."""
+    return any(path == g or _match_segs(path.split("/"), g.split("/")) for g in scope)
+
+
+def snapshot(task: dict[str, Any], role: str) -> tuple[str, list[str]]:
     """Commit what the agent left and bundle the branch from the base. Returns
-    the head commit, which vigild binds the imported bundle to."""
+    the head commit, which vigild binds the imported bundle to, and the
+    untracked files left out of the commit.
+
+    Only tracked files, and new files inside the task's scope or under
+    `.vigil/`, are committed (review round 4, item 7): build output, caches
+    and logs a session leaves behind are not the work, and committing them
+    would fail the scope check."""
     branch, base_sha = task.get("branch"), task.get("base_sha")
     if not branch or not base_sha:
         raise HarnessRefused("task.json names no branch or base_sha")
@@ -196,8 +218,21 @@ def snapshot(task: dict[str, Any], role: str) -> str:
     ref = f"refs/heads/{branch}"
     if git("symbolic-ref", "-q", "HEAD", check=False) != ref:
         raise HarnessRefused(f"HEAD is not on {branch}")
-    if git("status", "--porcelain"):
-        git("add", "-A")
+    scope = [str(x) for x in (task.get("spec") or {}).get("files_in_scope") or []]
+    git("add", "-u")  # tracked files: changes and deletions
+    untracked = git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
+    keep = [
+        p
+        for p in untracked
+        if p
+        and (p.startswith(".vigil/") or in_scope(p, scope))
+        and "__pycache__" not in p.split("/")  # bytecode is never the work
+        and not p.endswith((".pyc", ".pyo"))
+    ]
+    left_out = sorted(p for p in untracked if p and p not in keep)
+    if keep:
+        git("add", "--", *keep)
+    if git("diff", "--cached", "--name-only"):
         what = task.get("task_id") or task.get("job_id")
         git("commit", "-q", "--no-verify", "-m", f"vigil: {role} {what}")
     head = git("rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -205,7 +240,7 @@ def snapshot(task: dict[str, Any], role: str) -> str:
         os.unlink(OUT / "result.bundle")
     if head != base_sha:
         git("bundle", "create", "-q", str(OUT / "result.bundle"), ref, f"^{base_sha}")
-    return head
+    return head, left_out
 
 
 def prepare_session() -> None:
@@ -355,7 +390,7 @@ def main() -> int:
 
     kill_strays()  # nothing the agent started survives to touch what follows
     try:
-        head = snapshot(task, role)
+        head, left_out = snapshot(task, role)
     except HarnessRefused as e:
         kill_strays()
         emit("vigil_result", redact({"status": "failed", "error": f"harness: {e}"}, token))
@@ -369,6 +404,7 @@ def main() -> int:
                 "status": "done",
                 "role": role,
                 "head": head,
+                "not_committed": left_out[:200],
                 "seconds": round(time.monotonic() - started, 1),
             },
             token,

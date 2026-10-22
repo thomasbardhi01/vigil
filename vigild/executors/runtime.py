@@ -65,6 +65,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
         "VIGIL_AGENT_UID": str(uid),
+        "PYTHONDONTWRITEBYTECODE": "1",  # no __pycache__ in the worker's tree (round 4)
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
         "NO_PROXY": f"{col.host},localhost,127.0.0.1",

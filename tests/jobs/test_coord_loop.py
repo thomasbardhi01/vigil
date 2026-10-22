@@ -184,6 +184,7 @@ class StandIn:
                     spec.session_dir / "out",
                     branch=task["branch"],
                     base_sha=task["base_sha"],
+                    scope=[],
                 )
                 return ExecOutcome("done", 0, result)
             if self.barrier:
@@ -209,6 +210,7 @@ class StandIn:
                 spec.session_dir / "out",
                 branch=task["branch"],
                 base_sha=task["base_sha"],
+                scope=list(task["spec"]["files_in_scope"]),
             )
             return ExecOutcome("done", 0, result)
         finally:
@@ -1006,6 +1008,10 @@ def test_an_unnamed_runner_config_change_is_rejected(world: World) -> None:
     def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
         _work(spec.clone, task["spec"]["files_in_scope"][0])
         (spec.clone / "conftest.py").write_text("collect_ignore = ['tests']\n")
+        # committed by the agent itself (an untracked file out of scope would
+        # simply be left out of the commit, round 4)
+        git(spec.clone, "add", "conftest.py")
+        git(spec.clone, "commit", "-qm", "narrow the tests")
 
     w.standin.worker_edit = edit
     job = _approve(w)
@@ -1093,6 +1099,8 @@ def test_a_lockfile_change_is_read_as_needs_deps(world: World) -> None:
         _work(spec.clone, task["spec"]["files_in_scope"][0])
         if str(spec.task_id).endswith("w1"):
             (spec.clone / "package.json").write_text('{"dependencies": {"left-pad": "1.3.0"}}\n')
+            git(spec.clone, "add", "package.json")  # the agent commits it itself
+            git(spec.clone, "commit", "-qm", "add left-pad")
 
     w.standin.worker_edit = edit
     job = _approve(w)
@@ -1152,3 +1160,21 @@ def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: Wor
     assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
     images = {c["image"] for c in w.tests.calls}
     assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
+
+
+def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  # round 4, item 7
+    """A worker that ran pytest in its session leaves __pycache__ and build
+    output: they aren't committed, so the scope check still passes."""
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        (spec.clone / "tests" / "__pycache__").mkdir(parents=True, exist_ok=True)
+        (spec.clone / "tests" / "__pycache__" / "t.cpython-314.pyc").write_bytes(b"\0")
+        (spec.clone / ".pytest_cache").mkdir(exist_ok=True)
+        (spec.clone / ".pytest_cache" / "README.md").write_text("cache\n")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "in_review"
+    assert len(w.publisher.prs) == 2
