@@ -253,3 +253,26 @@ def test_the_assembler_never_reads_outside_the_repo(clone: Path, tmp_path: Path)
     p = assemble_worker(clone, c, untrusted={})
     assert "must-not-appear" not in p.text
     assert "localhost" not in p.parts["context_pack"]
+
+
+# --- review round 2, N10: the packet's git log goes through gitsafe -------------------------
+
+
+def test_the_git_log_ignores_ambient_git_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from vigild.packets import assemble
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for args in (("init", "-q"), ("config", "user.email", "t@x"), ("config", "user.name", "t")):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    (repo / "a.md").write_text("a\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add a"], cwd=repo, check=True)
+    # host state a hardened call never reads: GIT_* in vigild's own environment
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "nowhere"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "nowhere.gitconfig"))
+    assert assemble._git_log(repo, ["a.md"]).endswith("add a")

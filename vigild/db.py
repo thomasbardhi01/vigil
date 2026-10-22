@@ -12,7 +12,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -102,6 +102,41 @@ CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
 ID_PREFIX = re.compile(r"[^a-z0-9]")
 
 
+def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _m1_gateway_token_binding(conn: sqlite3.Connection) -> None:
+    """Review round 1: tokens carry the session's model and an expiry."""
+    _add_columns(
+        conn, "gateway_tokens", {"model": "TEXT NOT NULL DEFAULT ''", "expires_at": "TEXT"}
+    )
+
+
+# Ordered steps; PRAGMA user_version is how many have run (review round 2, N8).
+# Each step is idempotent, since SCHEMA's CREATE IF NOT EXISTS may already
+# have made a table in its newest shape. Append only; never reorder.
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_m1_gateway_token_binding]
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    for n, step in enumerate(MIGRATIONS, start=1):
+        if n > version:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                step(conn)
+                conn.execute(f"PRAGMA user_version = {n}")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+    return len(MIGRATIONS)
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -127,6 +162,7 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA)
+        migrate(conn)
         return cls(conn)
 
     @contextmanager

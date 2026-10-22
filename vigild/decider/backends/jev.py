@@ -65,18 +65,14 @@ class _Jev:
     model = ""
     version_changed = False
 
-    def __init__(
-        self, client: httpx2.Client, known_version: str | None = None, meter: Meter | None = None
-    ) -> None:
+    def __init__(self, client: httpx2.Client, known_version: str | None, *, meter: Meter) -> None:
         self.client = client
         self.known_version = known_version
-        self.meter = meter
+        self.meter = meter  # required: no Jev call goes unmetered (review round 2, N9)
 
     def _call(
         self, repo: str, job_id: str | None, run: Callable[[], dict[str, Any]]
     ) -> dict[str, Any]:
-        if self.meter is None:
-            return run()
         return self.meter(
             repo=repo,
             route=self.name,
@@ -116,9 +112,9 @@ class JevCloudflare(_Jev):
         account_id: str,
         token: str,
         known_version: str | None = None,
-        meter: Meter | None = None,
+        meter: Meter,
     ) -> None:
-        super().__init__(client, known_version, meter)
+        super().__init__(client, known_version, meter=meter)
         self.account_id = account_id
         self.token = token
 
@@ -148,9 +144,9 @@ class JevOpenRouter(_Jev):
         *,
         token: str,
         known_version: str | None = "jev-1.13",
-        meter: Meter | None = None,
+        meter: Meter,
     ) -> None:
-        super().__init__(client, known_version, meter)
+        super().__init__(client, known_version, meter=meter)
         self.token = token
 
     def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:

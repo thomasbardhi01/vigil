@@ -21,6 +21,11 @@ FIX = Path(__file__).parent / "fixtures"
 PA = "thomasbardhi01/parkagent"
 
 
+def passthrough(**kw: Any) -> dict[str, Any]:
+    """A meter that only runs the call (the real one is Gateway.metered)."""
+    return kw["run"]()  # type: ignore[no-any-return]
+
+
 def test_launch_question_set() -> None:
     assert set(QUESTIONS) == {
         "tier",
@@ -175,7 +180,9 @@ def test_jev_cloudflare_against_fixture() -> None:
         return httpx2.Response(200, json=fixture)
 
     client = httpx2.Client(transport=httpx2.MockTransport(handler))
-    jev = JevCloudflare(client, account_id="acct", token="t0k", known_version="jev-1.13.0")
+    jev = JevCloudflare(
+        client, account_id="acct", token="t0k", known_version="jev-1.13.0", meter=passthrough
+    )
     a = jev.ask(QUESTIONS["size"], "Add three tests", repo=PA, job_id=None)
     assert (a.value, a.probability, a.model_version) == ("S", 0.91, "jev-1.13.0")
     req = seen[0]
@@ -193,7 +200,9 @@ def test_jev_flags_a_model_version_change() -> None:
     client = httpx2.Client(
         transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json=fixture))
     )
-    jev = JevCloudflare(client, account_id="a", token="t", known_version="jev-1.13.0")
+    jev = JevCloudflare(
+        client, account_id="a", token="t", known_version="jev-1.13.0", meter=passthrough
+    )
     jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
     assert jev.version_changed
 
@@ -203,7 +212,7 @@ def test_jev_http_error_is_a_decider_error() -> None:
         transport=httpx2.MockTransport(lambda r: httpx2.Response(500, text="no"))
     )
     with pytest.raises(DeciderError):
-        JevCloudflare(client, account_id="a", token="t").ask(
+        JevCloudflare(client, account_id="a", token="t", meter=passthrough).ask(
             QUESTIONS["size"], "x", repo=PA, job_id=None
         )
 
@@ -217,7 +226,9 @@ def test_jev_openrouter_pins_the_model_and_zdr() -> None:
         seen.append(req)
         return httpx2.Response(200, json=fixture)
 
-    jev = JevOpenRouter(httpx2.Client(transport=httpx2.MockTransport(handler)), token="t")
+    jev = JevOpenRouter(
+        httpx2.Client(transport=httpx2.MockTransport(handler)), token="t", meter=passthrough
+    )
     assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None).value == "S"
     body = json.loads(seen[0].content)
     assert seen[0].url.path == "/api/alpha/decisions"
@@ -262,3 +273,50 @@ def test_decider_checks_the_route_before_asking(cfg: Config, store: Store) -> No
     jev, haiku = Fixed("jev-cloudflare", 0.99), Fixed("haiku", 0.9)
     d = Decider(cfg, store, {"jev-cloudflare": jev, "haiku": haiku})
     assert d.decide(PA, QUESTIONS["size"], "x").answer.backend == "haiku" and jev.calls == []
+
+
+# --- review round 2, N9 --------------------------------------------------------------------
+
+
+def test_jev_cannot_be_built_without_a_meter() -> None:
+    client = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(500)))
+    with pytest.raises(TypeError):
+        JevCloudflare(client, account_id="a", token="t")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        JevOpenRouter(client, token="t")  # type: ignore[call-arg]
+
+
+def test_a_gateway_refusal_is_a_decider_failure(cfg: Config, store: Store) -> None:
+    from vigild.gateway.service import GatewayError
+
+    class Refused:
+        name = "jev-cloudflare"
+
+        def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+            raise GatewayError(403, "permission_error", "budget: the day is spent")
+
+    haiku = Fixed("haiku", 0.95)
+    d = Decider(cfg, store, {"jev-cloudflare": Refused(), "haiku": haiku}).decide(
+        PA, QUESTIONS["size"], "x"
+    )
+    assert haiku.calls == ["size"] and d.answer is not None and d.answer.backend == "haiku"
+    errors = [e.data for e in store.events() if e.type == "decision" and "error" in e.data]
+    assert any("budget" in e["error"] for e in errors)
+
+
+def test_the_production_wiring_meters_every_route(cfg: Config, store: Store) -> None:
+    from vigild.budget import Budget
+    from vigild.config import Secrets
+    from vigild.decider.wiring import build_decider
+    from vigild.gateway.service import Gateway
+
+    gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
+    secrets = Secrets(
+        {"CLOUDFLARE_ACCOUNT_ID": "a", "CLOUDFLARE_API_TOKEN": "t", "OPENROUTER_API_KEY": "k"}
+    )
+    client = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(500)))
+    d = build_decider(cfg, store, gw, secrets, client)
+    assert set(d.backends) == {"haiku", "jev-cloudflare", "jev-openrouter"}
+    for name in ("jev-cloudflare", "jev-openrouter"):
+        assert d.backends[name].meter == gw.metered  # type: ignore[attr-defined]
+    assert set(build_decider(cfg, store, gw, Secrets({}), client).backends) == {"haiku"}

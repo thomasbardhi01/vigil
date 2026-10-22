@@ -12,6 +12,7 @@ from typing import Protocol
 from vigild.config import Config
 from vigild.db import Store, iso
 from vigild.decider.questions import Answer, DeciderError, Question
+from vigild.gateway.service import GatewayError
 from vigild.provenance import Provenance
 from vigild.repos import RepoPolicyError, check_decider_route
 
@@ -76,7 +77,7 @@ class Decider:
         try:
             check_decider_route(self.cfg, repo, route)  # item 11: never a route the repo omits
             return self.backends[route].ask(q, state, repo=repo, job_id=job_id)
-        except (DeciderError, RepoPolicyError) as e:
+        except (DeciderError, RepoPolicyError, GatewayError) as e:  # a refusal is a failure
             self.store.add_event(
                 "decision",
                 {"route": route, "question": q.name, "error": str(e)},

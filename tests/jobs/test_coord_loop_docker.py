@@ -24,11 +24,12 @@ from tests.jobs.test_coord_loop import REPO, BarePublisher
 from vigild.api.app import create_app
 from vigild.config import RepoPolicy
 from vigild.devimage import DevImages, DockerImages
-from vigild.executors.runtime import DockerRuntime
+from vigild.executors.runtime import DockerRuntime, DockerTestRunner
 from vigild.gateway.app import create_gateway_app
 from vigild.jobs.runner import JobRunner
 from vigild.server import Vigild, build
 from vigild.services import Tokens
+from vigild.verifier import Verifier
 from vigild.workspace import Workspace
 
 pytestmark = [pytest.mark.docker, pytest.mark.live]
@@ -75,6 +76,7 @@ def live(
         publisher,
         v.telemetry,
         images,
+        Verifier(ws, DockerTestRunner(cfg, client)),
         background=False,
     )
     v.services.jobs.runner = runner

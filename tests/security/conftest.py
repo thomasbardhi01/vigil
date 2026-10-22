@@ -52,7 +52,16 @@ def make_spec(
         clone = ws.clone(
             "o/fixture", f"fx-0001-w{n[0]}", branch=f"vigil/fx-0001-w{n[0]}", base="main"
         )
-        ws.write_task(clone, {"task_id": f"fx-0001-w{n[0]}", "job_id": "fx-0001", "spec": {}})
+        ws.write_task(
+            clone,
+            {
+                "task_id": f"fx-0001-w{n[0]}",
+                "job_id": "fx-0001",
+                "branch": f"vigil/fx-0001-w{n[0]}",
+                "base_sha": ws.base_sha(f"fx-0001-w{n[0]}"),
+                "spec": {},
+            },
+        )
         return SessionSpec(
             session_id=sid,
             role=role,

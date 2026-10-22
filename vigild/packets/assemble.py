@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from vigild.contract.models import Plan, WorkerReport
+from vigild.gitsafe import GitError, git
 from vigild.intake.paths import scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
 from vigild.jobs.model import Role
@@ -89,18 +90,14 @@ def _role_and_rules(role: Role, repo: Path) -> str:
 
 
 def _git_log(repo: Path, files: list[str]) -> str:
+    """Recent history for the context pack, through the one hardened git
+    (review round 2, N10): no ambient GIT_* env, system or global config."""
     try:
-        out = subprocess.run(
-            ["git", "log", "-3", "--format=%h %ad %s", "--date=short", "--", *files],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
+        return git(
+            repo, "log", "-3", "--format=%h %ad %s", "--date=short", "--", *files, timeout=20
         )
-    except OSError, subprocess.TimeoutExpired:
+    except GitError, OSError, subprocess.TimeoutExpired:
         return ""
-    return out.stdout.strip()
 
 
 def _excerpt(doc: str, needles: list[str]) -> str:
