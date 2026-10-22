@@ -119,3 +119,17 @@ def test_dismiss_resolves_a_page(client: TestClient, tokens: Tokens, store: Stor
 def test_a_spec_cannot_be_dismissed_or_resumed(client: TestClient, tokens: Tokens) -> None:
     _, item = _pending(client, tokens)
     assert client.post(f"/api/inbox/{item}/resume", headers=auth(tokens.admin)).status_code == 409
+
+
+def test_two_resumable_pages_start_one_run(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner
+) -> None:  # round 3, F7
+    job_id, _ = _pending(client, tokens)
+    first = _blocked_page(store, job_id)
+    second = store.create_inbox_item(
+        "questions", "page", job_id, "another page", {"resumable": True}
+    ).id
+    assert client.post(f"/api/inbox/{first}/resume", headers=auth(tokens.admin)).status_code == 200
+    assert store.get_inbox_item(second).status == "resolved"  # closed with the first
+    assert client.post(f"/api/inbox/{second}/resume", headers=auth(tokens.admin)).status_code == 409
+    assert runner.resumed == [job_id]

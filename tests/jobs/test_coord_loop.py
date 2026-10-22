@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1115,3 +1116,24 @@ def test_needs_deps_is_inferred_from_manifests() -> None:
     got = infer_deps("data/pyproject.toml", py_a, py_b)
     assert [(d.ecosystem, d.package, d.version) for d in got] == [("pypi", "tomlkit", "==0.13.2")]
     assert infer_deps("uv.lock", "a", "b") == []
+
+
+def test_a_job_already_running_is_not_started_twice(world: World) -> None:  # round 3, F7
+    w = world
+    job = _request(w)
+    started: list[str] = []
+    gate = threading.Event()
+
+    def slow(j: str) -> None:
+        started.append(j)
+        gate.wait(5)
+
+    w.runner.background = True
+    w.runner.run_coord = slow  # type: ignore[method-assign]
+    w.runner.on_resume(job)
+    w.runner.on_resume(job)  # a second resume while the first runs
+    gate.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and w.runner.running():
+        time.sleep(0.01)
+    assert started == [job]

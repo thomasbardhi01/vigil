@@ -401,6 +401,10 @@ class JobService:
                 "resume", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            # round 3, F7: one resume per hold; the job's other resumable pages close
+            for other in self.store.list_inbox():
+                if other.job_id == job.id and other.body.get("resumable") and other.id != item_id:
+                    self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
         self.runner.on_resume(job.id)
         return job
 

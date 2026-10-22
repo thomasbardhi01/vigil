@@ -323,3 +323,17 @@ def test_safe_read_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
     t.join(timeout=5)
     assert not t.is_alive(), "opening the FIFO blocked"
     assert errors and isinstance(errors[0], UnsafeFile)
+
+
+def test_host_git_reads_pathspecs_literally(tmp_path: Path) -> None:  # round 3, F8
+    from vigild.gitsafe import git as safe_git
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for args in (("init", "-q"), ("config", "user.email", "t@x"), ("config", "user.name", "t")):
+        git(repo, *args)
+    (repo / "a*").write_text("star\n")
+    (repo / "ab").write_text("b\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "two")
+    assert safe_git(repo, "ls-files", "--", "a*").split() == ["a*"]

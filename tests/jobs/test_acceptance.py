@@ -208,3 +208,27 @@ def test_test_ids_decide_must_fail_first_when_checked(
     assert any(want in e for e in errors), errors
     ok = {"checked": True, "failing_before": ["t::a"], "not_passing_after": []}
     assert _check(ws, base, head, tests={**TESTS_OK, "ids": ok}) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "server/test/zoneNumber.test.ts",  # ParkAgent's server and executor
+        "scripts/audit.test.mjs",
+        "data/test_import_parkboston_zones.py",
+        "server/test/pg/cas.pg.ts",
+        "web/src/button.spec.ts",  # round 3, F4
+        "web/src/__tests__/button.ts",
+    ],
+)
+def test_test_files_are_recognised(path: str) -> None:
+    from vigild.verifier import TEST_FILE
+
+    assert TEST_FILE.search(path), path
+
+
+def test_source_files_are_not_tests() -> None:
+    from vigild.verifier import TEST_FILE
+
+    for path in ("server/src/app.ts", "src/testing_utils.py", "docs/test-plan.md"):
+        assert not TEST_FILE.search(path), path

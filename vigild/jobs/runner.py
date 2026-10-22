@@ -152,10 +152,23 @@ class JobRunner:
         self._why: dict[str, dict[str, Any]] = {}  # task id -> why its last attempt failed
         self._why_lock = threading.Lock()
         self.deferred: list[str] = []  # approved builds reconcile found, not yet started
+        self._running: set[str] = set()
+        self._running_lock = threading.Lock()
 
     # --- triggers ---------------------------------------------------------------------
 
+    def running(self) -> list[str]:
+        with self._running_lock:
+            return sorted(self._running)
+
     def _spawn(self, fn: Callable[[str], None], job_id: str) -> None:
+        # round 3, F7: one run per job at a time, whatever starts it
+        with self._running_lock:
+            if job_id in self._running:
+                log.info("%s is already running; not starting it twice", job_id)
+                return
+            self._running.add(job_id)
+
         def safe(j: str) -> None:
             try:
                 fn(j)
@@ -165,6 +178,9 @@ class JobRunner:
                 self._page(
                     j, f"vigild error on {j}", {"error": f"{type(e).__name__}: {e}"}, resumable=True
                 )
+            finally:
+                with self._running_lock:
+                    self._running.discard(j)
 
         if self.background:
             threading.Thread(target=safe, args=(job_id,), daemon=True).start()
@@ -197,8 +213,8 @@ class JobRunner:
         hold jobs that were mid-flight (paged, with retry and the other actions),
         offer retry or cancel for a draft whose coord it failed (N6), and queue
         approved jobs whose build never started. They start from
-        `start_deferred`, which vigild calls once the gateway is listening and
-        the dev images have been validated (N11)."""
+        `start_deferred`, which vigild calls once the gateway is listening
+        (N11); each session then checks its repo's dev image itself."""
         out = {
             "tokens": self.gateway.revoke_all(),
             "containers": 0,
@@ -276,7 +292,8 @@ class JobRunner:
 
     def start_deferred(self) -> int:
         """Start the builds reconcile queued. vigild calls this only once its
-        gateway is listening and the dev images are validated (N11)."""
+        gateway is listening (N11); each session checks its repo's dev image
+        itself, building it when the lockfiles changed."""
         started, self.deferred = self.deferred, []
         for job_id in started:
             self.on_approved(job_id)
