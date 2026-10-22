@@ -147,3 +147,41 @@ def test_the_gate_resolves_package_scripts_with_the_base_files(
     assert r.status_code == 422 and "runs no test runner" in r.text
     t["spec"]["test_cmd"] = "pnpm -C server test"
     assert client.post("/api/tasks", json=t, headers=auth(tokens.admin)).status_code == 202
+
+
+def test_the_gate_reads_the_tasks_own_base_branch(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:  # round 5, item 2
+    svc = client.app.state.services.jobs  # type: ignore[attr-defined]
+    asked: list[tuple[str, str]] = []
+    pkg = {"server/package.json": '{"scripts": {"test": "vitest run"}}'}
+
+    def files(repo: str, base: str) -> Any:
+        asked.append((repo, base))
+        return pkg.get
+
+    svc.files = files
+    t = _task()
+    t["base"] = "develop"
+    t["spec"]["test_cmd"] = "pnpm -C server test"
+    assert client.post("/api/tasks", json=t, headers=auth(tokens.admin)).status_code == 202
+    assert asked and all(b == "develop" for _, b in asked)
+
+
+def test_an_unavailable_mirror_is_said_so(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:  # round 5, item 2
+    from vigild.verifier import FileNotAvailable
+
+    def files(repo: str, base: str) -> Any:
+        def read(path: str) -> str | None:
+            raise FileNotAvailable("the repo's mirror isn't available")
+
+        return read
+
+    client.app.state.services.jobs.files = files  # type: ignore[attr-defined]
+    t = _task()
+    t["spec"]["test_cmd"] = "pnpm -C server test"
+    r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
+    assert r.status_code == 422 and "mirror isn't available" in r.text
+    assert "runs no test runner" not in r.text

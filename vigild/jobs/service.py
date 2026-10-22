@@ -171,7 +171,7 @@ class JobService:
             raise SubmitError(r.reasons)
         return r.reasons if r.outcome is IntakeOutcome.PROPOSE else []
 
-    def _gate(self, repo: str, spec_text: str, plan_text: str, base: str = "main") -> list[str]:
+    def _gate(self, repo: str, spec_text: str, plan_text: str, base: str) -> list[str]:
         return check_job_spec(
             parse_spec(spec_text),
             parse_plan(plan_text),
@@ -219,6 +219,7 @@ class JobService:
                 task.repo,
                 render_spec(task, self.cfg.routing.money_paths),
                 render_plan(task),
+                task.base,
             )
             if errors:
                 raise SubmitError(errors)
@@ -280,7 +281,7 @@ class JobService:
         else:
             pdoc = parse_plan(plan.content)
             job0 = self.store.get_job(job_id)
-            errors = self._gate(job0.repo, spec.content, plan.content)
+            errors = self._gate(job0.repo, spec.content, plan.content, job0.base)
         self.store.add_artifact(
             job_id,
             "spec_gate.json",

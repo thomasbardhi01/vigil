@@ -156,6 +156,10 @@ PACKAGE_MANAGERS = {"pnpm", "npm", "yarn"}
 ReadFile = Callable[[str], str | None]
 
 
+class FileNotAvailable(RuntimeError):
+    """The base's files can't be read (no mirror, or it couldn't be fetched)."""
+
+
 @dataclass(frozen=True)
 class ReportPlan:
     """How the verifier will run `test_cmd` so each runner writes a report, and
@@ -229,7 +233,15 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if read is None:
             problems.append(f"`{c.text.strip()}`: the package script can't be read to check it")
             continue
-        raw = read(f"{where}/package.json" if where else "package.json")
+        manifest = f"{where}/package.json" if where else "package.json"
+        try:
+            raw = read(manifest)
+        except FileNotAvailable as e:
+            problems.append(f"`{c.text.strip()}`: {e}, so its package script can't be checked")
+            continue
+        if raw is None:
+            problems.append(f"`{c.text.strip()}`: there's no {manifest} on the base")
+            continue
         try:
             script = str((json.loads(raw or "{}").get("scripts") or {}).get(name) or "")
         except json.JSONDecodeError, AttributeError:

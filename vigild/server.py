@@ -202,7 +202,25 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     images.on_failure = runner.dev_image_failed
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
-    v.services.jobs.files = lambda repo, base: lambda path: ws.mirror_file(repo, base, path)
+
+    def files(repo: str, base: str) -> Callable[[str], str | None]:
+        """The base's files for the spec gate, from the mirror, fetched first
+        when there's none yet (round 5)."""
+        from vigild.verifier import FileNotAvailable
+
+        try:
+            if not ws._mirror_path(repo).exists():
+                ws.mirror(repo)
+        except Exception as e:
+            reason = f"the repo's mirror isn't available ({type(e).__name__})"
+
+            def unavailable(path: str) -> str | None:
+                raise FileNotAvailable(reason)
+
+            return unavailable
+        return lambda path: ws.mirror_file(repo, base, path)
+
+    v.services.jobs.files = files
     return runner
 
 
