@@ -424,3 +424,43 @@ def test_a_new_test_named_on_the_command_line_is_not_pinned_away(
     rec = _verify(ws, base, head, "pytest -q tests/test_flag.py")
     assert rec["runner_config"]["pinned_to_base"] == []
     assert rec["after"]["outcome"] == "pass" and rec["before"]["outcome"] == "fail"
+
+
+# --- review round 4, item 4: a base run with no report doesn't fail open -------------------
+
+
+def test_with_no_base_report_head_is_compared_with_before(ws: Workspace, tmp_path: Path) -> None:
+    """The reviewer's case: a check that fails at base before the runner starts
+    (here: the new test file is missing), so base reports nothing. Head is
+    compared with "before" minus the worker's added tests, so a deleted old
+    test is still caught."""
+
+    def edit(c: Path) -> None:
+        _turn_on(c)
+        (c / "tests" / "test_old.py").unlink()  # deleted tests aren't overlaid at before
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "test -f tests/test_flag.py && pytest -q tests")
+    assert rec["base"]["tests"] == 0 and rec["before"]["tests"] == 3
+    assert rec["ran"]["against"] == "before" and not rec["ran"]["ok"]
+    assert rec["ran"]["missing_ids"] == ["tests.test_old::test_old", "tests.test_old::test_old_2"]
+
+
+def test_with_no_report_at_base_or_before_what_ran_is_unknown(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    base, head = _session(ws, tmp_path, _turn_on)
+    # a "lint" that fails at base and before (the code isn't there yet), so
+    # pytest never runs there
+    lint = "python3 -c 'import sys; sys.path.insert(0, \".\"); import src.feature as f; assert f.flag()'"
+    rec = _verify(ws, base, head, f"{lint} && pytest -q tests")
+    assert rec["after"]["outcome"] == "pass"
+    assert rec["ran"] == {
+        "checked": False,
+        "unknown": True,
+        "note": "neither base nor before produced a report: what ran can't be compared",
+    }
+    errors = check_tests({"test_cmd": "x", "must_fail_first": True}, rec)
+    assert any("can't be compared" in e for e in errors), errors

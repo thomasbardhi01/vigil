@@ -65,6 +65,8 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
             still = ids["not_passing_after"]
             errors.append(f"the worker's tests that failed before don't pass after: {still}")
     ran = tests.get("ran") or {}
+    if ran.get("unknown"):
+        errors.append(f"what ran can't be compared: {ran.get('note')}")
     if ran.get("checked") and not ran.get("ok"):
         # owner direction, round 3: head may add tests, never run fewer or skip more
         errors.append(

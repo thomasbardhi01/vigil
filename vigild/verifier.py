@@ -360,10 +360,22 @@ class Verifier:
             after["outcome"] = "unknown"
             after["note"] = "no test report: that any test ran can't be confirmed"
         record["after"] = after
-        if base["_report"] and after["_report"]:
-            record["ran"] = compare_runs(base["_cases"], after["_cases"])
+        added = sorted(path for status, path in changed if status[:1] == "A")
+        if not after["_report"]:
+            record["ran"] = {"checked": False, "note": "no report from the head run"}
+        elif base["_report"]:
+            record["ran"] = {**compare_runs(base["_cases"], after["_cases"]), "against": "base"}
+        elif before is not None and before["_report"]:
+            # round 4, item 4: base ran no runner (e.g. a check before it failed);
+            # compare with "before" minus the tests the worker added
+            kept = [c for c in before["_cases"] if not belongs(c, added)]
+            record["ran"] = {**compare_runs(kept, after["_cases"]), "against": "before"}
         else:
-            record["ran"] = {"checked": False, "note": "no report from the base or the head run"}
+            record["ran"] = {
+                "checked": False,
+                "unknown": True,
+                "note": "neither base nor before produced a report: what ran can't be compared",
+            }
         if before is not None:
             record["ids"] = self._ids(before, after, tests)
         record["provenance"] = "human"  # observed by vigild, not reported by the model
