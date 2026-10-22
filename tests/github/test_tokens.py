@@ -205,7 +205,7 @@ def test_github_adding_metadata_read_is_accepted_but_more_is_revoked(
 
 
 def test_is_private_uses_a_metadata_read_token_and_revokes_it(
-    keypair: tuple[bytes, rsa.RSAPublicKey]
+    keypair: tuple[bytes, rsa.RSAPublicKey],
 ) -> None:  # item 10
     seen: list[httpx2.Request] = []
 
@@ -215,14 +215,20 @@ def test_is_private_uses_a_metadata_read_token_and_revokes_it(
             return httpx2.Response(200, json={"id": 1})
         if req.url.path.endswith("/access_tokens"):
             body = json.loads(req.content)
-            return httpx2.Response(201, json={"token": "ghs_m", "expires_at": "z",
-                                              "permissions": body["permissions"]})
+            return httpx2.Response(
+                201, json={"token": "ghs_m", "expires_at": "z", "permissions": body["permissions"]}
+            )
         if req.url.path == "/repos/thomasbardhi01/vigil":
             return httpx2.Response(200, json={"private": True})
         return httpx2.Response(204)
 
-    app = GitHubApp("1", keypair[0], http=httpx2.Client(transport=httpx2.MockTransport(handler)),
-                    claude_mods=CLAUDE_MODS, allowed_repos=["thomasbardhi01/vigil"])
+    app = GitHubApp(
+        "1",
+        keypair[0],
+        http=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        claude_mods=CLAUDE_MODS,
+        allowed_repos=["thomasbardhi01/vigil"],
+    )
     assert app.is_private("thomasbardhi01/vigil") is True
     mint = next(r for r in seen if r.url.path.endswith("/access_tokens"))
     assert json.loads(mint.content)["permissions"] == {"metadata": "read"}

@@ -76,6 +76,8 @@ def test_egress_only_reaches_the_allowlist(
         + "https://api.anthropic.com/ ; "
         + FETCH
         + "https://pypi.org/simple/ ; "
+        + FETCH
+        + "https://registry.npmjs.org/ ; "
         "python -c \"import socket\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=5); print('DIRECT-OPEN')\n"
         "except Exception as e:\n print('DIRECT-BLOCKED', e)\"",
     )
@@ -83,7 +85,8 @@ def test_egress_only_reaches_the_allowlist(
     assert lines[0].startswith("BLOCKED"), out  # example.com
     assert lines[1].startswith("BLOCKED"), out  # fly
     assert lines[2].startswith("BLOCKED"), out  # no direct model host: the gateway only
-    assert lines[3] == "200", out  # a package registry, for workers
+    assert lines[3] == "200", out  # PyPI, for workers
+    assert lines[4].startswith("BLOCKED"), out  # npm: no publishing path out (item 12)
     assert "DIRECT-BLOCKED" in out
 
 

@@ -103,10 +103,17 @@ Regenerate `schemas/*.json` after changing a contract model:
 `uv run python -m vigild.contract.export` (a test fails if they drift).
 
 ## Gotchas
-- **Docker Desktop on this Mac can't read `~/Documents`.** A bind mount from
-  there hangs `docker start` and wedges the engine until
-  `docker desktop restart`. Never bind-mount from the repo; keep data dirs
-  under `~` or a temp dir (pytest's `tmp_path` is fine).
+- **Never run host git in a clone a session has touched**, and never read a
+  file a session wrote with plain `open()`. A worker can write its `.git`
+  (hooks, `commondir`, `alternates`, `diff.external`) and plant symlinks.
+  All host git goes through `vigild/gitsafe.py`; a session's result comes
+  back as a bundle into vigild's vault (`Workspace.import_result`), and its
+  files are read as vault blobs or with `vigild/safefile.py`.
+- Scope globs are strict (`vigild/intake/paths.py` `in_scope`); money-path
+  detection keeps guard's loose rules (`matches`). Don't mix them up.
+- Never bind-mount from the repo into a container; keep data dirs under `~`
+  or a temp dir (pytest's `tmp_path` is fine). Docker Desktop needs Files and
+  Folders access to wherever they live (runbook).
 - Containers reach vigild's gateway as `host.docker.internal:8788`
   (192.168.65.254) through the smokescreen sidecar, which allows exactly
   that address:port. DNS is not the egress boundary; tests assert that
@@ -119,7 +126,7 @@ Regenerate `schemas/*.json` after changing a contract model:
 - The job FSM (`vigild/jobs/fsm.py`) is the only place a job's state
   changes. Inbox approval by the owner is the only exit from
   `spec_pending`; every transition writes an `events` row.
-- Glob semantics are guard's and route's: a glob without `/` matches the
+- Detection globs are guard's and route's: a glob without `/` matches the
   basename anywhere; with `/` it matches the path's tail;
   case-insensitive (`vigild/intake/paths.py`).
 - Untrusted text (issue bodies, PR comments, logs) enters a packet only

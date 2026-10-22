@@ -24,7 +24,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -37,25 +37,51 @@ from vigild.db import Store, iso, utcnow
 from vigild.metering.calls import CallUsage, SSEUsageTap, record_call, usage_from_anthropic
 from vigild.metering.prices import PriceTable
 from vigild.provenance import Provenance
-from vigild.repos import RepoPolicyError, check_backend
+from vigild.repos import RepoPolicyError, check_backend, check_decider_route
 
 FORWARD_HEADERS = ("anthropic-version", "anthropic-beta", "content-type", "accept")
 # Review round 1, item 5: only plain Messages requests pass. Server tools and
 # MCP connectors would let Anthropic fetch from or post to hosts the session's
 # proxy never allowed, and run up fees the gateway doesn't meter.
-ALLOWED_BODY_KEYS = frozenset({
-    "model", "messages", "system", "max_tokens", "metadata", "stop_sequences", "stream",
-    "temperature", "top_p", "top_k", "tools", "tool_choice", "thinking", "output_config",
-    "context_management",
-})  # fmt: skip
+ALLOWED_BODY_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "system",
+        "max_tokens",
+        "metadata",
+        "stop_sequences",
+        "stream",
+        "temperature",
+        "top_p",
+        "top_k",
+        "tools",
+        "tool_choice",
+        "thinking",
+        "output_config",
+        "context_management",
+    }
+)
 CLIENT_TOOL_TYPES = re.compile(r"^(custom|bash_\d{8}|text_editor_\d{8}|memory_\d{8})$")
 # Betas Claude Code 2.1.306 sends (observed through the gateway, 2026-10-22),
 # plus the ones vigild's own calls use. Anything else is refused by name.
-ALLOWED_BETAS = frozenset({
-    "claude-code-20250219", "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14", "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05", "effort-2025-11-24",
-})  # fmt: skip
+ALLOWED_BETAS = frozenset(
+    {
+        "claude-code-20250219",
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "context-management-2025-06-27",
+        "prompt-caching-scope-2026-01-05",
+        "effort-2025-11-24",
+        # Also sent by CLI 2.1.306, seen at the gateway in the live guard test.
+        # advanced-tool-use only matters with server tools, which _check_body refuses.
+        "thinking-token-count-2026-05-13",
+        "per-turn-control-2026-07-01",
+        "mid-conversation-tool-changes-2026-07-01",
+        "advanced-tool-use-2025-11-20",
+        "thinking-display-updates-2026-08-18",
+    }
+)
 # The CLI's own small-model side calls (titles, summaries) use this model; it is
 # the one model a session may call besides its routed one, where the repo allows it.
 SIDE_MODELS = frozenset({"claude-haiku-5-5"})
@@ -138,9 +164,16 @@ class Gateway:
         self.store.x(
             "INSERT INTO gateway_tokens (token_hash, session_id, repo, backend_preset, model,"
             " created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
-            (_hash(token), session_id, repo, preset, self.cfg.preset(preset).model or "", iso(),
-             iso(expires)),
-        )  # fmt: skip
+            (
+                _hash(token),
+                session_id,
+                repo,
+                preset,
+                self.cfg.preset(preset).model or "",
+                iso(),
+                iso(expires),
+            ),
+        )
         return token
 
     def revoke_all(self) -> int:
@@ -410,6 +443,64 @@ class Gateway:
         return resp.status_code, out_headers, data
 
     # --- vigild's own calls -------------------------------------------------------------
+
+    def metered(
+        self,
+        *,
+        repo: str,
+        route: str,
+        provider: str,
+        model: str,
+        purpose: str,
+        job_id: str | None,
+        run: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """A non-Anthropic call vigild makes itself (Jev): the same route check,
+        reservation and per-call row as everything through the gateway (item 11)."""
+        try:
+            check_decider_route(self.cfg, repo, route)
+        except RepoPolicyError as e:
+            raise GatewayError(403, "permission_error", str(e)) from e
+        try:
+            rid = self.budget.reserve(
+                session_id=None,
+                task_id=None,
+                amount=self.cfg.budgets.decider_call_usd,
+                purpose=purpose,
+            )
+        except BudgetExceeded as e:
+            raise GatewayError(403, "permission_error", str(e)) from e
+        started = time.monotonic()
+        cost = 0.0
+        try:
+            payload = run()
+            result = payload.get("result", payload) if isinstance(payload, dict) else {}
+            usage = (
+                (result.get("usage") if isinstance(result, dict) else None)
+                or payload.get("usage")
+                or {}
+            )
+            cost = record_call(
+                self.store,
+                self.prices,
+                session_id=None,
+                task_id=None,
+                job_id=job_id,
+                purpose=purpose,
+                provider=provider,
+                backend_preset=route,
+                model=model,
+                usage=CallUsage(
+                    tokens_in=int(usage.get("input_tokens") or 0),
+                    tokens_out=int(usage.get("output_tokens") or 0),
+                ),
+                provider_cost_usd=usage.get("cost"),
+                latency_ms=int((time.monotonic() - started) * 1000),
+                provenance=Provenance.CLAUDE,
+            )
+            return payload
+        finally:
+            self.budget.settle(rid, cost)
 
     def call(
         self, *, repo: str, preset: str, body: dict[str, Any], purpose: str, job_id: str | None

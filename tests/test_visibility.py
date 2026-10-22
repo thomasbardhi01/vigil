@@ -33,7 +33,7 @@ def test_matching_visibility_passes(cfg: Config) -> None:
 
 def test_a_public_yaml_entry_for_a_private_repo_stops_vigild(cfg: Config) -> None:
     gh = FakeGitHub({"thomasbardhi01/parkagent": True, "thomasbardhi01/vigil": True})
-    with pytest.raises(RepoPolicyError, match="parkagent.*private"):
+    with pytest.raises(RepoPolicyError, match=r"parkagent.*private"):
         verify_visibility(cfg, gh.is_private)
 
 
@@ -41,3 +41,17 @@ def test_a_failed_check_stops_vigild(cfg: Config) -> None:
     gh = FakeGitHub({"thomasbardhi01/parkagent": OSError("timeout"), "thomasbardhi01/vigil": True})
     with pytest.raises(RepoPolicyError, match="can't check"):
         verify_visibility(cfg, gh.is_private)
+
+
+def test_yaml_stricter_than_github_warns_and_keeps_the_yaml(
+    cfg: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vigil may be public on GitHub for a while; the YAML keeps it private,
+    which is the stricter rule, so vigild starts and warns."""
+    gh = FakeGitHub({"thomasbardhi01/parkagent": False, "thomasbardhi01/vigil": False})
+    with caplog.at_level("WARNING"):
+        verify_visibility(cfg, gh.is_private)
+    assert cfg.repos.repos["thomasbardhi01/vigil"].visibility == "private"
+    assert any(
+        "thomasbardhi01/vigil" in r.message and "stricter" in r.message for r in caplog.records
+    )

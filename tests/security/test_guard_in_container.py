@@ -70,6 +70,9 @@ def test_gh_pr_merge_is_refused_by_guard_in_a_worker_container(
     finally:
         vigild.gateway.revoke(sess.id)
         vigild.budget.settle_session(sess.id)
+    for e in vigild.store.events(session_id=sess.id):
+        if e.type == "gateway_refused":
+            print("gateway refused:", e.data["reason"])
     calls = vigild.store.q("SELECT model, cost_usd FROM model_calls WHERE session_id=?", (sess.id,))
     spend = sum(r["cost_usd"] for r in calls)
     print(f"\nguard test: {len(calls)} model calls through the gateway, ${spend:.5f}")

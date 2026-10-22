@@ -15,7 +15,6 @@ images:
 collector:
   container: otel-collector
   otlp_http: http://127.0.0.1:4318
-langfuse_url: http://127.0.0.1:3000
 github:
   owner: thomasbardhi01
   claude_mods: thomasbardhi01/claude-mods

@@ -13,6 +13,7 @@ gateway (`check_backend` again, per call).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,9 @@ PRIVATE_HOSTED_ROUTES = frozenset({"jev-cloudflare"})
 PRIVATE_HOSTED_PROVIDER_EXCEPTIONS: dict[str, frozenset[str]] = {
     "thomasbardhi01/vigil": frozenset({"anthropic"}),
 }
+
+
+log = logging.getLogger("vigild.repos")
 
 
 class RepoPolicyError(ValueError):
@@ -75,17 +79,19 @@ def check_decider_route(cfg: Config, repo: str, route: str) -> None:
 
 def verify_visibility(cfg: Config, is_private: Callable[[str], bool]) -> None:
     """Review round 1, item 10: the YAML's `visibility` is checked against the
-    repo itself (through the App) before vigild starts. A mismatch, or a check
-    that can't be made, stops vigild: a private repo must never be treated as
-    public by mistake."""
+    repo itself (through the App) before vigild starts. One direction only:
+    - YAML public, GitHub private: refuse to start (the YAML is less strict);
+    - YAML private, GitHub public: warn and keep the YAML (it is stricter, and
+      a repo may be public for a while and private again later);
+    - the check can't be made: refuse to start."""
     for repo, pol in cfg.repos.repos.items():
         try:
             private = is_private(repo)
         except Exception as e:
             raise RepoPolicyError(f"{repo}: can't check its visibility ({type(e).__name__})") from e
-        want = pol.visibility == "private"
-        if private != want:
-            actual = "private" if private else "public"
-            raise RepoPolicyError(
-                f"{repo} is {actual} on GitHub but configs/repos.yaml says {pol.visibility}"
+        if private and pol.visibility != "private":
+            raise RepoPolicyError(f"{repo} is private on GitHub but configs/repos.yaml says public")
+        if not private and pol.visibility == "private":
+            log.warning(
+                "%s is public on GitHub; configs/repos.yaml keeps it private (stricter)", repo
             )

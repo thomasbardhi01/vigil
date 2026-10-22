@@ -1,7 +1,11 @@
 # Per-session egress allowlists for the smokescreen sidecar (B4, B5).
 # No model host and no GitHub host is listed: hosted model calls go through
 # vigild's gateway (P1), and vigild pushes and opens PRs from the host (P2), so
-# a worker needs neither. Package registries stay for workers.
+# a worker needs neither. PyPI stays for workers (uploads go to
+# upload.pypi.org, which isn't listed). npm is gone (review r1, item 12): its
+# registry takes publishes on the same host as reads, and smokescreen can't
+# filter methods, so a worker's npm dependencies must be baked into its repo's
+# dev image.
 gateway:
   host: host.docker.internal
   port: 8788
@@ -17,6 +21,6 @@ proxy:
   port: 4750
 roles:
   coord:    []
-  worker:   [pypi.org, files.pythonhosted.org, registry.npmjs.org]
+  worker:   [pypi.org, files.pythonhosted.org]
   reviewer: []
   auditor:  []

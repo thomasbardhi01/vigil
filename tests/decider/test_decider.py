@@ -222,3 +222,43 @@ def test_jev_openrouter_pins_the_model_and_zdr() -> None:
     body = json.loads(seen[0].content)
     assert seen[0].url.path == "/api/alpha/decisions"
     assert body["model"] == "typesafe/jev-1.13" and body["provider"]["zdr"] is True
+
+
+# --- review round 1, item 11: Jev is metered and budgeted like every other call ----------
+
+
+def test_jev_calls_go_through_the_gateways_meter(cfg: Config, store: Store) -> None:
+    from vigild.budget import Budget
+    from vigild.config import Secrets
+    from vigild.gateway.service import Gateway
+
+    gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
+    fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
+    client = httpx2.Client(
+        transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json=fixture))
+    )
+    jev = JevCloudflare(client, account_id="a", token="t", meter=gw.metered)
+    assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None).value == "S"
+    row = store.q("SELECT provider, model, tokens_in, cost_usd, purpose FROM model_calls")[0]
+    assert (row["provider"], row["model"], row["tokens_in"]) == ("cloudflare", "typesafe/jev", 412)
+    assert row["cost_usd"] == pytest.approx(412 * 0.042 / 1e6)
+    assert store.q("SELECT COUNT(*) n FROM ledger")[0]["n"] == 1
+
+
+def test_the_meter_refuses_a_route_the_repo_does_not_list(cfg: Config, store: Store) -> None:
+    from vigild.budget import Budget
+    from vigild.config import Secrets
+    from vigild.gateway.service import Gateway, GatewayError
+
+    gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
+    client = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(500)))
+    jev = JevOpenRouter(client, token="t", meter=gw.metered)
+    with pytest.raises(GatewayError, match="jev-openrouter"):
+        jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
+
+
+def test_decider_checks_the_route_before_asking(cfg: Config, store: Store) -> None:
+    cfg.repos.repos[PA].decider = ["haiku"]
+    jev, haiku = Fixed("jev-cloudflare", 0.99), Fixed("haiku", 0.9)
+    d = Decider(cfg, store, {"jev-cloudflare": jev, "haiku": haiku})
+    assert d.decide(PA, QUESTIONS["size"], "x").answer.backend == "haiku" and jev.calls == []

@@ -257,9 +257,10 @@ Sources: https://platform.claude.com/docs/en/about-claude/models/overview · htt
   through the sidecar, `host.docker.internal` (192.168.65.254) reaches a
   server bound to the Mac's `127.0.0.1`. That is how workers reach the
   gateway. Direct connections out fail ("Network is unreachable").
-- **Checked 2026-10-22:** on this Mac, a bind mount from `~/Documents`
-  hangs `docker start` and wedges the engine until Docker Desktop restarts.
-  Mounts from the home directory and from `/private/var/folders` work.
+- **Checked 2026-10-22:** without Files and Folders access to `~/Documents`,
+  a bind mount from there hangs `docker start` until Docker Desktop restarts.
+  The grant has since been given on this Mac. Mounts from the home directory
+  and from `/private/var/folders` work either way.
 - **Not verified:** that a Desktop container reaches a tailnet `100.x`
   address while the Tailscale app runs. Phase 5 tests it first.
 

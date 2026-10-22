@@ -19,12 +19,19 @@ RUN apt-get update \
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# The CLI and its whole dependency tree come from a committed lockfile
+# (generated with --before=2026-10-22, the day after 2.1.306 shipped).
+COPY cli/package.json cli/package-lock.json /opt/claude-cli/
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
- && npm install -g --no-fund --no-audit @anthropic-ai/claude-code@2.1.306 \
+ && cd /opt/claude-cli && npm ci --no-fund --no-audit \
+ && ln -s /opt/claude-cli/node_modules/.bin/claude /usr/local/bin/claude \
  && npm cache clean --force \
  && claude --version | grep -q '^2\.1\.306'
 
-RUN pip install --no-cache-dir claude-agent-sdk==0.2.165
+# The SDK and its transitive deps, hash-locked (uv pip compile --generate-hashes,
+# exclude-newer 2026-10-08): images/claude-executor/requirements.txt.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 # The non-root user (bypassPermissions refuses root).
 RUN groupadd -g 10001 vigil && useradd -u 10001 -g 10001 -m -d /home/vigil -s /bin/bash vigil

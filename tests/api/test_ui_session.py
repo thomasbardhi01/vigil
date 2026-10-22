@@ -84,14 +84,19 @@ def test_bearer_still_works_for_the_cli(ui_client: TestClient, tokens: Tokens) -
     assert ui_client.get("/api/inbox", headers=auth(tokens.admin)).status_code == 200
 
 
-def test_the_loopback_listener_has_no_ui_login(client: TestClient, tokens: Tokens) -> None:  # item 20
+def test_the_loopback_listener_has_no_ui_login(
+    client: TestClient, tokens: Tokens
+) -> None:  # item 20
     """P7: the UI is served on the Tailscale address only; loopback is bearer-only."""
     assert client.post("/api/login", json={"token": tokens.admin}).status_code == 404
     client.cookies.set("vigil_session", "anything")
     assert client.get("/api/inbox").status_code == 401
 
 
-def test_secure_cookie_behind_tailscale_serve(ui_client: TestClient, tokens: Tokens) -> None:  # item 20
-    r = ui_client.post("/api/login", json={"token": tokens.admin},
-                       headers={"X-Forwarded-Proto": "https"})
+def test_secure_cookie_behind_tailscale_serve(
+    ui_client: TestClient, tokens: Tokens
+) -> None:  # item 20
+    r = ui_client.post(
+        "/api/login", json={"token": tokens.admin}, headers={"X-Forwarded-Proto": "https"}
+    )
     assert "Secure" in r.headers["set-cookie"]

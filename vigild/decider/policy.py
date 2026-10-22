@@ -13,6 +13,7 @@ from vigild.config import Config
 from vigild.db import Store, iso
 from vigild.decider.questions import Answer, DeciderError, Question
 from vigild.provenance import Provenance
+from vigild.repos import RepoPolicyError, check_decider_route
 
 ACT = 0.85
 ESCALATE = 0.6
@@ -73,8 +74,9 @@ class Decider:
         self, route: str, q: Question, state: str, repo: str, job_id: str | None
     ) -> Answer | None:
         try:
+            check_decider_route(self.cfg, repo, route)  # item 11: never a route the repo omits
             return self.backends[route].ask(q, state, repo=repo, job_id=job_id)
-        except DeciderError as e:
+        except (DeciderError, RepoPolicyError) as e:
             self.store.add_event(
                 "decision",
                 {"route": route, "question": q.name, "error": str(e)},

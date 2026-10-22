@@ -39,6 +39,8 @@ def _handler(req: httpx2.Request) -> httpx2.Response:
         )
     if p == "/installation/token":
         return httpx2.Response(204)
+    if p == "/repos/thomasbardhi01/vigil":
+        return httpx2.Response(200, json={"private": False})
     if p == "/healthz":
         return httpx2.Response(200, text="OK")
     return httpx2.Response(404)
@@ -72,6 +74,8 @@ def test_doctor_checks_and_never_prints_values(cfg: Config, tmp_path: object) ->
     assert names["token mint+revoke: thomasbardhi01/vigil"].ok
     assert names["token mint+revoke: thomasbardhi01/claude-mods (contents:read)"].ok
     assert names["configs (incl. the private-repo rule)"].ok
+    vis = names["visibility: thomasbardhi01/vigil"]
+    assert vis.ok and "keeps it private" in vis.note
     assert not names["CLOUDFLARE_API_TOKEN"].ok  # missing: reported, not fatal
     out = render(checks)
     for v in [*SECRET_VALUES, "ghs_x"]:

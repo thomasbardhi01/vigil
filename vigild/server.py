@@ -107,16 +107,17 @@ async def serve(v: Vigild) -> None:
     gw = v.cfg.vigild.gateway
     configs = [
         uvicorn.Config(create_app(v.services), host=api.host, port=api.port, log_level="info"),
-        uvicorn.Config(create_gateway_app(v.gateway), host=gw.host, port=gw.port,
-                       log_level="info"),
-    ]  # fmt: skip
+        uvicorn.Config(create_gateway_app(v.gateway), host=gw.host, port=gw.port, log_level="info"),
+    ]
     if api.tailscale_host:
         configs.append(
             uvicorn.Config(
-                create_app(v.services, ui=True), host=api.tailscale_host, port=api.port,
+                create_app(v.services, ui=True),
+                host=api.tailscale_host,
+                port=api.port,
                 log_level="info",
             )
-        )  # fmt: skip
+        )
     else:
         log.warning("config: web UI login is off (api.tailscale_host is not set)")
     await asyncio.gather(*(uvicorn.Server(c).serve() for c in configs))
@@ -131,9 +132,12 @@ def _github_app(v: Vigild) -> Any:
     if not (app_id and key_path):
         return None
     return GitHubApp(
-        app_id, Path(key_path).expanduser().read_bytes(), http=httpx2.Client(timeout=30),
-        claude_mods=v.cfg.vigild.github.claude_mods, allowed_repos=list(v.cfg.repos.repos),
-    )  # fmt: skip
+        app_id,
+        Path(key_path).expanduser().read_bytes(),
+        http=httpx2.Client(timeout=30),
+        claude_mods=v.cfg.vigild.github.claude_mods,
+        allowed_repos=list(v.cfg.repos.repos),
+    )
 
 
 def build_runner(v: Vigild, app: Any) -> JobRunner:
@@ -158,9 +162,17 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
     runtime = DockerRuntime(v.cfg, client)
     runner = JobRunner(
-        v.cfg, v.store, v.budget, v.gateway, runtime, ws, publisher, v.telemetry,
-        DevImages(v.cfg, v.store, DockerImages(client)), reaper=runtime.reap,
-    )  # fmt: skip
+        v.cfg,
+        v.store,
+        v.budget,
+        v.gateway,
+        runtime,
+        ws,
+        publisher,
+        v.telemetry,
+        DevImages(v.cfg, v.store, DockerImages(client)),
+        reaper=runtime.reap,
+    )
     runner.jobs = v.services.jobs
     return runner
 
@@ -195,6 +207,7 @@ def main() -> None:
     v.services.jobs.runner = runner
     log.info("reconcile: %s", runner.reconcile())
     stop = threading.Event()
-    threading.Thread(target=validate_images_forever, args=(runner.dev_images, stop),
-                     daemon=True).start()  # fmt: skip
+    threading.Thread(
+        target=validate_images_forever, args=(runner.dev_images, stop), daemon=True
+    ).start()
     asyncio.run(serve(v))

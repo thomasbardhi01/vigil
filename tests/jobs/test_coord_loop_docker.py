@@ -8,6 +8,7 @@ routing is the configured one in production."""
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -62,14 +63,15 @@ def live(
     client = docker.from_env()
     images = DevImages(cfg, v.store, DockerImages(client))
     assert images.validate(REPO).ok
-    publisher = BarePublisher()
+    ws = Workspace(tmp_path / "work", remote_url=lambda r: str(fixture_repo["bare"]))
+    publisher = BarePublisher(ws)
     runner = JobRunner(
         cfg,
         v.store,
         v.budget,
         v.gateway,
         DockerRuntime(cfg, client),
-        Workspace(tmp_path / "work", remote_url=lambda r: str(fixture_repo["bare"])),
+        ws,
         publisher,
         v.telemetry,
         images,
@@ -123,6 +125,8 @@ def test_two_workers_build_in_their_own_containers(
     print(
         f"\ncoord done: ${spend():.4f}; specs={len(inbox['specs'])} pages={[q['title'] for q in inbox['questions']]}"
     )
+    for q in inbox["questions"]:
+        print("page:", q["title"], json.dumps(q["body"])[:1500])
     assert len(inbox["specs"]) == 1, inbox["questions"]
     item = inbox["specs"][0]
     c.post(f"/api/inbox/{item['id']}/approve", headers=auth(tokens.admin), json={})
@@ -132,7 +136,9 @@ def test_two_workers_build_in_their_own_containers(
         f"after build: ${spend():.4f}; state={tree['job']['state']}; "
         f"pages={[q['title'] for q in inbox['questions']]}"
     )
-    workers = tree["sessions"][0]["children"]
+    # one coord session per draft; the workers hang under the draft that passed
+    coord = [r for r in tree["sessions"] if r["role"] == "coord"][-1]
+    workers = coord["children"]
     print("workers:", [(w["id"], w["status"], w["pr_url"]) for w in workers])
     assert len(workers) == 2
     assert all(w["status"] == "pr_open" for w in workers)

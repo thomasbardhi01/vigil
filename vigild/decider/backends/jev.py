@@ -8,7 +8,8 @@ Cloudflare token, and the fixtures are then replaced with recorded ones.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Protocol
 
 import httpx2
 
@@ -41,13 +42,50 @@ def _parse(q: Question, payload: dict[str, Any], backend: str) -> tuple[Answer, 
     return q.parse(choice, prob, backend=backend, model_version=version), version
 
 
+class Meter(Protocol):
+    """The gateway's shared metering path (review round 1, item 11): it checks
+    the repo lists the route, reserves, calls, records the call, settles."""
+
+    def __call__(
+        self,
+        *,
+        repo: str,
+        route: str,
+        provider: str,
+        model: str,
+        purpose: str,
+        job_id: str | None,
+        run: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+
 class _Jev:
     name = "jev"
+    provider = ""
+    model = ""
     version_changed = False
 
-    def __init__(self, client: httpx2.Client, known_version: str | None = None) -> None:
+    def __init__(
+        self, client: httpx2.Client, known_version: str | None = None, meter: Meter | None = None
+    ) -> None:
         self.client = client
         self.known_version = known_version
+        self.meter = meter
+
+    def _call(
+        self, repo: str, job_id: str | None, run: Callable[[], dict[str, Any]]
+    ) -> dict[str, Any]:
+        if self.meter is None:
+            return run()
+        return self.meter(
+            repo=repo,
+            route=self.name,
+            provider=self.provider,
+            model=self.model,
+            purpose="decider",
+            job_id=job_id,
+            run=run,
+        )
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -68,6 +106,8 @@ class _Jev:
 
 class JevCloudflare(_Jev):
     name = "jev-cloudflare"
+    provider = "cloudflare"
+    model = "typesafe/jev"
 
     def __init__(
         self,
@@ -76,8 +116,9 @@ class JevCloudflare(_Jev):
         account_id: str,
         token: str,
         known_version: str | None = None,
+        meter: Meter | None = None,
     ) -> None:
-        super().__init__(client, known_version)
+        super().__init__(client, known_version, meter)
         self.account_id = account_id
         self.token = token
 
@@ -87,8 +128,9 @@ class JevCloudflare(_Jev):
             "model": "typesafe/jev",
             "input": {"context": state[:96_000], "questions": [_question(q)]},
         }
-        payload = self._post(
-            CF_URL.format(account=self.account_id), {"Authorization": f"Bearer {self.token}"}, body
+        url = CF_URL.format(account=self.account_id)
+        payload = self._call(
+            repo, job_id, lambda: self._post(url, {"Authorization": f"Bearer {self.token}"}, body)
         )
         if payload.get("success") is False:
             raise DeciderError("jev-cloudflare: success=false")
@@ -97,11 +139,18 @@ class JevCloudflare(_Jev):
 
 class JevOpenRouter(_Jev):
     name = "jev-openrouter"
+    provider = "openrouter"
+    model = "typesafe/jev-1.13"
 
     def __init__(
-        self, client: httpx2.Client, *, token: str, known_version: str | None = "jev-1.13"
+        self,
+        client: httpx2.Client,
+        *,
+        token: str,
+        known_version: str | None = "jev-1.13",
+        meter: Meter | None = None,
     ) -> None:
-        super().__init__(client, known_version)
+        super().__init__(client, known_version, meter)
         self.token = token
 
     def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
@@ -110,5 +159,9 @@ class JevOpenRouter(_Jev):
             "provider": {"zdr": True, "data_collection": "deny"},
             "input": {"context": state, "questions": [_question(q)]},
         }
-        payload = self._post(OR_URL, {"Authorization": f"Bearer {self.token}"}, body)
+        payload = self._call(
+            repo,
+            job_id,
+            lambda: self._post(OR_URL, {"Authorization": f"Bearer {self.token}"}, body),
+        )
         return self._finish(q, payload)

@@ -122,6 +122,17 @@ def run_checks(
             app.revoke(tok.token)
             return True, ""
 
+        def visibility(repo: str) -> tuple[bool, str]:
+            private = app.is_private(repo)
+            yaml_private = cfg.repo(repo).visibility == "private"
+            if private and not yaml_private:
+                return False, "private on GitHub, public in repos.yaml"
+            if yaml_private and not private:
+                return True, "public on GitHub; repos.yaml keeps it private"
+            return True, "matches"
+
+        for repo in repos if repos is not None else list(cfg.repos.repos):
+            out.append(_safe(f"visibility: {repo}", lambda r=repo: visibility(r)))
         for repo in repos if repos is not None else list(cfg.repos.repos):
             out.append(
                 _safe(

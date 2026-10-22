@@ -179,7 +179,10 @@ def check_job_spec(
     levels = {v.criterion: v for v in plan.verify}
     for c in spec.criteria:
         if c.ident not in levels and not plan.errors:
-            errors.append(f"plan.md has no verify entry for {c.ident}")
+            errors.append(
+                f"plan.md has no verify entry for {c.ident} (verify names "
+                f"{sorted(levels) or 'nothing'}; use the spec's ids: AC1, AC2, …)"
+            )
     for v in plan.verify:
         if v.level not in BUILT_VERIFY_LEVELS:
             errors.append(f"{v.criterion}: verify level {v.level} isn't built yet (phase 1: 0)")

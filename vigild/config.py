@@ -174,7 +174,6 @@ class Vigild(_M):
     fleet_coord: str
     images: Images
     collector: Collector
-    langfuse_url: str
     github: GitHub
     container: ContainerLimits
 

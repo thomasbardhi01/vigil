@@ -99,6 +99,9 @@ def test_worker_allowlist_has_registries_but_no_github(cfg: Config) -> None:
     hosts = allowlist(cfg, Role.WORKER)
     assert "pypi.org" in hosts and "host.docker.internal" in hosts
     assert "github.com" not in hosts and "api.github.com" not in hosts
+    # review r1, item 12: npm accepts PUTs on the same host as reads, and
+    # smokescreen can't filter methods, so workers get no npm at all
+    assert "registry.npmjs.org" not in hosts
     assert not any("anthropic" in h or "openrouter" in h for h in hosts)
 
 

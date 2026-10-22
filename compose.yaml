@@ -4,8 +4,8 @@
 #
 #   docker compose --env-file ~/.config/vigil/env up -d --build
 #
-# Nothing is bind-mounted from the repo: Docker Desktop on this Mac can't
-# read ~/Documents, and a bind mount from there hangs the engine.
+# Nothing is bind-mounted from the repo, so no container depends on where the
+# checkout lives (the collector's config is baked into its image).
 #
 # Secrets come from the env file by interpolation only: PHOENIX_SECRET,
 # PHOENIX_ADMIN_SECRET, PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD (runbook).

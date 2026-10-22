@@ -30,7 +30,9 @@ the phases that build those things.
   - Model calls go through vigild's gateway (P1). A session gets a
     per-session gateway token, on its stdin, never in the environment
     `docker inspect` shows. The token works only on the gateway, only for
-    that session's repo and backend, and only until the session ends.
+    that session's repo and model, and expires with the session; every token
+    is revoked when vigild restarts. Token-shaped strings are redacted from
+    session events.
   - vigild pushes branches and opens PRs from the host (P2). The one-hour
     installation token lives in vigild's memory for one publish and is
     revoked after it.
@@ -89,6 +91,9 @@ vigild narrows that in code (`vigild/github/app.py`, ADR-0001):
 - **Permissions:** each token is one repo, one hour, and only what its use
   needs.
   - Publishing a branch: contents:write and pull_requests:write.
+  - Refreshing a mirror: contents:read (no host git credentials are ever
+    used).
+  - Checking a repo's visibility at start: metadata:read.
   - Label intake (phase 2): issues:read.
 - **Revoked:** after every use. Anything GitHub grants beyond what was
   asked (other than the metadata:read it always adds) makes vigild revoke
@@ -124,17 +129,13 @@ status issue (#1), and waits for you.
 
 - 4.94 with a 12 GiB VM. That fits Phoenix (2 GiB cap), the collector
   (256 MiB), and the sessions (4 GiB cap each, plus a 128 MiB proxy).
-- **Docker Desktop can't read `~/Documents`** here: macOS hasn't granted
-  it Files and Folders access to that folder.
-  - A bind mount from `~/Documents` (where the vigil checkout lives) hangs
-    `docker start`, and the engine stays wedged until Docker Desktop
-    restarts (`docker desktop restart`).
-  - So nothing vigil runs bind-mounts from the repo: the collector's
-    config is baked into its image.
-  - vigild's data directory (`~/vigil-data`: clones, session files) must
-    stay outside `~/Documents`, `~/Desktop` and `~/Downloads`.
-  - To allow it instead: System Settings → Privacy & Security → Files and
-    Folders → Docker → Documents.
+- **Setup step: if you keep checkouts in `~/Documents`, grant Docker
+  access to it** (System Settings → Privacy & Security → Files and Folders
+  → Docker → Documents). Without that grant, a bind mount from there hangs
+  `docker start` until Docker Desktop restarts. Done on this Mac.
+- Even so, nothing vigil runs bind-mounts from the repo: the collector's
+  config is baked into its image, and vigild's data (`~/vigil-data`: clones,
+  session files) lives outside the checkout.
 - The CLI is at `~/.docker/bin/docker`. Put it on `PATH` for launchd jobs.
 
 ### Build the images
@@ -162,31 +163,23 @@ docker compose --env-file ~/.config/vigil/env up -d --build
 - vigild attaches the collector to each session's network as
   `otel-collector`.
 
-### Validate the dev images, nightly
+### Dev images
 
-A session runs only in its repo's pinned dev image, validated less than
-26 hours ago. Run the validation once by hand, then nightly from launchd:
+A session runs only in its repo's pinned dev image, validated less than 26
+hours ago. **vigild validates every repo's image itself, at start and every
+24 hours**: the repo's `dev_image_check`, plus `command -v` for each tool in
+`dev_image_tools`. No launchd job. To validate by hand (after a rebuild):
 
 ```sh
 uv run python cli/vigil validate-images
 ```
 
-`~/Library/LaunchAgents/dev.vigil.validate-images.plist` (03:00 daily):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.vigil.validate-images</string>
-  <key>WorkingDirectory</key><string>/Users/thomasbardhi/Documents/vigil</string>
-  <key>ProgramArguments</key><array>
-    <string>/opt/homebrew/bin/uv</string><string>run</string><string>python</string>
-    <string>cli/vigil</string><string>validate-images</string></array>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>/Users/thomasbardhi/.docker/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
-  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
-</dict></plist>
-```
+`dev_image_tools` is also what a `test_cmd` may use: the spec gate refuses a
+test that needs anything else. **ParkAgent today:** its dev image is the
+executor image, which has no pnpm and none of ParkAgent's dependencies, so
+only doc- and grep-style tasks can run there. A ParkAgent dev image (Node 24,
+pnpm, its lockfile's dependencies baked in, since workers have no npm egress)
+needs ParkAgent's lockfile, which waits on your go-ahead.
 
 ### Check everything
 
@@ -203,8 +196,20 @@ It prints one `pass`, `fail` or `skip` line per check, never a value. Add
 uv run python -m vigild
 ```
 
-- The API is at 127.0.0.1:8787, plus the Tailscale address when
-  `api.tailscale_host` is set.
+- **At start** vigild:
+  - reads each repo's real visibility through the App. It refuses to start
+    if `configs/repos.yaml` says public for a repo that is private, or if it
+    can't check (so the App must be configured). A repo the YAML keeps
+    private that is public on GitHub only logs a warning: the YAML's stricter
+    rule stays in force;
+  - reconciles anything a previous run left behind: tokens revoked, session
+    containers removed, reservations settled, mid-flight jobs blocked with a
+    resumable page in the inbox;
+  - validates the dev images.
+- The API is at 127.0.0.1:8787, bearer tokens only (the CLI and MCP).
+- The web UI's login exists only on the Mac's Tailscale address
+  (`api.tailscale_host`; unset means no UI login). Behind `tailscale serve`
+  (HTTPS) the session cookie is `Secure` automatically.
 - The gateway is at 127.0.0.1:8788. Containers reach it as
   `host.docker.internal:8788` through their proxy; Docker Desktop forwards
   that to the Mac's loopback.

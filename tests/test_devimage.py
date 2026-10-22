@@ -121,8 +121,10 @@ def test_parkagent_image_has_no_pnpm_so_pnpm_tests_are_refused(cfg: Config) -> N
     assert missing_tools(cfg, PA, "grep -q 'rate limit' docs/feature-map.md") == []
 
 
-def test_validate_all_covers_every_repo(parts: tuple[DevImages, FakeDocker, Clock]) -> None:  # item 21
-    images, docker, _ = parts
+def test_validate_all_covers_every_repo(
+    parts: tuple[DevImages, FakeDocker, Clock],
+) -> None:  # item 21
+    images, _, _ = parts
     out = images.validate_all()
     assert sorted(v.repo for v in out) == sorted(images.cfg.repos.repos)
     for repo in images.cfg.repos.repos:
