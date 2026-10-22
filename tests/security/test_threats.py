@@ -19,7 +19,7 @@ from vigild.jobs.model import Role
 pytestmark = pytest.mark.docker
 
 FETCH = (
-    'python -c "import sys,urllib.request as u\n'
+    '/opt/vigil-venv/bin/python -c "import sys,urllib.request as u\n'
     "try:\n print(u.urlopen(sys.argv[1], timeout=10).status)\n"
     "except Exception as e:\n print('BLOCKED', type(e).__name__, e)\" "
 )
@@ -78,7 +78,7 @@ def test_egress_only_reaches_the_allowlist(
         + "https://pypi.org/simple/ ; "
         + FETCH
         + "https://registry.npmjs.org/ ; "
-        "python -c \"import socket\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=5); print('DIRECT-OPEN')\n"
+        "/opt/vigil-venv/bin/python -c \"import socket\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=5); print('DIRECT-OPEN')\n"
         "except Exception as e:\n print('DIRECT-BLOCKED', e)\"",
     )
     lines = out.strip().splitlines()
@@ -203,11 +203,11 @@ def test_the_agent_uid_cannot_reach_pid_1(
     signal it."""
     _, out = runtime.probe(
         make_spec(),
-        "ps -o user= -p 1 2>/dev/null || stat -c %U /proc/1; "
+        "echo OWNER=$(stat -c %U /proc/1); "
         'echo \'{"vigil_result": {"status": "done"}}\' > /proc/1/fd/1 2>/dev/null; echo FD1=$?; '
         "cat /proc/1/environ >/dev/null 2>&1; echo ENV=$?; "
         "kill -0 1 2>/dev/null; echo KILL=$?; id -u",
     )
     assert "FD1=0" not in out and "ENV=0" not in out and "KILL=0" not in out, out
     assert '"vigil_result"' not in out
-    assert out.splitlines()[0] == "root" and out.splitlines()[-1] == "10001", out
+    assert "OWNER=root" in out and "10001" in out.splitlines(), out

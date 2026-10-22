@@ -185,6 +185,22 @@ image, with no network. There is no timer and no launchd job.
   uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
   ```
 
+- **Session images.** A repo's coord and worker sessions run in its session
+  image: the executor layer (`images/claude-executor/Dockerfile`) built over
+  its dev image, so workers can run the real suite offline. vigild builds it
+  right after the dev image, and rebuilds it when the dev image or the layer
+  changes (ParkAgent's: about 4.8 GB, the layer about 25 s with a warm build
+  cache). It fails, pages and rebuilds like a dev image. The generic
+  `vigil/claude-executor` image (`scripts/build-images.py`) is the same layer
+  over the pinned Python base; the security tests run against all three.
+- **Test commands** must run pytest or vitest (directly, or through a package
+  script): the verifier judges by their JUnit report, and the spec gate
+  refuses anything else.
+- **A task that needs a dependency** blocks with an inbox item listing the
+  packages and the worker's manifest and lockfile diff. Until phase 2's deps
+  job exists, make the dependency change yourself in its own PR (manifest and
+  lockfile only), let it merge, then press **Retry** on the item: the new
+  base changes the dev image key, so vigild builds the new image first.
 - `dev_image_tools` is what a `test_cmd` may use; the spec gate refuses a
   test that needs anything else. `dev_excluded` says which suites can't run
   in a Linux container and why: for ParkAgent, the iOS app (Xcode).

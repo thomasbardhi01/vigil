@@ -61,7 +61,7 @@ def live(
         backends=["claude-haiku"],
         dev_dockerfile="images/dev/fixture.Dockerfile",
         dev_lockfiles=["README.md"],
-        dev_suites={"smoke": "git --version && python -m pytest --version"},
+        dev_suites={"smoke": "python -m pytest --version"},
         dev_image_tools=["git", "grep", "python", "pytest"],
     )
     client = docker.from_env()
@@ -165,6 +165,10 @@ def test_two_workers_build_in_their_own_containers(
         f"after build: ${spend():.4f}; state={tree['job']['state']}; "
         f"pages={[q['title'] for q in inbox['questions']]}"
     )
+    for q in inbox["questions"]:
+        print("page:", q["title"], json.dumps(q["body"])[:3000])
+    for a in v.store.q("SELECT task_id, content FROM artifacts WHERE name='tests.json'"):
+        print("tests.json", a["task_id"], a["content"][:3000])
     # one coord session per draft; the workers hang under the draft that passed
     coord = [r for r in tree["sessions"] if r["role"] == "coord"][-1]
     workers = coord["children"]

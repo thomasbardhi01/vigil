@@ -109,10 +109,15 @@ Regenerate `schemas/*.json` after changing a contract model:
   All host git goes through `vigild/gitsafe.py`; a session's result comes
   back as a bundle into vigild's vault (`Workspace.import_result`), and its
   files are read as vault blobs or with `vigild/safefile.py`.
-- **Test results come only from the verifier** (`vigild/verifier.py`): a
-  fresh vault checkout, the repo's dev image, no network. Never read a test
-  outcome from anything a session wrote, and never trust a worker report's
-  test fields. The executor's harness is root; the agent is uid 10001.
+- **Test results come only from the verifier** (`vigild/verifier.py`): fresh
+  vault checkouts with the base's runner files, the repo's plain dev image
+  (never the session image), no network, three runs (base, before, after)
+  compared by their JUnit reports. Never read a test outcome from anything a
+  session wrote, and never trust a worker report's test fields.
+- Sessions run in the repo's session image: one executor layer
+  (`images/claude-executor/Dockerfile`) over its dev image. Keep the layer
+  the only executor definition; the harness is root, the agent uid 10001.
+- Parse shell lines with `vigild/shellwords.py`, nothing else.
 - Secrets are scrubbed by one function, `vigild.redact.redact`; use it for
   anything a session or model produced that vigild stores or publishes.
 - A new DB column is a new step at the end of `vigild/db.py` `MIGRATIONS`
