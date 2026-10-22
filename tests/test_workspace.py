@@ -160,3 +160,89 @@ def test_mirror_file_reads_the_base_tip(tmp_path: Path, fixture_repo: dict[str, 
     assert ws.mirror_file("o/fixture", "main", "README.md") == "# fixture\n"
     assert ws.mirror_file("o/fixture", "main", "nope.txt") is None
     assert ws.mirror_file("o/fixture", "main;rm", "README.md") is None
+
+
+# --- round 5: the clone race (CI run 39869589271) -----------------------------------------
+
+
+def test_host_git_never_runs_auto_maintenance_or_gc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A clone copies the mirror's objects/ while a fetch's auto-maintenance
+    holds objects/maintenance.lock: the file vanished mid-copy. vigild's git
+    runs no auto-maintenance or auto-gc in any repo it owns."""
+    import subprocess as sp
+
+    from vigild import gitsafe
+
+    seen: list[list[str]] = []
+    real = sp.run
+
+    def spy(cmd: list[str], **kw: object) -> sp.CompletedProcess[str]:
+        seen.append(list(cmd))
+        return real(cmd, **kw)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", spy)
+    gitsafe.git(tmp_path, "init", "-q", str(tmp_path / "r"))
+    gitsafe.git_bytes(tmp_path / "r", "status")
+    for cmd in seen:
+        joined = " ".join(cmd)
+        assert "-c maintenance.auto=false" in joined and "-c gc.auto=0" in joined, joined
+
+
+def test_a_clone_holds_the_repo_lock_while_it_copies_the_mirror(
+    tmp_path: Path, fixture_repo: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    ws.mirror("o/fixture")
+    held: list[bool] = []
+    real = ws._git
+
+    def spy(cwd: Path, *args: str, token: str | None = None) -> str:
+        if args[:2] == ("clone", "--no-hardlinks"):
+            held.append(ws._locks["o/fixture"].locked())
+        return real(cwd, *args, token=token)
+
+    monkeypatch.setattr(ws, "_git", spy)
+    ws.clone("o/fixture", "fx-0001-w1", branch="vigil/fx-0001-w1", base="main")
+    assert held == [True]
+
+
+def test_parallel_clones_and_fetches_on_one_mirror(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """What a wave does: workers cloning from one mirror while it's fetched."""
+    import threading
+
+    seed = fixture_repo["seed"]
+    for i in range(40):  # enough objects that a fetch would want to maintain
+        (seed / f"f{i}.txt").write_text(f"{i}\n" * 50)
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", f"c{i}")
+    git(seed, "push", "-q", "origin", "main")
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    ws.mirror("o/fixture")
+    errors: list[BaseException] = []
+
+    def clone(n: int) -> None:
+        try:
+            ws.clone("o/fixture", f"fx-0001-w{n}", branch=f"vigil/fx-0001-w{n}", base="main")
+        except BaseException as e:
+            errors.append(e)
+
+    def fetch() -> None:
+        try:
+            for _ in range(5):
+                ws.mirror("o/fixture")
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=clone, args=(n,)) for n in range(1, 7)]
+    threads.append(threading.Thread(target=fetch))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    mirror = ws._mirror_path("o/fixture")
+    assert not list((mirror / "objects").glob("*.lock"))

@@ -96,8 +96,13 @@ class Workspace:
         return self.data_dir / "mirrors" / owner / f"{name}.git"
 
     def mirror(self, repo: str) -> Path:
+        with self._repo_lock(repo):
+            return self._update_mirror(repo)
+
+    def _update_mirror(self, repo: str) -> Path:
+        """Fetch (or make) the mirror; the caller holds the repo's lock."""
         path = self._mirror_path(repo)
-        with self._repo_lock(repo), self.token_for(repo) as token:
+        with self.token_for(repo) as token:
             if path.exists():
                 self._git(path, "remote", "update", "--prune", token=token)
             else:
@@ -113,16 +118,19 @@ class Workspace:
             raise WorkspaceError(f"bad task id {task_id!r}")
         if not BRANCH.match(branch) or ".." in branch:
             raise WorkspaceError(f"branch {branch!r} must be vigil/*")
-        mirror = self.mirror(repo)
-        base_sha = self._git(mirror, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
         dest = self.data_dir / "clones" / task_id
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        self._git(
-            dest.parent, "clone", "--no-hardlinks", "--quiet", "--branch", base, str(mirror),
-            str(dest),
-        )  # fmt: skip
+        # one lock for the fetch and the copy: no fetch writes the mirror while
+        # a clone copies its objects (round 5)
+        with self._repo_lock(repo):
+            mirror = self._update_mirror(repo)
+            base_sha = self._git(mirror, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
+            if dest.exists():
+                shutil.rmtree(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self._git(
+                dest.parent, "clone", "--no-hardlinks", "--quiet", "--branch", base,
+                str(mirror), str(dest),
+            )  # fmt: skip
         self._git(dest, "checkout", "--quiet", "--detach", base_sha)
         self._git(dest, "checkout", "--quiet", "-b", branch)
         self._git(dest, "remote", "remove", "origin")
@@ -261,7 +269,7 @@ class Workspace:
         self._git(src, "config", "core.hooksPath", "/dev/null")
         self._git(src, "config", "core.fsmonitor", "false")
         wants = sorted({sha, *(c for c, _ in take)})
-        with self._repo_lock(f"vault:{repo}"):
+        with self._repo_lock(f"vault:{repo}" if source == "vault" else repo):
             self._git(
                 src, "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--quiet",
                 "--no-tags", str(origin), *wants,

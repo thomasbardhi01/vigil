@@ -29,6 +29,11 @@ HARDENING = (
     "-c", "protocol.allow=never",
     "-c", "protocol.file.allow=always",
     "-c", "protocol.https.allow=always",
+    # No auto-maintenance or auto-gc in any repo vigild owns (round 5): a
+    # fetch's maintenance holds objects/maintenance.lock while a clone copies
+    # objects/, and the file vanishes mid-copy.
+    "-c", "maintenance.auto=false",
+    "-c", "gc.auto=0",
 )  # fmt: skip
 
 
