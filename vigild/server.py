@@ -158,7 +158,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
 
-    from vigild.devimage import DockerImages
+    from vigild.devimage import DockerImages, SessionImages
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
     from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
@@ -178,6 +178,13 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     runtime = DockerRuntime(v.cfg, client)
     tests = DockerTestRunner(v.cfg, client)
     images = DevImages(v.cfg, v.store, DockerImages(client), ws, tests)
+    gh = v.cfg.vigild.github
+
+    def claude_mods() -> Path:
+        dest = v.cfg.vigild.data_path / "claude-mods" / gh.claude_mods_sha
+        return ws.export_tree(gh.claude_mods, gh.claude_mods_sha, dest)
+
+    sessions = SessionImages(images, claude_mods)
     runner = JobRunner(
         v.cfg,
         v.store,
@@ -190,8 +197,10 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         images,
         Verifier(ws, tests),
         reaper=runtime.reap,
+        session_images=sessions,
     )
     images.on_failure = runner.dev_image_failed
+    sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
     return runner
 

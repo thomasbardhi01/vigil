@@ -78,20 +78,30 @@ RUN cd data && uv python install "$(cat .python-version)" \
  && uv sync --frozen --no-install-project \
  && chmod -R a+rX /opt/python /opt/data-venv
 
-# vigil-prepare: the verifier's first step. The checkout (read-only at /src)
-# is copied into /work (the container's tmpfs) with the dependencies above,
-# and a PostgreSQL with PostGIS starts on loopback for the server's pg suite
-# and boot check. Nothing reaches the network.
+# vigil-session-prepare: puts the dependencies above next to whatever is at
+# /work and starts a PostgreSQL with PostGIS on loopback. A session runs it
+# before the agent (the session image is this image plus the executor layer),
+# so a worker can run the real suites offline; vigil-prepare, the verifier's
+# first step, runs it after copying the read-only checkout from /src.
+COPY --chmod=0555 <<'EOF' /usr/local/bin/vigil-session-prepare
+#!/bin/sh
+set -eu
+for d in . server executor; do
+  [ -e "/work/$d/node_modules" ] || cp -a "/opt/deps/$d/node_modules" "/work/$d/"
+done
+PGDATA=/tmp/pg; export PGDATA
+if [ ! -d "$PGDATA" ]; then
+  /usr/lib/postgresql/17/bin/initdb -U ci --auth=trust --no-sync -D "$PGDATA" >/dev/null
+  /usr/lib/postgresql/17/bin/pg_ctl -s -w -D "$PGDATA" -l /tmp/pg.log \
+    -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp" start
+  for db in ci pa_pg_test; do /usr/lib/postgresql/17/bin/createdb -h 127.0.0.1 -U ci "$db"; done
+fi
+EOF
 COPY --chmod=0555 <<'EOF' /usr/local/bin/vigil-prepare
 #!/bin/sh
 set -eu
 cp -a /src/. /work/
-for d in . server executor; do cp -a "/opt/deps/$d/node_modules" "/work/$d/"; done
-PGDATA=/tmp/pg; export PGDATA
-/usr/lib/postgresql/17/bin/initdb -U ci --auth=trust --no-sync -D "$PGDATA" >/dev/null
-/usr/lib/postgresql/17/bin/pg_ctl -s -w -D "$PGDATA" -l /tmp/pg.log \
-  -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp" start
-for db in ci pa_pg_test; do /usr/lib/postgresql/17/bin/createdb -h 127.0.0.1 -U ci "$db"; done
+exec /usr/local/bin/vigil-session-prepare
 EOF
 
 RUN groupadd -g 10001 vigil && useradd -u 10001 -g 10001 -M -d /tmp/home -s /bin/sh vigil

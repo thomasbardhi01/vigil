@@ -1,40 +1,66 @@
 # syntax=docker/dockerfile:1
-# Claude executor (coord, worker, reviewer, auditor sessions). linux/arm64.
+# The executor layer (coord, worker, reviewer, auditor sessions). linux/arm64.
 #
-# Build with scripts/build-images.py, which passes claude-mods at the pinned
-# SHA as a build context (a `git archive` of vigild's mirror), so no token is
-# needed at build time and nothing is cloned at run time (B16).
+# One definition, applied over a base (owner direction, review round 3):
+# - over a repo's dev image (`--build-arg BASE=vigil-dev/<repo>:<key>`), vigild
+#   builds that repo's session image, so a worker has the repo's real toolchain
+#   and dependencies, offline, and can run its suite while it works;
+# - over the default BASE, scripts/build-images.py builds the generic executor
+#   image (`vigil/claude-executor`) the security tests and doctor use.
+# The verifier never runs this layer: it uses the plain dev image.
 #
-# Pins: CPython 3.14.8, Node 24.21.0 (only to run the CLI), Claude Code CLI
-# 2.1.306 (owner exception to the two-week rule, Q1), claude-agent-sdk 0.2.165.
-# Base images are pinned by digest (docs/sources.md).
+# Build contexts: `claude_mods` (a `git archive` of the pinned SHA, so no token
+# and no clone at build time; B16) and `vigil_configs` (the managed settings).
+#
+# Pins: CPython 3.14.8 for the harness (uv-managed, under /opt/vigil-python,
+# whatever the base's own Python); Node 24.21.0 only to install the CLI, which
+# is a native binary; Claude Code CLI 2.1.306 (owner exception, Q1) from a
+# committed lockfile; claude-agent-sdk 0.2.165 hash-locked; uv 0.12.24; git,
+# ripgrep and util-linux from Debian as of 2026-10-08 (snapshot). Bases by digest.
 
-FROM node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS node
+ARG BASE=python:3.14.8-slim-trixie@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
 
-FROM python:3.14.8-slim-trixie@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
+FROM ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates ripgrep \
- && rm -rf /var/lib/apt/lists/*
-
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
-COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
-# The CLI and its whole dependency tree come from a committed lockfile
-# (generated with --before=2026-10-22, the day after 2.1.306 shipped).
+# The CLI and its whole tree from the committed lockfile (generated with
+# --before=2026-10-22, the day after 2.1.306 shipped). It's a native binary:
+# Node isn't in the final image.
+FROM node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS cli
 COPY cli/package.json cli/package-lock.json /opt/claude-cli/
-RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
- && cd /opt/claude-cli && npm ci --no-fund --no-audit \
- && ln -s /opt/claude-cli/node_modules/.bin/claude /usr/local/bin/claude \
- && npm cache clean --force \
+RUN cd /opt/claude-cli && npm ci --no-fund --no-audit && npm cache clean --force \
+ && /opt/claude-cli/node_modules/.bin/claude --version | grep -q '^2\.1\.306'
+
+FROM ${BASE}
+USER 0:0
+
+ARG SNAPSHOT=20261008T000000Z
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+ && echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${SNAPSHOT} trixie main" \
+      > /etc/apt/sources.list.d/snapshot.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates ripgrep util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && command -v setpriv
+
+COPY --from=cli /opt/claude-cli /opt/claude-cli
+RUN ln -sf /opt/claude-cli/node_modules/.bin/claude /usr/local/bin/claude \
  && claude --version | grep -q '^2\.1\.306'
 
-# The SDK and its transitive deps, hash-locked (uv pip compile --generate-hashes,
-# exclude-newer 2026-10-08): images/claude-executor/requirements.txt.
+# The harness's own Python and the SDK, hash-locked (requirements.txt), apart
+# from anything the repo uses.
+COPY --from=uv /uv /usr/local/bin/vigil-uv
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt && rm /tmp/requirements.txt
+RUN UV_PYTHON_INSTALL_DIR=/opt/vigil-python vigil-uv python install 3.14.8 \
+ && UV_PYTHON_INSTALL_DIR=/opt/vigil-python vigil-uv venv --python 3.14.8 /opt/vigil-venv \
+ && vigil-uv pip install --python /opt/vigil-venv/bin/python --require-hashes --no-cache \
+      -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt /usr/local/bin/vigil-uv \
+ && chmod -R a+rX /opt/vigil-python /opt/vigil-venv \
+ && /opt/vigil-venv/bin/python -c "import claude_agent_sdk"
 
-# The agent uid (bypassPermissions refuses root).
-RUN groupadd -g 10001 vigil && useradd -u 10001 -g 10001 -m -d /home/vigil -s /bin/bash vigil
+# The agent uid (bypassPermissions refuses root); dev images already have it.
+RUN id -u 10001 >/dev/null 2>&1 \
+ || (groupadd -g 10001 vigil && useradd -u 10001 -g 10001 -M -d /tmp/home -s /bin/sh vigil)
 
 # guard@claude-mods, seeded at build time from the pinned SHA (B16).
 COPY --from=claude_mods . /opt/claude-mods
@@ -60,11 +86,11 @@ RUN chmod 0555 /opt/vigil/hooks/pre-push \
 
 COPY entrypoint.py /opt/vigil/entrypoint.py
 COPY agent-cli /opt/vigil/agent-cli
-RUN chmod 0555 /opt/vigil/agent-cli && command -v setpriv
+RUN chmod 0555 /opt/vigil/agent-cli
 
 # The harness is PID 1 as root (runtime.py adds only SETUID, SETGID and KILL);
-# it runs the CLI, test_cmd and git as uid 10001 with no capabilities, so the
-# agent can't reach its stdout or signal it (review round 2, N1 and N11).
+# it runs the CLI, any session-prepare hook the base has, and git as uid 10001
+# with no capabilities (review round 2, N1 and N11).
 USER 0:0
 ENV HOME=/tmp/home \
     CLAUDE_CONFIG_DIR=/tmp/home/.claude \
@@ -78,5 +104,6 @@ ENV HOME=/tmp/home \
     DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     PYTHONUNBUFFERED=1
+LABEL dev.vigil.layer=executor
 WORKDIR /work
-ENTRYPOINT ["python", "/opt/vigil/entrypoint.py"]
+ENTRYPOINT ["/opt/vigil-venv/bin/python", "/opt/vigil/entrypoint.py"]

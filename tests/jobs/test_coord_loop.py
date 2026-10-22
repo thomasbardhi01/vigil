@@ -28,7 +28,7 @@ from vigild.api.app import create_app
 from vigild.budget import Budget
 from vigild.config import Config, RepoPolicy
 from vigild.db import Store
-from vigild.devimage import DevImages
+from vigild.devimage import DevImages, SessionImages
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.jobs.model import Role
 from vigild.jobs.runner import JobRunner
@@ -311,8 +311,11 @@ def world(
         images,
         Verifier(ws, tests),
         background=False,
+        session_images=SessionImages(images, lambda: tmp_path),
     )
     images.on_failure = runner.dev_image_failed
+    assert runner.session_images is not None
+    runner.session_images.on_failure = runner.dev_image_failed
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)
@@ -1137,3 +1140,15 @@ def test_a_job_already_running_is_not_started_twice(world: World) -> None:  # ro
     while time.monotonic() < deadline and w.runner.running():
         time.sleep(0.01)
     assert started == [job]
+
+
+def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: World) -> None:
+    w = world  # owner direction, round 3
+    seen: list[tuple[str, str | None]] = []
+    w.standin.on_session = lambda spec: seen.append((spec.role.value, spec.image))
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "in_review"
+    assert {r for r, _ in seen} == {"coord", "worker"}
+    assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
+    images = {c["image"] for c in w.tests.calls}
+    assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images

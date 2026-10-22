@@ -69,8 +69,16 @@ def missing_tools(cfg: Config, repo: str, test_cmd: str | None) -> list[str]:
 class DockerLike(Protocol):
     def image_id_of(self, image: str) -> str | None: ...
     def build(
-        self, context: Path, dockerfile: Path, tag: str, *, timeout_s: int
+        self,
+        context: Path,
+        dockerfile: Path,
+        tag: str,
+        *,
+        timeout_s: int,
+        build_args: dict[str, str] | None = None,
+        contexts: dict[str, Path] | None = None,
     ) -> tuple[bool, str]: ...
+    def run_check(self, image: str, command: str) -> tuple[int, str]: ...
 
 
 class Sources(Protocol):
@@ -275,6 +283,110 @@ class DevImages:
         )
 
 
+EXECUTOR_LAYER = ROOT / "images" / "claude-executor"
+MANAGED_SETTINGS = ROOT / "configs" / "managed-settings.json"
+# What a session image must have: the CLI at its pin, the harness's Python
+# with the SDK, setpriv for the agent uid, and guard seeded.
+SESSION_CHECK = (
+    "claude --version | grep -q '^2\\.1\\.306' && echo claude 2.1.306"
+    " && /opt/vigil-venv/bin/python -c 'import claude_agent_sdk'"
+    " && command -v setpriv >/dev/null && test -d /opt/claude-seed"
+    " && test -x /opt/vigil/agent-cli && id -u 10001 >/dev/null"
+)
+
+
+def layer_digest() -> str:
+    """The executor layer's identity: every file it's built from."""
+    h = hashlib.sha256()
+    files = sorted(
+        f for f in EXECUTOR_LAYER.rglob("*") if f.is_file() and "__pycache__" not in f.parts
+    )
+    for f in [*files, MANAGED_SETTINGS]:
+        h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+class SessionImages:
+    """Each repo's session image (owner direction, round 3): the one executor
+    layer (images/claude-executor/Dockerfile) built over that repo's dev
+    image, so workers have its toolchain and dependencies offline. Keyed on
+    the dev image and the layer (and guard's pinned SHA); built, checked,
+    blocked and paged like a dev image. The verifier never uses it."""
+
+    def __init__(
+        self,
+        dev: DevImages,
+        claude_mods: Callable[[], Path],
+        *,
+        on_failure: OnFailure | None = None,
+    ) -> None:
+        self.dev = dev
+        self.claude_mods = claude_mods  # a checkout of claude-mods at the pinned SHA
+        self.on_failure = on_failure
+
+    def key(self, dev_tag: str) -> str:
+        sha = self.dev.cfg.vigild.github.claude_mods_sha
+        return hashlib.sha256(f"{dev_tag}\0{layer_digest()}\0{sha}".encode()).hexdigest()
+
+    def tag(self, repo: str, key: str) -> str:
+        return self.dev.tag(repo, key).replace("vigil-dev/", "vigil-session/", 1)
+
+    def ensure_fresh(self, repo: str, base_sha: str, *, force: bool = False) -> str:
+        dev_tag = self.dev.ensure_fresh(repo, base_sha, force=force)
+        with self.dev._lock(f"session:{repo}"):
+            key = self.key(dev_tag)
+            tag = self.tag(repo, key)
+            last = self.dev.latest(repo, key)
+            if last is not None and not force:
+                if not last["ok"]:
+                    raise StaleDevImage(
+                        f"{repo}: session image {tag} failed its {last['stage']}; "
+                        "rebuild it from the inbox"
+                    )
+                current = self.dev.docker.image_id_of(tag)
+                if current is not None and current == last["image_id"]:
+                    return tag
+            v = self._build(repo, key, tag, dev_tag, base_sha)
+            if not v.ok:
+                if self.on_failure is not None:
+                    self.on_failure(
+                        repo,
+                        f"{repo}: session image {v.stage.removeprefix('session-')} failed",
+                        {
+                            "kind": "dev_image",
+                            "repo": repo,
+                            "key": key,
+                            "image": tag,
+                            "stage": v.stage,
+                            "base_sha": base_sha,
+                            "failed_suites": [],
+                            "detail": json.loads(v.output),
+                            "actions": ["rebuild", "dismiss"],
+                        },
+                    )
+                raise StaleDevImage(f"{repo}: session image {tag} failed its {v.stage}")
+            return tag
+
+    def _build(self, repo: str, key: str, tag: str, dev_tag: str, base_sha: str) -> Validation:
+        ok, out = self.dev.docker.build(
+            EXECUTOR_LAYER,
+            EXECUTOR_LAYER / "Dockerfile",
+            tag,
+            timeout_s=BUILD_SECONDS,
+            build_args={"BASE": dev_tag},
+            contexts={"claude_mods": self.claude_mods(), "vigil_configs": ROOT / "configs"},
+        )
+        image_id = self.dev.docker.image_id_of(tag) if ok else None
+        if not ok or image_id is None:
+            fail: dict[str, Any] = {"build": out[-TAIL:]}
+            return self.dev._record(repo, key, tag, None, False, "session-build", fail, base_sha)
+        code, check = self.dev.docker.run_check(tag, SESSION_CHECK)
+        body: dict[str, Any] = {"check": check[-TAIL:], "base": dev_tag}
+        return self.dev._record(
+            repo, key, tag, image_id, code == 0, "session-validate", body, base_sha
+        )
+
+
 class DockerImages:
     """The real DockerLike. Builds go through the docker CLI, so they get
     BuildKit (the dev Dockerfiles use heredocs and `COPY --chmod`); they have
@@ -294,10 +406,22 @@ class DockerImages:
             return None
 
     def build(
-        self, context: Path, dockerfile: Path, tag: str, *, timeout_s: int
+        self,
+        context: Path,
+        dockerfile: Path,
+        tag: str,
+        *,
+        timeout_s: int,
+        build_args: dict[str, str] | None = None,
+        contexts: dict[str, Path] | None = None,
     ) -> tuple[bool, str]:
         cmd = [self.cli, "build", "--progress=plain", "-f", str(dockerfile), "-t", tag,
-               "--label", f"dev.vigil.devimage={tag}", str(context)]  # fmt: skip
+               "--label", f"dev.vigil.devimage={tag}"]  # fmt: skip
+        for k, v in (build_args or {}).items():
+            cmd += ["--build-arg", f"{k}={v}"]
+        for k, path in (contexts or {}).items():
+            cmd += ["--build-context", f"{k}={path}"]
+        cmd.append(str(context))
         try:
             p = subprocess.run(
                 cmd,
@@ -312,3 +436,23 @@ class DockerImages:
         except OSError as e:
             return False, f"docker CLI: {e}"
         return p.returncode == 0, (p.stdout + p.stderr)[-20000:]
+
+    def run_check(self, image: str, command: str) -> tuple[int, str]:
+        """A command in the image, as the agent uid, with no network."""
+        c = self.client.containers.run(
+            image,
+            entrypoint=["sh", "-c"],
+            command=[command],
+            user="10001:10001",
+            detach=True,
+            network_mode="none",
+            read_only=True,
+            tmpfs={"/tmp": "rw,mode=1777"},  # noqa: S108
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+        )
+        try:
+            code = int(c.wait(timeout=300).get("StatusCode", -1))
+            return code, c.logs().decode(errors="replace")
+        finally:
+            c.remove(force=True)

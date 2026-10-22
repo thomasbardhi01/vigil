@@ -33,7 +33,14 @@ class FakeDocker:
         return self.ids.get(image)
 
     def build(
-        self, context: Path, dockerfile: Path, tag: str, *, timeout_s: int
+        self,
+        context: Path,
+        dockerfile: Path,
+        tag: str,
+        *,
+        timeout_s: int,
+        build_args: dict[str, str] | None = None,
+        contexts: dict[str, Path] | None = None,
     ) -> tuple[bool, str]:
         files = sorted(str(p.relative_to(context)) for p in context.rglob("*") if p.is_file())
         self.builds.append((tag, files))
@@ -41,6 +48,9 @@ class FakeDocker:
             return False, "E: Unable to locate package"
         self.ids[tag] = f"sha256:{len(self.builds):04d}"
         return True, "built"
+
+    def run_check(self, image: str, command: str) -> tuple[int, str]:
+        return 0, "claude 2.1.306"
 
 
 class FakeSuites:
@@ -189,3 +199,84 @@ def test_tools_in(cmd: str, tools: list[str]) -> None:
 def test_parkagent_runs_its_real_tests_but_not_xcode(cfg: Config) -> None:
     assert missing_tools(cfg, PA, "pnpm -C server test") == []
     assert missing_tools(cfg, PA, "xcodebuild test") == ["xcodebuild"]
+
+
+# --- owner direction, round 3: session images = the executor layer over the dev image --------
+
+
+class LayerDocker(FakeDocker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.args: list[dict[str, Any]] = []
+        self.checks: list[tuple[str, str]] = []
+        self.check_exit = 0
+
+    def build(  # type: ignore[override]
+        self,
+        context: Path,
+        dockerfile: Path,
+        tag: str,
+        *,
+        timeout_s: int,
+        build_args: dict[str, str] | None = None,
+        contexts: dict[str, Path] | None = None,
+    ) -> tuple[bool, str]:
+        self.args.append({"tag": tag, "dockerfile": dockerfile, "build_args": build_args or {},
+                          "contexts": sorted(contexts or {})})  # fmt: skip
+        if "claude-executor" in str(dockerfile):
+            self.ids[tag] = f"sha256:layer{len(self.args):04d}"
+            return True, "built"
+        return super().build(context, dockerfile, tag, timeout_s=timeout_s)
+
+    def run_check(self, image: str, command: str) -> tuple[int, str]:
+        self.checks.append((image, command))
+        return self.check_exit, "claude 2.1.306"
+
+
+@pytest.fixture
+def layered(world: Any, tmp_path: Path) -> tuple[Any, LayerDocker, DevImages, str, dict[str, Any]]:
+    from vigild.devimage import SessionImages
+
+    images, _, _, _, base, ctx = world
+    docker = LayerDocker()
+    images.docker = docker
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    sessions = SessionImages(images, lambda: mods, on_failure=images.on_failure)
+    return sessions, docker, images, base, ctx
+
+
+def test_a_session_image_is_the_executor_layer_over_the_dev_image(layered: Any) -> None:
+    sessions, docker, images, base, _ = layered
+    tag = sessions.ensure_fresh(REPO, base)
+    dev_tag = images.ensure_fresh(REPO, base)
+    assert tag.startswith("vigil-session/fixture:") and dev_tag.startswith("vigil-dev/fixture:")
+    _, layer_build = docker.args
+    assert layer_build["dockerfile"].name == "Dockerfile"
+    assert layer_build["dockerfile"].parent.name == "claude-executor"  # one layer definition
+    assert layer_build["build_args"] == {"BASE": dev_tag}
+    assert layer_build["contexts"] == ["claude_mods", "vigil_configs"]
+    assert docker.checks and "2.1.306" in docker.checks[0][1]
+    assert sessions.ensure_fresh(REPO, base) == tag and len(docker.args) == 2  # reused
+
+
+def test_a_new_dev_image_or_layer_change_rebuilds_the_session_image(
+    layered: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vigild import devimage
+
+    sessions, docker, _, base, _ = layered
+    first = sessions.ensure_fresh(REPO, base)
+    monkeypatch.setattr(devimage, "layer_digest", lambda: "changed")
+    second = sessions.ensure_fresh(REPO, base)
+    assert second != first and len(docker.args) == 3  # the layer only; the dev image stands
+
+
+def test_a_failed_session_image_blocks_and_pages(layered: Any) -> None:
+    sessions, docker, _, base, ctx = layered
+    docker.check_exit = 1
+    with pytest.raises(StaleDevImage, match="session"):
+        sessions.ensure_fresh(REPO, base)
+    page = ctx["pages"][-1]
+    assert page["kind"] == "dev_image" and page["stage"] == "session-validate"
+    assert page["actions"] == ["rebuild", "dismiss"]

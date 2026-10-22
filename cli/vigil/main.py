@@ -48,8 +48,9 @@ def dev_image(
     repo: str = typer.Option(..., "--repo", help="owner/name, as in configs/repos.yaml"),
     rebuild: bool = typer.Option(False, "--rebuild", help="Build again even if validated."),
 ) -> None:
-    """Build and validate a repo's dev image at its base branch's tip, as the
-    first job would (vigild/devimage.py). Prints each suite's outcome."""
+    """Build and validate a repo's dev image, then its session image (the
+    executor layer over it), at its base branch's tip, as the first job would
+    (vigild/devimage.py). Prints each suite's outcome."""
     import json
 
     from vigild.devimage import StaleDevImage
@@ -63,6 +64,9 @@ def dev_image(
     try:
         tag = images.ensure_fresh(repo, base, force=rebuild)
         typer.echo(f"pass  {repo}  {tag}")
+        if runner.session_images is not None:
+            session = runner.session_images.ensure_fresh(repo, base, force=rebuild)
+            typer.echo(f"pass  {repo}  {session}")
     except StaleDevImage as e:
         ok = False
         typer.echo(f"fail  {repo}  {e}")

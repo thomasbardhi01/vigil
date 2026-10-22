@@ -28,7 +28,7 @@ isn't the head named on the result line (the out dir is a bind mount, which on
 Docker Desktop ignores file modes). The harness never pushes. Tool inputs and
 results are redacted of anything token-shaped before they are emitted (item 13).
 Exit codes: 0 done, 2 bad input, 3 guard not loaded, 4 agent error,
-5 the work tree can't be committed safely.
+5 the work tree can't be committed safely, 6 the session-prepare hook failed.
 """
 
 from __future__ import annotations
@@ -50,7 +50,10 @@ from typing import Any
 WORK = Path("/work")
 PACKET = Path("/vigil/packet.md")
 OUT = Path("/vigil/out")
-AGENT_CLI = "/opt/vigil/agent-cli"  # setpriv down to the agent uid, then the CLI
+AGENT_CLI = "/opt/vigil/agent-cli"
+SESSION_PREPARE = (
+    "/usr/local/bin/vigil-session-prepare"  # setpriv down to the agent uid, then the CLI
+)
 PLAIN_CLI = "/usr/local/bin/claude"
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
@@ -205,6 +208,29 @@ def snapshot(task: dict[str, Any], role: str) -> str:
     return head
 
 
+def prepare_session() -> None:
+    """In a repo's session image, the dev image's hook puts its baked
+    dependencies next to the clone (and starts what its suites need), as the
+    agent uid, so the worker's toolchain works offline (round 3)."""
+    if not os.access(SESSION_PREPARE, os.X_OK):
+        return
+    try:
+        p = subprocess.run(
+            [SESSION_PREPARE],
+            cwd=WORK,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+            **as_agent(),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HarnessRefused("the session-prepare hook took over 15 minutes") from e
+    if p.returncode != 0:
+        raise HarnessRefused(f"the session-prepare hook failed: {(p.stdout + p.stderr)[-500:]}")
+
+
 async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     from claude_agent_sdk import (
         AssistantMessage,
@@ -313,6 +339,11 @@ def main() -> int:
     packet = PACKET.read_text()
     task = json.loads((WORK / ".vigil" / "task.json").read_text())
 
+    try:
+        prepare_session()
+    except HarnessRefused as e:
+        emit("vigil_result", {"status": "failed", "error": f"harness: {e}"})
+        return 6
     started = time.monotonic()
     try:
         agent = asyncio.run(run_agent(packet, role, token))

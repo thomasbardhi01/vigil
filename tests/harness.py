@@ -64,7 +64,13 @@ class LocalTestRunner:
         ).stdout.strip()
         planted = [p for p in (".git/commondir", ".vigil/task.json") if (source / p).exists()]
         self.calls.append(
-            {"source": str(source), "command": command, "hooksPath": hooks, "worker_files": planted}
+            {
+                "source": str(source),
+                "command": command,
+                "hooksPath": hooks,
+                "worker_files": planted,
+                "image": image,
+            }
         )
         # as in the container: bash with pipefail and errexit, pytest asked for
         # a JUnit report in a directory outside the checkout

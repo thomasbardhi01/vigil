@@ -278,6 +278,30 @@ class Workspace:
                 self._git(src, "rm", "-q", "-f", "--ignore-unmatch", "--", *absent)
         return src
 
+    def export_tree(self, repo: str, sha: str, dest: Path) -> Path:
+        """The tree at `sha`, from a freshly fetched mirror, unpacked at `dest`
+        (claude-mods for the executor layer's build context)."""
+        import io
+        import tarfile
+
+        if not SHA.match(sha):
+            raise WorkspaceError("bad sha")
+        if dest.exists():
+            return dest
+        mirror = self.mirror(repo)
+        try:
+            data = git_bytes(mirror, "archive", "--format=tar", sha)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        tmp = dest.with_name(dest.name + ".partial")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            t.extractall(tmp, filter="data")
+        tmp.rename(dest)
+        return dest
+
     def tree_paths(self, repo: str, sha: str) -> set[str]:
         """Every file path at `sha` in the vault."""
         if not SHA.match(sha):

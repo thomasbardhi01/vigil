@@ -194,3 +194,22 @@ def test_one_redactor_and_the_harness_matches_it() -> None:
 
     assert runner.redact is redact and service.redact is redact
     assert _entrypoint().SECRETISH.pattern == SECRETISH.pattern
+
+
+# --- round 3: a session image's prepare hook ------------------------------------------------
+
+
+def test_the_session_prepare_hook_runs_before_the_agent(tmp_path: Path) -> None:
+    work, _ = _work(tmp_path)
+    ep = _harness(tmp_path, work)
+    hook = tmp_path / "hook.sh"
+    hook.write_text("#!/bin/sh\nmkdir -p node_modules && touch node_modules/.ready\n")
+    hook.chmod(0o755)
+    ep.SESSION_PREPARE = str(hook)
+    ep.prepare_session()
+    assert (work / "node_modules" / ".ready").exists()
+    hook.write_text("#!/bin/sh\necho no postgres >&2; exit 3\n")
+    with pytest.raises(ep.HarnessRefused, match="no postgres"):
+        ep.prepare_session()
+    ep.SESSION_PREPARE = str(tmp_path / "absent")
+    ep.prepare_session()  # no hook (the generic image): nothing to do

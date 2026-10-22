@@ -54,7 +54,7 @@ from vigild.contract.models import (
     WorkerReport,
 )
 from vigild.db import Store, iso
-from vigild.devimage import DevImages, StaleDevImage, missing_tools
+from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
@@ -133,6 +133,7 @@ class JobRunner:
         dev_images: DevImages,
         verifier: Verifier,
         *,
+        session_images: SessionImages | None = None,
         background: bool = True,
         reaper: Callable[[], int] | None = None,
     ) -> None:
@@ -145,6 +146,7 @@ class JobRunner:
         self.publisher = publisher
         self.telemetry = telemetry
         self.dev_images = dev_images
+        self.session_images = session_images  # None: sessions use the generic executor image
         self.verifier = verifier
         self.background = background
         self.reaper = reaper
@@ -274,7 +276,10 @@ class JobRunner:
         """The owner asked for a failed dev image to be built again."""
 
         def go(_: str) -> None:
-            self.dev_images.ensure_fresh(repo, base_sha, force=True)
+            if self.session_images is not None:
+                self.session_images.ensure_fresh(repo, base_sha, force=True)
+            else:
+                self.dev_images.ensure_fresh(repo, base_sha, force=True)
 
         def safe(j: str) -> None:
             try:
@@ -289,6 +294,14 @@ class JobRunner:
             threading.Thread(target=safe, args=(repo,), daemon=True).start()
         else:
             safe(repo)
+
+    def _session_image(self, repo: str, base_sha: str) -> str | None:
+        """The repo's session image (owner direction, round 3), built when its
+        dev image or the executor layer changed; the dev image comes first."""
+        if self.session_images is None:
+            self.dev_images.ensure_fresh(repo, base_sha)
+            return None
+        return self.session_images.ensure_fresh(repo, base_sha)
 
     def start_deferred(self) -> int:
         """Start the builds reconcile queued. vigild calls this only once its
@@ -376,7 +389,9 @@ class JobRunner:
         try:
             # the repo's dev image must be fresh before any work starts on it;
             # a new lockfile builds one here (owner direction, round 2)
-            self.dev_images.ensure_fresh(job.repo, self.workspace.head_sha(job.repo, job.base))
+            session_image = self._session_image(
+                job.repo, self.workspace.head_sha(job.repo, job.base)
+            )
             check_backend(self.cfg, job.repo, preset)
         except (StaleDevImage, RepoPolicyError) as e:
             why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
@@ -413,7 +428,7 @@ class JobRunner:
                 return
             try:
                 draft = self._coord_attempt(
-                    job, coord, rid, attempt, branch, meta, gate_errors, previous
+                    job, coord, rid, attempt, branch, meta, gate_errors, previous, session_image
                 )
             except Exception:
                 self.budget.settle(rid)
@@ -450,6 +465,7 @@ class JobRunner:
         meta: dict[str, Any],
         gate_errors: list[str] | None,
         previous: dict[str, str],
+        session_image: str | None = None,
     ) -> tuple[list[str], dict[str, str]] | None:
         job_id = job.id
         # A fresh clone per draft: vigild writes only into clones no session has touched.
@@ -503,7 +519,7 @@ class JobRunner:
             max_budget_usd=self.cfg.budgets.coord_session_usd,
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
-            image=None,  # sessions run in the executor image; tests run in the dev image
+            image=session_image,  # the executor layer over the repo's dev image
         )
         out = self._run_session(
             coord,
@@ -845,6 +861,7 @@ class JobRunner:
         base_sha = self.workspace.base_sha(task_id)
         try:
             image = self.dev_images.ensure_fresh(job.repo, base_sha)  # what the verifier runs
+            session_image = self._session_image(job.repo, base_sha)  # what the worker runs in
         except StaleDevImage as e:
             self.budget.settle(reservation, 0.0)
             return self._fail(
@@ -893,7 +910,7 @@ class JobRunner:
             max_budget_usd=amount,  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
-            image=None,  # the executor image; the verifier runs `image`
+            image=session_image,  # the verifier runs the plain dev image, `image`
         )
         attrs = {
             "vigil.job_id": job_id,

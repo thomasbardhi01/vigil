@@ -137,3 +137,17 @@ def test_remove(ws: Workspace) -> None:
     clone = ws.clone("o/fixture", "fx-0001-w1", branch="vigil/a", base="main")
     ws.remove(clone)
     assert not clone.exists()
+
+
+def test_export_tree_unpacks_a_commit_once(tmp_path: Path, fixture_repo: dict[str, Path]) -> None:
+    from tests.conftest import git as host_git
+
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    sha = host_git(fixture_repo["seed"], "rev-parse", "HEAD")
+    dest = ws.export_tree("o/fixture", sha, tmp_path / "mods" / sha)
+    assert (dest / "README.md").read_text() == "# fixture\n" and not (dest / ".git").exists()
+    (dest / "README.md").write_text("kept")
+    assert (
+        ws.export_tree("o/fixture", sha, dest) == dest
+        and (dest / "README.md").read_text() == "kept"
+    )
