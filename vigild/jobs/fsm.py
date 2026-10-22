@@ -83,7 +83,7 @@ def _workers_routed(c: Ctx) -> list[str]:
 def _workers_done(c: Ctx) -> list[str]:
     errs: list[str] = []
     workers = [s for s in c.store.list_sessions(c.job.id) if s.role is Role.WORKER]
-    tasks = c.store.list_tasks(c.job.id)
+    tasks = [t for t in c.store.list_tasks(c.job.id) if t.state not in ("superseded", "abandoned")]
     if not tasks:
         errs.append("no worker tasks")
     for t in tasks:
@@ -119,6 +119,12 @@ def _merged(c: Ctx) -> list[str]:
     return [] if c.evidence.get("merge_commits") else ["no merge commits recorded"]
 
 
+def _abandon(c: Ctx) -> list[str]:
+    if c.actor is not Actor.OWNER or c.channel != "inbox":
+        return ["only the owner, from the inbox, abandons a job"]
+    return [] if c.evidence.get("action") == "abandon" else ["abandoning needs action=abandon"]
+
+
 def _verified(c: Ctx) -> list[str]:
     art = c.store.get_artifact(c.job.id, "verify.json")
     if art is None or not json.loads(art.content).get("clean"):
@@ -136,9 +142,13 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.READY, S.MERGED): _merged,
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,
+    (S.SPEC_PENDING, S.ABANDONED): _abandon,
 }
 HOLDS = (S.BLOCKED, S.ESCALATED)
-TERMINAL = (S.DONE,)
+TERMINAL = (S.DONE, S.ABANDONED)
+# Out of a hold, besides resuming where it left (review round 2, N5): the
+# owner sends a failed build back to the coord, or abandons the job.
+FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon"}
 NEVER_FORCED = {(S.SPEC_PENDING, S.APPROVED)}
 
 
@@ -169,13 +179,14 @@ def transition(
                 raise TransitionError(f"{to.value} needs a reason")
             blocked_from = frm
         elif frm in HOLDS:
-            if to != job.blocked_from:
+            action = evidence.get("action")
+            if to != job.blocked_from and (action is None or FROM_HOLD.get(to) != action):
                 raise TransitionError(
                     f"no transition {frm.value} -> {to.value}; it can only resume "
-                    f"{job.blocked_from.value if job.blocked_from else '?'}"
+                    f"{job.blocked_from.value if job.blocked_from else '?'}, re-plan or abandon"
                 )
             if not owner_inbox:
-                raise TransitionError("only the owner, from the inbox, resumes a held job")
+                raise TransitionError("only the owner, from the inbox, moves a held job")
         else:
             guard = EDGES.get((frm, to))
             if guard is None:

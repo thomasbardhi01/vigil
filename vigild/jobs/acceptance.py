@@ -42,7 +42,9 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
     if not str(spec.get("test_cmd") or "").strip():
         return ["the contract has no test_cmd, so nothing can be accepted"]
     if not tests or tests.get("source") != "verifier":
-        return ["the verifier's record is missing: test_cmd was not observed, so nothing is accepted"]
+        return [
+            "the verifier's record is missing: test_cmd was not observed, so nothing is accepted"
+        ]
     errors: list[str] = []
     before = (tests.get("before") or {}).get("outcome")
     after = (tests.get("after") or {}).get("outcome")

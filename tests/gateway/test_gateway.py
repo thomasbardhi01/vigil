@@ -426,15 +426,80 @@ def _turns(user_blocks: list[Any]) -> list[dict[str, Any]]:
         {"messages": _turns([_result({"type": "text", "text": "x"}, DOC_URL)])},
         {"messages": [{"role": "user", "content": [IMG_URL]}]},
         {"messages": [{"role": "user", "content": [DOC_URL]}]},
-        {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "f"}}]}]},
-        {"messages": [{"role": "assistant", "content": [{"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}]}]},
-        {"messages": [{"role": "user", "content": [{"type": "web_search_tool_result", "tool_use_id": "s", "content": []}]}]},
-        {"messages": [{"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m", "name": "x", "server_name": "s", "input": {}}]}]},
-        {"messages": [{"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m", "content": []}]}]},
-        {"messages": [{"role": "user", "content": [{"type": "search_result", "source": "https://x", "title": "t", "content": []}]}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "file", "file_id": "f"}}],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "web_search_tool_result", "tool_use_id": "s", "content": []}
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "mcp_tool_use",
+                            "id": "m",
+                            "name": "x",
+                            "server_name": "s",
+                            "input": {},
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "mcp_tool_result", "tool_use_id": "m", "content": []}],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "search_result",
+                            "source": "https://x",
+                            "title": "t",
+                            "content": [],
+                        }
+                    ],
+                }
+            ]
+        },
         {"messages": [{"role": "user", "content": [{"type": "container_upload", "file_id": "f"}]}]},
         {"messages": [{"role": "user", "content": [{"text": "no type"}]}]},
-        {"messages": [{"role": "user", "content": [_result(_result({"type": "text", "text": "x"}))]}]},
+        {
+            "messages": [
+                {"role": "user", "content": [_result(_result({"type": "text", "text": "x"}))]}
+            ]
+        },
         {"system": [{"type": "text", "text": "s"}, IMG_URL]},
         {"system": [{"type": "image", "source": IMG_B64["source"]}]},
         {"messages": "not a list"},

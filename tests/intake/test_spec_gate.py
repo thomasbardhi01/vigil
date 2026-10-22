@@ -7,7 +7,7 @@ import json
 import pytest
 
 from vigild.contract.models import Task
-from vigild.intake.spec_gate import check_job_spec, check_task, bad_test_cmd
+from vigild.intake.spec_gate import bad_test_cmd, check_job_spec, check_task
 from vigild.jobs.artifacts import parse_plan, parse_spec
 
 MONEY = ["src/billing/**", "src/auth/**", "**/payments/**", "**/consent/**"]

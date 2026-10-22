@@ -135,11 +135,11 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
         "mounts": [_mount(str(source), "/work", read_only=True)],
         "tmpfs": {"/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
         "working_dir": "/work",
-        "environment": {
-            "HOME": "/tmp/home",
-            "XDG_CACHE_HOME": "/tmp/cache",
+        "environment": {  # caches on the container's own tmpfs, never the source
+            "HOME": "/tmp/home",  # noqa: S108
+            "XDG_CACHE_HOME": "/tmp/cache",  # noqa: S108
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPYCACHEPREFIX": "/tmp/pycache",
+            "PYTHONPYCACHEPREFIX": "/tmp/pycache",  # noqa: S108
         },
         "stdin_open": False,
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},

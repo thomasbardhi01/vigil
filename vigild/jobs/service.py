@@ -399,6 +399,63 @@ class JobService:
         self.runner.on_resume(job.id)
         return job
 
+    def _offered(self, item_id: int, action: str) -> InboxItem:
+        item = self._question(item_id)
+        if item.job_id is None or action not in (item.body.get("actions") or []):
+            raise Conflict(f"inbox item {item_id} doesn't offer {action}")
+        return item
+
+    def retry(self, item_id: int) -> Job:
+        """Run the failed and remaining tasks again, each with what's left of
+        its own cap (review round 2, N5)."""
+        self._offered(item_id, "retry")
+        return self.resume(item_id)
+
+    def replan(self, item_id: int) -> Job:
+        """Send a held job back to the coord, with the failures in its packet."""
+        with self.store.tx():
+            item = self._offered(item_id, "replan")
+            assert item.job_id is not None
+            try:
+                job = transition(
+                    self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
+                    channel="inbox", evidence={"inbox_item_id": item_id, "action": "replan"},
+                )  # fmt: skip
+            except TransitionError as e:
+                raise Conflict(str(e)) from e
+            self.store.add_event(
+                "replan",
+                {"inbox_item_id": item_id, "tasks": item.body.get("tasks") or {}},
+                Provenance.HUMAN,
+                job_id=job.id,
+            )
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        self.runner.on_resume(job.id)
+        return job
+
+    def abandon(self, item_id: int) -> Job:
+        """Give the job up: nothing more runs; open PRs stay for you to close."""
+        with self.store.tx():
+            item = self._offered(item_id, "abandon")
+            assert item.job_id is not None
+            try:
+                job = transition(
+                    self.store, item.job_id, JobState.ABANDONED, Actor.OWNER,
+                    channel="inbox", evidence={"inbox_item_id": item_id, "action": "abandon"},
+                )  # fmt: skip
+            except TransitionError as e:
+                raise Conflict(str(e)) from e
+            for t in self.store.list_tasks(job.id):
+                if t.state != "pr_open":
+                    self.store.update_task(t.id, state="abandoned")
+            self.store.add_event(
+                "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
+            )
+            for other in self.store.list_inbox():
+                if other.job_id == job.id and other.queue == "questions":
+                    self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+        return job
+
     def dismiss(self, item_id: int) -> None:
         with self.store.tx():
             item = self._question(item_id)

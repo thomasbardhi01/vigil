@@ -200,6 +200,34 @@ def resume(request: Request, item_id: int) -> dict[str, Any]:
     return {"job_id": job.id, "state": job.state.value}
 
 
+def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
+    jobs = _svc(request).jobs
+    try:
+        job = {"retry": jobs.retry, "replan": jobs.replan, "abandon": jobs.abandon}[action](item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value}
+
+
+@router.post("/api/inbox/{item_id}/retry", dependencies=[ADMIN])
+def retry(request: Request, item_id: int) -> dict[str, Any]:
+    """A blocked job runs its failed tasks again, on what's left of their caps."""
+    return _act(request, item_id, "retry")
+
+
+@router.post("/api/inbox/{item_id}/replan", dependencies=[ADMIN])
+def replan(request: Request, item_id: int) -> dict[str, Any]:
+    """A blocked job goes back to its coord, with the failures in the packet."""
+    return _act(request, item_id, "replan")
+
+
+@router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])
+def abandon(request: Request, item_id: int) -> dict[str, Any]:
+    return _act(request, item_id, "abandon")
+
+
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:

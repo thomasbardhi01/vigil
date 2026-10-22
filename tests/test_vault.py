@@ -315,7 +315,7 @@ def test_safe_read_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
     def read() -> None:
         try:
             safe_read_bytes(root, root / "result.bundle")
-        except BaseException as e:  # noqa: BLE001
+        except BaseException as e:
             errors.append(e)
 
     t = threading.Thread(target=read, daemon=True)

@@ -68,7 +68,8 @@ def bad_test_cmd(cmd: str | None) -> str | None:
         words.pop()
         ops.pop()
     if ops and ops[-1] in (";", "||", "|", "\n") and _always_zero(words[-1]):
-        return f"test_cmd `{cmd.strip()}` always exits 0: it ends in `{ops[-1].strip() or 'newline'} {' '.join(words[-1])}`"
+        tail = f"{ops[-1].strip() or 'newline'} {' '.join(words[-1])}"
+        return f"test_cmd `{cmd.strip()}` always exits 0: it ends in `{tail}`"
     return None
 
 
@@ -78,9 +79,8 @@ def check_task(task: Task) -> GateResult:
         for key in ("test_cmd", "done_when")
         if not (getattr(task.spec, key) or "").strip()
     ]
-    if task.spec.test_cmd and task.spec.test_cmd.strip():
-        if why := bad_test_cmd(task.spec.test_cmd):
-            errors.append(why)
+    if (task.spec.test_cmd or "").strip() and (why := bad_test_cmd(task.spec.test_cmd)):
+        errors.append(why)
     return GateResult(ok=not errors, needs_spec=bool(errors), errors=errors)
 
 

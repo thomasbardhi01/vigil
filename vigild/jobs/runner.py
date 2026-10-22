@@ -16,6 +16,11 @@
   record is the only test result (owner direction, round 2). Acceptance fails
   closed (blocker 4), and vigild publishes the draft PR itself (P2).
 - on_resume (only from the inbox): a held job picks up its remaining work.
+- A failed worker (its session, its result, acceptance, publish, a question
+  for its coord, a stale image) blocks the job after its wave with one inbox
+  item offering retry, re-plan or abandon (review round 2, N5). A retry runs
+  only the failed and remaining tasks, each reserving what's left of its own
+  cap; re-plan sends the job back to the coord with the failures in its packet.
 - reconcile (at startup): nothing from before a restart keeps running or
   keeps money held (review round 1, item 7).
 
@@ -72,6 +77,8 @@ COORD_MINUTES = 30
 WORKER_MINUTES = 40
 SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
 LIVE_SESSION = ("created", "running")
+DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
+MIN_RETRY_USD = 0.05  # less than this left of a task's cap: no retry is offered
 
 
 class Publisher(Protocol):
@@ -151,6 +158,9 @@ class JobRunner:
         self.background = background
         self.reaper = reaper
         self.jobs: Pager | None = None
+        self._why: dict[str, dict[str, Any]] = {}  # task id -> why its last attempt failed
+        self._why_lock = threading.Lock()
+        self.deferred: list[str] = []  # approved builds reconcile found, not yet started
 
     # --- triggers ---------------------------------------------------------------------
 
@@ -193,8 +203,11 @@ class JobRunner:
     def reconcile(self) -> dict[str, int]:
         """After a restart: revoke every gateway token, remove leftover session
         containers, fail sessions that were live, settle every open reservation,
-        hold jobs that were mid-flight (paged, resumable), and re-fire approved
-        jobs whose build never started."""
+        hold jobs that were mid-flight (paged, with retry and the other actions),
+        offer retry or cancel for a draft whose coord it failed (N6), and queue
+        approved jobs whose build never started. They start from
+        `start_deferred`, which vigild calls once the gateway is listening and
+        the dev images have been validated (N11)."""
         out = {
             "tokens": self.gateway.revoke_all(),
             "containers": 0,
@@ -205,10 +218,13 @@ class JobRunner:
         }
         if self.reaper is not None:
             out["containers"] = self.reaper()
+        failed_coord: set[str] = set()
         for s in self.store.list_sessions():
             if s.status in LIVE_SESSION:
                 self.store.update_session(s.id, status="failed", ended_at=iso())
                 out["sessions"] += 1
+                if s.role is Role.COORD and s.job_id:
+                    failed_coord.add(s.job_id)
         for rid in self.budget.open_reservation_ids():
             self.budget.settle(rid)
             out["reservations"] += 1
@@ -221,15 +237,31 @@ class JobRunner:
                 self._page(
                     job.id,
                     f"{job.id}: vigild restarted while it was {job.state.value}",
-                    {"state": job.state.value},
+                    {"state": job.state.value, "actions": ["retry", "replan", "abandon"]},
+                    resumable=True,
+                )
+                out["held"] += 1
+            elif job.state is JobState.SPEC_PENDING and job.id in failed_coord:
+                self._page(
+                    job.id,
+                    f"{job.id}: vigild restarted while the coord was drafting",
+                    {"state": job.state.value, "actions": ["retry", "abandon"]},
                     resumable=True,
                 )
                 out["held"] += 1
             elif job.state is JobState.APPROVED:
-                self.on_approved(job.id)
+                self.deferred.append(job.id)
                 out["rebuilt"] += 1
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
+
+    def start_deferred(self) -> int:
+        """Start the builds reconcile queued. vigild calls this only once its
+        gateway is listening and the dev images are validated (N11)."""
+        started, self.deferred = self.deferred, []
+        for job_id in started:
+            self.on_approved(job_id)
+        return len(started)
 
     # --- helpers ------------------------------------------------------------------------
 
@@ -285,6 +317,17 @@ class JobRunner:
             self.gateway.revoke(s.id)
             self.budget.settle(reservation)
             self.store.update_session(s.id, ended_at=iso())
+
+    def _replan_context(self, job_id: str) -> dict[str, Any]:
+        """The failures the owner sent back with the latest re-plan, if any."""
+        rows = self.store.q(
+            "SELECT data FROM events WHERE job_id=? AND type='replan' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        )
+        if not rows:
+            return {}
+        tasks = json.loads(rows[0]["data"]).get("tasks")
+        return tasks if isinstance(tasks, dict) else {}
 
     def _session_dir(self, session_id: str) -> Path:
         return self.cfg.vigild.data_path / "sessions" / session_id
@@ -376,6 +419,7 @@ class JobRunner:
         clone_id = f"{job_id}-coord{attempt}"
         clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
         base_sha = self.workspace.base_sha(clone_id)
+        replan = self._replan_context(job_id)
         request = {
             "job_id": job_id,
             "repo": job.repo,
@@ -390,8 +434,16 @@ class JobRunner:
             "risk": meta.get("risk"),
             **{f"previous_{k}": v for k, v in previous.items()},
         }
+        untrusted: dict[str, str] = {}
+        if replan:
+            # vigild's summary goes in the contract; the failure details carry
+            # worker and test output, so they go in the untrusted section
+            request["replan"] = {
+                tid: {"title": t.get("title"), "state": t.get("state")} for tid, t in replan.items()
+            }
+            untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
         self.workspace.write_task(clone, request)
-        packet = assemble_coord(clone, request, untrusted={}, gate_errors=gate_errors)
+        packet = assemble_coord(clone, request, untrusted=untrusted, gate_errors=gate_errors)
         self.store.add_event(
             "packet",
             {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
@@ -498,7 +550,12 @@ class JobRunner:
         job = self.store.get_job(job_id)
         art = self.store.get_artifact(job_id, "plan.md")
         assert art is not None
-        for w in parse_plan(art.content).workers:
+        workers = parse_plan(art.content).workers
+        planned = {w.task_id for w in workers}
+        for old in self.store.list_tasks(job_id):
+            if old.id not in planned and old.state not in ("pr_open", *DEAD_TASK):
+                self.store.update_task(old.id, state="superseded")  # re-planned away (N5)
+        for w in workers:
             if not w.task_id.startswith(f"{job_id}-w"):
                 raise RuntimeError(f"plan.md task id {w.task_id} isn't vigild's")  # item 16
             task = self._task(job_id, job.repo, job.base, job.source, w)
@@ -520,6 +577,8 @@ class JobRunner:
                 existing = self.store.get_task(w.task_id)
                 if existing.job_id != job_id:
                     raise RuntimeError(f"task {w.task_id} belongs to {existing.job_id}")
+                if existing.state == "pr_open":
+                    continue  # after a re-plan, a published task's PR stands as it is
                 self.store.update_task(w.task_id, contract=contract)
             except KeyError:
                 self.store.create_task(job_id, contract, Provenance.CLAUDE)
@@ -530,20 +589,20 @@ class JobRunner:
         self.dispatch(job_id)
 
     def dispatch(self, job_id: str) -> None:
-        """Run every task not yet published, in dependency waves."""
-        tasks = {t.id: t for t in self.store.list_tasks(job_id)}
+        """Run every live task not yet published, in dependency waves. After a
+        wave with a failure, the job blocks and the owner chooses (N5)."""
+        tasks = {t.id: t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK}
         done = {t for t, row in tasks.items() if row.state == "pr_open"}
         pending = [t for t in tasks if t not in done]
         while pending:
             wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
             if not wave:
-                # Nothing can start: a dependency failed or is waiting (item 17).
+                # Nothing can start: a dependency is missing from the plan (item 17).
                 stuck = {t: self.store.get_task(t).state for t in pending}
                 self._page(
                     job_id,
                     f"{job_id}: work is stuck behind unfinished dependencies",
-                    {"pending": stuck},
-                    resumable=True,
+                    {"pending": stuck, "actions": ["replan", "abandon"]},
                 )
                 self._block(job_id, f"stuck: {sorted(stuck)}")
                 return
@@ -553,32 +612,84 @@ class JobRunner:
             except Refused:
                 return
             with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = [pool.submit(self._run_worker, job_id, t, reservations[t]) for t in wave]
+                futures = [pool.submit(self._run_worker, job_id, t, *reservations[t]) for t in wave]
                 results = [f.result() for f in futures]
             done |= {t for t, ok in zip(wave, results, strict=True) if ok}
-        if all(t.state == "pr_open" for t in self.store.list_tasks(job_id)):
+            failed = [t for t, ok in zip(wave, results, strict=True) if not ok]
+            if failed:
+                self._hold_failed(job_id, failed)
+                return
+        live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
+        if all(t.state == "pr_open" for t in live):
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
 
-    def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, int]:
-        """Reserve every worker of a wave before any starts; on a refusal,
-        release them, block the job and page: dispatch halts."""
-        held: dict[str, int] = {}
+    def remaining(self, task_id: str) -> tuple[float, float, float]:
+        """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
+        cap = float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"])
+        spent = self.budget.task_spent(task_id)
+        return cap, spent, max(0.0, cap - spent)
+
+    def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
+        """Block the job with one item: retry (when every failed task has budget
+        left), re-plan, or abandon."""
+        tasks: dict[str, dict[str, Any]] = {}
+        can_retry = True
         for tid in task_ids:
-            amount = float(self.store.get_task(tid).contract["limits"]["max_cost_usd"])
+            cap, spent, left = self.remaining(tid)
+            with self._why_lock:
+                why = self._why.pop(tid, {})
+            tasks[tid] = {
+                "state": self.store.get_task(tid).state,
+                "cap_usd": round(cap, 4),
+                "spent_usd": round(spent, 4),
+                "remaining_usd": round(left, 4),
+                **why,
+            }
+            can_retry = can_retry and left >= MIN_RETRY_USD
+        actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
+        self._block(job_id, f"workers failed: {sorted(task_ids)}")
+        titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
+        self._page(
+            job_id,
+            f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300],
+            {"kind": "worker_failed", "tasks": tasks, "actions": actions},
+            resumable=can_retry,
+        )
+
+    def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, tuple[int, float]]:
+        """Reserve every worker of a wave before any starts, each for what's
+        left of its own cap; on a refusal, release them, block the job and
+        page: dispatch halts."""
+        held: dict[str, tuple[int, float]] = {}
+        for tid in task_ids:
+            _, _, amount = self.remaining(tid)
             try:
-                held[tid] = self.budget.reserve(
-                    session_id=None, task_id=tid, amount=amount, purpose="worker"
+                if amount < MIN_RETRY_USD:
+                    raise BudgetExceeded(
+                        "per_task", f"task {tid} has ${amount:.2f} of its cap left"
+                    )
+                held[tid] = (
+                    self.budget.reserve(
+                        session_id=None, task_id=tid, amount=amount, purpose="worker"
+                    ),
+                    amount,
                 )
             except BudgetExceeded as e:
-                for rid in held.values():
+                for rid, _amt in held.values():
                     self.budget.settle(rid, 0.0)
                 for t2 in task_ids:
                     self.store.update_task(t2, state="waiting")
+                per_task = e.cap == "per_task"
                 self._page(
                     job_id,
                     f"{job_id}: {e.cap} cap reached; dispatch halted",
-                    {"cap": e.cap, "detail": e.detail, "tasks": task_ids},
-                    resumable=True,
+                    {
+                        "cap": e.cap,
+                        "detail": e.detail,
+                        "tasks": task_ids,
+                        "actions": ([] if per_task else ["retry"]) + ["replan", "abandon"],
+                    },
+                    resumable=not per_task,
                 )
                 self._block(job_id, f"budget: {e}")
                 raise Refused(str(e)) from e
@@ -596,13 +707,16 @@ class JobRunner:
         if s is not None:
             self.store.update_session(s.id, status=state)
         self.store.update_task(task_id, state=state)
-        self._page(job_id, title, {"task_id": task_id, **body})
+        why = redact({"title": title, **body})
+        with self._why_lock:
+            self._why[task_id] = why
+        self.store.add_event("task_failed", why, Provenance.HUMAN, job_id=job_id, task_id=task_id)
         return False
 
-    def _run_worker(self, job_id: str, task_id: str, reservation: int) -> bool:
+    def _run_worker(self, job_id: str, task_id: str, reservation: int, amount: float) -> bool:
         held: dict[str, SessionRow] = {}
         try:
-            return self._worker(job_id, task_id, reservation, held)
+            return self._worker(job_id, task_id, reservation, amount, held)
         except Exception as e:  # the reservation never leaks (item 7)
             log.exception("worker %s failed", task_id)
             self.budget.settle(reservation)
@@ -615,7 +729,12 @@ class JobRunner:
             )
 
     def _worker(
-        self, job_id: str, task_id: str, reservation: int, held: dict[str, SessionRow]
+        self,
+        job_id: str,
+        task_id: str,
+        reservation: int,
+        amount: float,
+        held: dict[str, SessionRow],
     ) -> bool:
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
@@ -682,7 +801,7 @@ class JobRunner:
             session_dir=self._session_dir(s.id),
             max_turns=60,
             max_minutes=WORKER_MINUTES,
-            max_budget_usd=float(contract["limits"]["max_cost_usd"]),
+            max_budget_usd=amount,  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=image,
@@ -737,9 +856,14 @@ class JobRunner:
                 },
                 Provenance.CLAUDE,
             )
-            self.store.update_session(s.id, status="waiting")
-            self.store.update_task(task_id, state="waiting")
-            return False
+            return self._fail(
+                job_id,
+                s,
+                task_id,
+                f"{task_id} asks its coord",
+                {"question": question},
+                state="waiting",
+            )
         raw = self.workspace.read_blob(job.repo, head, f"{art_dir}/worker_report.json", 256 << 10)
         try:
             report = WorkerReport.model_validate_json(raw or "")

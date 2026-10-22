@@ -180,7 +180,7 @@ def test_verifying_to_done_needs_a_clean_verify_record(store: Store) -> None:
 
 # * -> blocked / escalated, and back
 @pytest.mark.parametrize(
-    "start", [s for s in JobState if s not in (S.DONE, S.BLOCKED, S.ESCALATED)]
+    "start", [s for s in JobState if s not in (S.DONE, S.ABANDONED, S.BLOCKED, S.ESCALATED)]
 )
 @pytest.mark.parametrize("to", [S.BLOCKED, S.ESCALATED])
 def test_blocked_and_escalated_reachable_from_every_live_state(
@@ -251,3 +251,31 @@ def test_in_review_reads_the_newest_session_by_sequence(store: Store) -> None:
     store.update_session(later.id, status="failed")
     with pytest.raises(TransitionError, match="PR"):
         transition(store, jid, S.IN_REVIEW, Actor.VIGILD)
+
+
+# review round 2, N5: out of a hold, the owner may also re-plan or abandon
+def test_a_held_build_can_be_replanned_or_abandoned_by_the_owner_only(store: Store) -> None:
+    for to, action in ((S.SPEC_PENDING, "replan"), (S.ABANDONED, "abandon")):
+        jid = _job(store, S.BUILDING)
+        transition(store, jid, S.BLOCKED, Actor.VIGILD, evidence={"reason": "worker failed"})
+        with pytest.raises(TransitionError):
+            transition(store, jid, to, Actor.OWNER, channel="inbox")  # no action named
+        with pytest.raises(TransitionError, match="owner"):
+            transition(store, jid, to, Actor.VIGILD, evidence={"action": action})
+        with pytest.raises(TransitionError):
+            transition(
+                store, jid, S.READY, Actor.OWNER, channel="inbox", evidence={"action": action}
+            )
+        job = transition(store, jid, to, Actor.OWNER, channel="inbox", evidence={"action": action})
+        assert job.state is to
+
+
+def test_abandoned_is_terminal_and_reachable_from_spec_pending(store: Store) -> None:
+    jid = _job(store, S.SPEC_PENDING)
+    with pytest.raises(TransitionError):
+        transition(store, jid, S.ABANDONED, Actor.VIGILD, evidence={"action": "abandon"})
+    transition(
+        store, jid, S.ABANDONED, Actor.OWNER, channel="inbox", evidence={"action": "abandon"}
+    )
+    with pytest.raises(TransitionError, match="no transition out"):
+        transition(store, jid, S.BLOCKED, Actor.VIGILD, evidence={"reason": "x"})

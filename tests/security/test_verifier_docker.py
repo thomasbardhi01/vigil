@@ -46,7 +46,7 @@ def test_no_network_read_only_source_agent_uid(
         source,
         "id -u; grep CapEff /proc/self/status; cat ok.txt; "
         "touch /work/x 2>/dev/null; echo SRC=$?; touch /tmp/x; echo TMP=$?; "
-        "python -c \"import urllib.request as u\n"
+        'python -c "import urllib.request as u\n'
         "try:\n u.urlopen('https://pypi.org/simple/', timeout=5); print('REACHED')\n"
         "except Exception as e:\n print('BLOCKED', type(e).__name__)\"; exit 3",
     )
@@ -59,7 +59,9 @@ def test_no_network_read_only_source_agent_uid(
 
 
 def test_output_is_capped_to_its_tail(runner: DockerTestRunner, cfg: Config, source: Path) -> None:
-    r = _run(runner, cfg, source, "head -c 300000 /dev/zero | tr '\\0' a; echo END", max_output=4096)
+    r = _run(
+        runner, cfg, source, "head -c 300000 /dev/zero | tr '\\0' a; echo END", max_output=4096
+    )
     assert r.exit == 0 and r.truncated
     assert len(r.output) <= 4096 and r.output.rstrip().endswith("END")
 

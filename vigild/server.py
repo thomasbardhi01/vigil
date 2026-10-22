@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,9 +100,11 @@ def build(
     return Vigild(cfg, secrets, store, budget, gateway, telemetry, services)
 
 
-async def serve(v: Vigild) -> None:
+async def serve(v: Vigild, on_ready: Callable[[], Any] | None = None) -> None:
     """Loopback: the bearer-only API and the gateway. The Tailscale address: the
-    API with the UI's cookie login (P7). No Tailscale address, no UI login."""
+    API with the UI's cookie login (P7). No Tailscale address, no UI login.
+    `on_ready` runs (in a thread) once every listener, the gateway's included,
+    has started (review round 2, N11)."""
     api = v.cfg.vigild.api
     gw = v.cfg.vigild.gateway
     configs = [
@@ -120,7 +122,17 @@ async def serve(v: Vigild) -> None:
         )
     else:
         log.warning("config: web UI login is off (api.tailscale_host is not set)")
-    await asyncio.gather(*(uvicorn.Server(c).serve() for c in configs))
+    servers = [uvicorn.Server(c) for c in configs]
+
+    async def ready() -> None:
+        while not all(getattr(srv, "started", False) for srv in servers):
+            if any(getattr(srv, "should_exit", False) for srv in servers):
+                return
+            await asyncio.sleep(0.05)
+        if on_ready is not None:
+            await asyncio.to_thread(on_ready)
+
+    await asyncio.gather(*(srv.serve() for srv in servers), ready())
 
 
 def _github_app(v: Vigild) -> Any:
@@ -146,9 +158,9 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
 
     from vigild.devimage import DockerImages
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
-    from vigild.verifier import Verifier
     from vigild.github.app import READ_ONLY
     from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
+    from vigild.verifier import Verifier
     from vigild.workspace import Workspace
 
     client = docker.from_env()
@@ -207,9 +219,15 @@ def main() -> None:
         raise SystemExit(f"vigild: {e}") from e
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
+    # Validate the dev images before anything can start a session, then hold
+    # every job a restart interrupted; approved builds start only once the
+    # gateway is listening (review round 2, N11).
+    for repo in runner.dev_images.cfg.repos.repos:
+        if runner.dev_images.due(repo):
+            runner.dev_images.validate(repo)
     log.info("reconcile: %s", runner.reconcile())
     stop = threading.Event()
     threading.Thread(
         target=validate_images_forever, args=(runner.dev_images, stop), daemon=True
     ).start()
-    asyncio.run(serve(v))
+    asyncio.run(serve(v, on_ready=runner.start_deferred))

@@ -68,6 +68,9 @@ class Budget:
     def spent_month(self) -> float:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE month=?", (self._month(),))
 
+    def task_spent(self, task_id: str) -> float:
+        return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE task_id=?", (task_id,))
+
     def task_total(self, task_id: str) -> float:
         spent = self._sum("SELECT SUM(amount_usd) FROM ledger WHERE task_id=?", (task_id,))
         held = self._sum(

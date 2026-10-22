@@ -21,6 +21,7 @@ class JobState(StrEnum):
     DONE = "done"
     BLOCKED = "blocked"
     ESCALATED = "escalated"
+    ABANDONED = "abandoned"  # the owner gave up on it, from the inbox (round 2, N5)
 
 
 class Role(StrEnum):

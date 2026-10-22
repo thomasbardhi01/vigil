@@ -135,7 +135,9 @@ def check_content(body: dict[str, Any]) -> None:
     for i, m in enumerate(messages):
         if not isinstance(m, dict):
             raise GatewayError(400, "invalid_request_error", f"messages[{i}] must be an object")
-        allowed = MESSAGE_BLOCKS | (ASSISTANT_ONLY_BLOCKS if m.get("role") == "assistant" else set())
+        allowed = MESSAGE_BLOCKS | (
+            ASSISTANT_ONLY_BLOCKS if m.get("role") == "assistant" else set()
+        )
         _check_blocks(m.get("content", ""), frozenset(allowed), f"messages[{i}].content")
 
 

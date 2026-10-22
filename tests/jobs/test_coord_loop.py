@@ -463,7 +463,7 @@ def test_out_of_scope_worker_is_not_published(world: World) -> None:
     job = _approve(w)
     assert w.publisher.prs == []
     assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
-    assert w.store.get_job(job).state.value == "building"
+    assert w.store.get_job(job).state.value == "blocked"  # round 2, N5: never stranded
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     assert any("acceptance" in p["title"] for p in pages)
 
@@ -523,7 +523,7 @@ def test_hook_forgery_and_a_fifo_record_change_no_verdict(
         (evil / "hooks").mkdir(parents=True)
         forge = (
             f"#!/bin/sh\necho ran >> {marker}\n"
-            f"echo '{{\"before\":{{\"outcome\":\"fail\"}},\"after\":{{\"outcome\":\"pass\"}}}}'"
+            f'echo \'{{"before":{{"outcome":"fail"}},"after":{{"outcome":"pass"}}}}\''
             f" > {out}/harness_tests.json\n"
         )
         for name in ("post-commit", "pre-commit"):
@@ -611,7 +611,7 @@ def test_each_coord_draft_is_its_own_session_and_books_once(world: World) -> Non
     assert booked == pytest.approx(metered) == pytest.approx(0.20)
 
 
-def test_dependents_of_a_failed_worker_page_and_block(world: World) -> None:  # item 17
+def test_dependents_of_a_failed_worker_wait_and_the_job_blocks(world: World) -> None:  # item 17
     w = world
 
     def chained(j: str) -> tuple[str, str]:
@@ -633,8 +633,9 @@ def test_dependents_of_a_failed_worker_page_and_block(world: World) -> None:  # 
     job = _approve(w)
     assert [c[1] for c in w.standin.calls if c[0] == "worker"] == [f"{job}-w1"]
     assert w.store.get_job(job).state.value == "blocked"
-    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert any("stuck" in p["title"] and p["body"]["resumable"] for p in pages)
+    item = _failure_item(w, job)
+    assert list(item["body"]["tasks"]) == [f"{job}-w1"] and item["body"]["resumable"]
+    assert w.store.get_task(f"{job}-w2").state == "queued"
 
 
 def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
@@ -718,4 +719,237 @@ def test_reconcile_restarts_an_approved_job_that_never_built(world: World) -> No
     assert w.store.get_job(job).state.value == "approved"
     w.runner.build = real_build  # type: ignore[method-assign]
     assert w.runner.reconcile()["rebuilt"] == 1
+    # nothing starts until vigild's gateway is up and its images are validated (N11)
+    assert w.store.get_job(job).state.value == "approved" and w.standin.calls == [("coord", job)]
+    assert w.runner.start_deferred() == 1
     assert w.store.get_job(job).state.value == "in_review"
+    assert w.runner.start_deferred() == 0
+
+
+# --- review round 2, N5: a failed worker blocks its job; retry, re-plan or abandon ----------
+
+
+def _spend(w: World, amount_out_tokens: int) -> Callable[[SessionSpec], None]:
+    """Each worker session spends Opus output tokens through the meter."""
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    prices = PriceTable(w.runner.cfg.prices)
+
+    def spend(spec: SessionSpec) -> None:
+        if spec.role is Role.WORKER:
+            record_call(
+                w.store,
+                prices,
+                session_id=spec.session_id,
+                task_id=spec.task_id,
+                job_id=spec.job_id,
+                purpose="session",
+                provider="anthropic",
+                backend_preset="claude-opus",
+                model="claude-opus-5-5",
+                usage=CallUsage(tokens_out=amount_out_tokens),
+            )
+
+    return spend
+
+
+def _failure_item(w: World, job: str) -> dict[str, Any]:
+    items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == "worker_failed"]
+    return item  # type: ignore[no-any-return]
+
+
+def _flaky(fail_first: set[str]) -> Callable[[SessionSpec, dict[str, Any]], None]:
+    """Workers whose first attempt strays out of scope; later attempts are clean."""
+    tries: dict[str, int] = {}
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        tid = str(spec.task_id)
+        tries[tid] = tries.get(tid, 0) + 1
+        f = task["spec"]["files_in_scope"][0]
+        (spec.clone / f).write_text(EDITS[f])
+        if tries[tid] == 1 and tid[-2:] in fail_first:
+            (spec.clone / "README.md").write_text("out of scope\n")
+
+    return edit
+
+
+def test_fail_blocked_retry_done(world: World) -> None:
+    """End to end: a worker fails, the job blocks with one inbox item offering
+    retry, re-plan or abandon; retry re-runs only the failed task, with what's
+    left of its budget; the job reaches review."""
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    w.standin.on_session = _spend(w, 15_000)  # $0.30 of Opus output per worker session
+    budgets: list[tuple[str, float]] = []
+    real = w.standin.run
+
+    def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+        if spec.role is Role.WORKER:
+            budgets.append((str(spec.task_id), spec.max_budget_usd))
+        return real(spec, token, sink)
+
+    w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["retry", "replan", "abandon"]
+    failed = item["body"]["tasks"]
+    assert list(failed) == [f"{job}-w1"]
+    assert "outside scope" in json.dumps(failed)
+    assert failed[f"{job}-w1"]["spent_usd"] == pytest.approx(0.30)
+    assert failed[f"{job}-w1"]["remaining_usd"] == pytest.approx(1.70)
+    assert [p["head"] for p in w.publisher.prs] == [f"vigil/{job}-w2"]
+
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "in_review"
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+    # the retry ran only w1, under what was left of its $2.00, not a fresh cap
+    w1 = [b for b in budgets if b[0].endswith("w1")]
+    assert w1 == [(f"{job}-w1", 2.0), (f"{job}-w1", pytest.approx(1.70))]
+    assert sum(1 for b in budgets if b[0].endswith("w2")) == 1
+    held = w.store.q(
+        "SELECT amount_usd FROM reservations WHERE task_id=? ORDER BY id", (f"{job}-w1",)
+    )
+    assert [r["amount_usd"] for r in held] == [2.0, pytest.approx(1.70)]
+    assert w.budget.open_today() == 0
+
+
+def test_no_budget_left_offers_only_replan_or_abandon(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    w.standin.on_session = _spend(w, 100_000)  # $2.00: the whole cap
+    job = _approve(w)
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["replan", "abandon"]
+    assert item["body"]["resumable"] is False
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 409
+    r = w.client.post(f"/api/inbox/{item['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 409
+
+
+def test_replan_sends_the_job_back_to_the_coord_with_the_failure(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    packets: list[str] = []
+    w.standin.on_session = lambda spec: (
+        packets.append(spec.packet) if spec.role is Role.COORD else None
+    )
+    job = _approve(w)
+    item = _failure_item(w, job)
+    r = w.client.post(f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert len(packets) == 2
+    assert f"{job}-w1" in packets[1] and "outside scope" in packets[1]
+    assert "outside scope" not in packets[0]
+    # the new draft goes through approval again, then builds; w2's PR stands
+    assert w.store.get_job(job).state.value == "spec_pending"
+    spec_item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    r = w.client.post(
+        f"/api/inbox/{spec_item['id']}/approve", headers=auth(w.tokens.admin), json={}
+    )
+    assert r.status_code == 200, r.text
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert w.store.get_job(job).state.value == "in_review", [(q["title"], q["body"]) for q in qs]
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+
+
+def test_abandon_ends_the_job(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    job = _approve(w)
+    item = _failure_item(w, job)
+    calls = len(w.standin.calls)
+    r = w.client.post(f"/api/inbox/{item['id']}/abandon", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "abandoned"
+    assert w.store.get_task(f"{job}-w1").state == "abandoned"
+    assert w.store.get_task(f"{job}-w2").state == "pr_open"
+    assert len(w.standin.calls) == calls
+    assert w.budget.open_today() == 0
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code in (404, 409)
+
+
+@pytest.mark.parametrize("cause", ["ask_coord", "stale_image", "session_failed"])
+def test_every_worker_failure_blocks_with_actions(world: World, cause: str) -> None:
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        (spec.clone / f).write_text(EDITS[f])
+        if cause == "ask_coord" and str(spec.task_id).endswith("w1"):
+            d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "ask_coord.json").write_text(json.dumps({"question": "which?"}))
+
+    w.standin.worker_edit = edit
+    if cause == "stale_image":
+        real_fresh = w.images.ensure_fresh
+        n = [0]
+
+        def fresh(repo: str) -> str:
+            n[0] += 1
+            if n[0] > 1:  # the coord ran; the image went stale before the workers
+                w.images.docker.image_id = "sha256:rebuilt"  # type: ignore[attr-defined]
+            return real_fresh(repo)
+
+        w.images.ensure_fresh = fresh  # type: ignore[method-assign]
+    if cause == "session_failed":
+        real = w.standin.run
+
+        def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+            if spec.role is Role.WORKER and str(spec.task_id).endswith("w1"):
+                return ExecOutcome("timeout", None, {}, "over 40 min")
+            return real(spec, token, sink)
+
+        w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job)
+    assert "replan" in item["body"]["actions"] and "abandon" in item["body"]["actions"]
+    assert f"{job}-w1" in item["body"]["tasks"]
+    assert w.budget.open_today() == 0
+
+
+def test_reconcile_offers_retry_or_cancel_for_a_coord_it_failed(world: World) -> None:  # N6
+    w = world
+    w.runner.run_coord = lambda j: None  # type: ignore[method-assign]  # vigild dies drafting
+    job = _request(w)
+    coord = w.store.create_session(job, Role.COORD, backend_preset="claude-opus")
+    w.store.set_coord_session(job, coord.id)
+    w.store.update_session(coord.id, status="running")
+    del w.runner.run_coord  # back to the real one
+
+    out = w.runner.reconcile()
+    assert out["sessions"] == 1 and out["held"] == 1
+    assert w.store.get_session(coord.id).status == "failed"
+    items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in items if q["job_id"] == job]
+    assert "restarted" in item["title"]
+    assert item["body"]["actions"] == ["retry", "abandon"] and item["body"]["resumable"]
+
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert [c[0] for c in w.standin.calls] == ["coord"]
+    assert w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+
+
+def test_cancel_a_spec_pending_job(world: World) -> None:  # N6
+    w = world
+    w.runner.run_coord = lambda j: None  # type: ignore[method-assign]
+    job = _request(w)
+    coord = w.store.create_session(job, Role.COORD, backend_preset="claude-opus")
+    w.store.update_session(coord.id, status="running")
+    w.runner.reconcile()
+    item = next(
+        q
+        for q in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if q["job_id"] == job
+    )
+    r = w.client.post(f"/api/inbox/{item['id']}/abandon", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "abandoned"

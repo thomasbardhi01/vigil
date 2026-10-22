@@ -106,9 +106,7 @@ def test_each_run_gets_a_fresh_checkout_with_no_hooks(ws: Workspace, tmp_path: P
     assert not any(Path(s).exists() for s in sources), "checkouts are removed after the run"
 
 
-def test_the_hook_forgery_and_a_fifo_record_change_nothing(
-    ws: Workspace, tmp_path: Path
-) -> None:
+def test_the_hook_forgery_and_a_fifo_record_change_nothing(ws: Workspace, tmp_path: Path) -> None:
     """The reviewer's forgery: commondir pointing at a copy with core.fsmonitor
     and hooks/post-commit that rewrite the old record path, plus a FIFO planted
     at that path. The verdict comes from the vault checkout; neither runs or
@@ -143,12 +141,29 @@ def test_the_hook_forgery_and_a_fifo_record_change_nothing(
     # harness pins its git); it doesn't matter here: what's tested is vigild's side
     git(clone, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "add", "-A")
     subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "commit", "-qm", "w"],
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "commit",
+            "-qm",
+            "w",
+        ],
         cwd=clone,
         check=True,
         env={**os.environ, "GIT_COMMON_DIR": str(clone / ".git")},
     )
-    git(clone, "bundle", "create", "-q", str(out / "result.bundle"), f"refs/heads/{BRANCH}", f"^{base}")
+    git(
+        clone,
+        "bundle",
+        "create",
+        "-q",
+        str(out / "result.bundle"),
+        f"refs/heads/{BRANCH}",
+        f"^{base}",
+    )
     tip = git(clone, "rev-parse", BRANCH)
     head = ws.import_result(REPO, TID, out, BRANCH, base, head=tip)
     rec = _verify(_verifier(ws), base, head, "grep -q 'rate limit' docs/feature-map.md")
