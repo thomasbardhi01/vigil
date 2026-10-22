@@ -128,9 +128,13 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
 # into /work with the dependencies it installed, and starts what the suites
 # need (a database on loopback); an image without one gets a plain copy.
 # Exit 125 means the tree couldn't be prepared: the outcome is `unknown`.
-# The verifier's container script (rounds 2-4). The per-run marker arrives on
-# stdin and stdin is closed before anything else runs, so the marker is in no
-# argv, environment or file a test can read. The checkout is prepared (exit 125
+# The verifier's container script (rounds 2-5). The per-run marker arrives on
+# stdin and stdin is closed before anything else runs, so it's in no argv,
+# environment or file. It isn't secret from the test, though: the script runs
+# as the same uid, so a test can read it from /proc/1/mem (the reviewer did).
+# It keeps accidental output from looking like a trailer; like an in-process
+# rewrite of the report, a deliberate forgery stays open (architecture B33),
+# with the draft PR and review as the backstop. The checkout is prepared (exit 125
 # means it couldn't be: `unknown`), test_cmd runs under pipefail and errexit,
 # and then one trailer: BEGIN, each expected report (pytest.xml, vitest-N.xml)
 # in base64, and END with the exit code. vigild accepts reports only from a
