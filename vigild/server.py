@@ -202,6 +202,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     images.on_failure = runner.dev_image_failed
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
+    v.services.jobs.files = lambda repo, base: lambda path: ws.mirror_file(repo, base, path)
     return runner
 
 

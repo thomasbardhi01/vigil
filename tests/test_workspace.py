@@ -151,3 +151,12 @@ def test_export_tree_unpacks_a_commit_once(tmp_path: Path, fixture_repo: dict[st
         ws.export_tree("o/fixture", sha, dest) == dest
         and (dest / "README.md").read_text() == "kept"
     )
+
+
+def test_mirror_file_reads_the_base_tip(tmp_path: Path, fixture_repo: dict[str, Path]) -> None:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    assert ws.mirror_file("o/fixture", "main", "README.md") is None  # no mirror yet
+    ws.mirror("o/fixture")
+    assert ws.mirror_file("o/fixture", "main", "README.md") == "# fixture\n"
+    assert ws.mirror_file("o/fixture", "main", "nope.txt") is None
+    assert ws.mirror_file("o/fixture", "main;rm", "README.md") is None

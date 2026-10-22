@@ -420,7 +420,9 @@ def test_a_test_cmd_no_runner_reports_on_is_refused(cmd: str) -> None:
     assert not r.ok and any("test runner" in e for e in r.errors), r.errors
     plan = PLAN.replace('"test_cmd": "pytest -q tests/test_runbook.py"', f'"test_cmd": "{cmd}"')
     errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
-    assert any("pa-0001-w2" in e and "test runner" in e for e in errors), errors
+    assert any("pa-0001-w2" in e and ("test runner" in e or "test_cmd" in e) for e in errors), (
+        errors
+    )
 
 
 @pytest.mark.parametrize(
@@ -430,16 +432,17 @@ def test_a_test_cmd_no_runner_reports_on_is_refused(cmd: str) -> None:
         "uv run pytest -q",
         "python -m pytest tests/test_a.py",
         "pnpm -C server test",
-        "npm test",
         "npx vitest run test/a.test.ts",
         "pnpm -C server exec vitest run",
         "cd server && pnpm test 2>&1 | tail -n 50",
     ],
 )
 def test_a_reporting_runner_is_accepted(cmd: str) -> None:
-    from vigild.verifier import can_report
+    # without the base's files the gate takes a pnpm script on trust; with
+    # them it checks the script (tests/test_verifier.py, the resolver)
+    from vigild.intake import spec_gate
 
-    assert can_report(cmd), cmd
+    assert spec_gate.test_cmd_problem(cmd) is None, cmd
 
 
 @pytest.mark.parametrize(

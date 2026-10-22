@@ -155,82 +155,118 @@ PACKAGE_MANAGERS = {"pnpm", "npm", "yarn"}
 ReadFile = Callable[[str], str | None]
 
 
-def _package_script(c: Command, read: ReadFile) -> str:
-    """The script a `pnpm -C server test` / `npm run test` command runs, read
-    from the base's package.json (what the verifier pins)."""
-    args = list(c.args)
-    where = ""
-    for flag in ("-C", "--dir", "--prefix"):
-        if flag in args and args.index(flag) + 1 < len(args):
-            k = args.index(flag)
-            where = args[k + 1]
-            del args[k : k + 2]
-    rest = [a for a in args if not a.startswith("-")]
-    if rest[:1] == ["run"]:
-        rest = rest[1:]
-    if not rest:
-        return ""
-    raw = read(f"{where.rstrip('/')}/package.json" if where else "package.json")
-    try:
-        scripts = json.loads(raw or "{}").get("scripts") or {}
-    except json.JSONDecodeError, AttributeError:
-        return ""
-    return str(scripts.get(rest[0]) or "")
+@dataclass(frozen=True)
+class ReportPlan:
+    """How the verifier will run `test_cmd` so each runner writes a report, and
+    why it can't, if it can't. The spec gate and the verifier use this one
+    resolver (round 4, item 6): the gate refuses whatever has problems."""
+
+    command: str
+    reports: int
+    problems: list[str]
 
 
-def can_report(test_cmd: str) -> bool:
-    """Does some command in the line run a test runner the verifier can read:
-    pytest, vitest, or a package manager's script (whose runner the verifier
-    finds in the base's package.json)?"""
+def _flags(n: int) -> str:
+    return f" --reporter=default --reporter=junit --outputFile.junit={REPORT_DIR}/vitest-{n}.xml"
+
+
+def _runs_pytest(c: Command) -> bool:
+    return "pytest" in (c.program, *(a.rsplit("/", 1)[-1] for a in c.args[:3]))
+
+
+def _runs_vitest(c: Command) -> bool:
+    return c.program == "vitest" or ("vitest" in c.args and "run" in c.args)
+
+
+def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
+    """Resolve each command: pytest reports through PYTEST_ADDOPTS; a direct
+    `vitest run` gets the reporter flags; `pnpm [-C dir] [run] <script> [args]`
+    whose script (from the base's package.json, relative to any `cd`) ends in
+    vitest runs as `pnpm exec bash -c '<script> <args> <flags>'`, since pnpm
+    takes `--reporter` as its own. Anything the verifier can't attach a report
+    to is a problem, never a silent drop."""
+    problems: list[str] = []
+    out, pos, n, reporting = [], 0, 0, 0
+    cwd = ""
     for c in parse(test_cmd).commands:
-        args = [a.rsplit("/", 1)[-1] for a in c.args]
-        if c.program in ("pytest", "vitest") or "pytest" in args or "vitest" in args:
-            return True
-        if c.program in PACKAGE_MANAGERS and any(a in ("test", "run") for a in args[:4]):
-            return True
-    return False
+        if c.program == "cd" and c.args:
+            cwd = "" if c.args[0] in (".", "/work") else c.args[0].strip("/")
+            continue
+        if _runs_pytest(c):
+            reporting += 1
+            continue
+        if _runs_vitest(c):
+            n += 1
+            reporting += 1
+            end = c.start + len(c.text.rstrip())
+            out.append(test_cmd[pos:end] + _flags(n))
+            pos = end
+            continue
+        if c.program in ("npm", "yarn", "npx") and not _runs_vitest(c):
+            problems.append(
+                f"`{c.text.strip()}`: {c.program} scripts aren't supported; "
+                "use pnpm or call the runner directly"
+            )
+            continue
+        if c.program != "pnpm":
+            continue
+        args = list(c.args)
+        if any(a.startswith("--filter") or a == "-F" or a in ("-r", "--recursive") for a in args):
+            problems.append(f"`{c.text.strip()}`: pnpm --filter/-r isn't supported; use -C <dir>")
+            continue
+        where = cwd
+        for flag in ("-C", "--dir"):
+            if flag in args and args.index(flag) + 1 < len(args):
+                k = args.index(flag)
+                where = "/".join(x for x in (cwd, args[k + 1].strip("/")) if x)
+                del args[k : k + 2]
+        if args[:1] == ["run"]:
+            args = args[1:]
+        if not args or args[0] in ("exec", "dlx", "install", "add"):
+            continue
+        name, extra = args[0], args[1:]
+        if read is None:
+            problems.append(f"`{c.text.strip()}`: the package script can't be read to check it")
+            continue
+        raw = read(f"{where}/package.json" if where else "package.json")
+        try:
+            script = str((json.loads(raw or "{}").get("scripts") or {}).get(name) or "")
+        except json.JSONDecodeError, AttributeError:
+            script = ""
+        last = parse(script).commands[-1] if script.strip() else None
+        if last is None or not (_runs_vitest(last) or _runs_pytest(last)):
+            problems.append(
+                f"`{c.text.strip()}`: the package script `{name}` runs no test runner "
+                "vigil can read (vitest or pytest, last in the script)"
+            )
+            continue
+        reporting += 1
+        if _runs_pytest(last):
+            continue  # PYTEST_ADDOPTS reaches it through pnpm
+        n += 1
+        body = " ".join([script, *(shlex.quote(a) for a in extra)]) + _flags(n)
+        lead = c.text[: len(c.text) - len(c.text.lstrip())]
+        dir_opt = f"-C {shlex.quote(where)} " if where and where != cwd else ""
+        out.append(
+            test_cmd[pos : c.start]
+            + lead
+            + f"pnpm {dir_opt}exec bash -o pipefail -o errexit -c {shlex.quote(body)}"
+        )
+        pos = c.start + len(c.text.rstrip())
+    out.append(test_cmd[pos:])
+    if not reporting and not problems:
+        problems.append(
+            "runs no test runner vigil can read (pytest, vitest, or a pnpm script that runs one)"
+        )
+    return ReportPlan("".join(out), reporting, problems)
 
 
-def _dir_option(c: Command) -> str:
-    args = list(c.args)
-    for flag in ("-C", "--dir", "--prefix"):
-        if flag in args and args.index(flag) + 1 < len(args):
-            return f"{flag} {shlex.quote(args[args.index(flag) + 1])} "
-    return ""
+def can_report(test_cmd: str, read: ReadFile | None = None) -> bool:
+    return not plan_reports(test_cmd, read).problems
 
 
 def with_reports(test_cmd: str, read: ReadFile | None = None) -> str:
-    """Ask each vitest run for a JUnit report too. A direct `vitest run` gets
-    the flags appended. A pnpm script that ends in vitest runs as
-    `pnpm exec bash -c '<the base's script> <flags>'`, since pnpm reads
-    `--reporter` as its own option; npm passes arguments after `--` on.
-    pytest gets its report through PYTEST_ADDOPTS in the container's environment."""
-    out, pos, n = [], 0, 0
-    for c in parse(test_cmd).commands:
-        direct = c.program == "vitest" or ("vitest" in c.args and "run" in c.args)
-        script = _package_script(c, read) if read and c.program in PACKAGE_MANAGERS else ""
-        last = parse(script).commands[-1] if script.strip() else None
-        via_script = last is not None and (
-            last.program == "vitest" or ("vitest" in last.args and "run" in last.args)
-        )
-        if not (direct or via_script):
-            continue
-        n += 1
-        flags = (
-            f" --reporter=default --reporter=junit --outputFile.junit={REPORT_DIR}/vitest-{n}.xml"
-        )
-        end = c.start + len(c.text.rstrip())
-        if direct:
-            out.append(test_cmd[pos:end] + flags)
-        elif c.program == "pnpm":
-            inner = shlex.quote(script + flags)
-            run = f"pnpm {_dir_option(c)}exec bash -o pipefail -o errexit -c {inner}"
-            out.append(test_cmd[pos : c.start] + c.text[: len(c.text) - len(c.text.lstrip())] + run)
-        else:  # npm and yarn pass extra arguments to the script
-            out.append(test_cmd[pos:end] + (" --" if c.program == "npm" else "") + flags)
-        pos = end
-    out.append(test_cmd[pos:])
-    return "".join(out)
+    return plan_reports(test_cmd, read).command
 
 
 @dataclass(frozen=True)

@@ -33,6 +33,7 @@ from vigild.safefile import UnsafeFile, safe_read_bytes
 
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 BRANCH = re.compile(r"^vigil/[A-Za-z0-9._/-]+$")
+BRANCH_NAME = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 RO_DIRS = (".github", ".claude", ".opencode", ".git/hooks")
 RO_FILES = (".git/config",)
@@ -302,6 +303,21 @@ class Workspace:
             t.extractall(tmp, filter="data")
         tmp.rename(dest)
         return dest
+
+    def mirror_file(self, repo: str, branch: str, path: str) -> str | None:
+        """A regular file at the tip of `branch` in the mirror as last fetched,
+        or None (no mirror yet, no such file, not a regular file)."""
+        mirror = self._mirror_path(repo)
+        if not mirror.exists() or not BRANCH_NAME.match(branch):
+            return None
+        try:
+            sha = self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+            entries = self._tree_entries(repo, sha, [path])
+            if path not in entries:
+                return None
+            return git_bytes(mirror, "cat-file", "blob", entries[path][1]).decode(errors="replace")
+        except WorkspaceError, GitError:
+            return None
 
     def tree_paths(self, repo: str, sha: str) -> set[str]:
         """Every file path at `sha` in the vault."""

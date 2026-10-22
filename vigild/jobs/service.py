@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -150,7 +151,14 @@ def render_plan(task: Task) -> str:
 
 
 class JobService:
-    def __init__(self, cfg: Config, store: Store, runner: Runner) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        store: Store,
+        runner: Runner,
+        files: Callable[[str, str], Callable[[str], str | None]] | None = None,
+    ) -> None:
+        self.files = files  # (repo, base) -> read a file at the base's tip
         self.cfg = cfg
         self.store = store
         self.runner = runner
@@ -163,12 +171,15 @@ class JobService:
             raise SubmitError(r.reasons)
         return r.reasons if r.outcome is IntakeOutcome.PROPOSE else []
 
-    def _gate(self, repo: str, spec_text: str, plan_text: str) -> list[str]:
+    def _gate(self, repo: str, spec_text: str, plan_text: str, base: str = "main") -> list[str]:
         return check_job_spec(
             parse_spec(spec_text),
             parse_plan(plan_text),
             self.cfg.routing.money_paths,
             missing_tools=lambda cmd: missing_tools(self.cfg, repo, cmd),
+            # the base's files, so the gate resolves package scripts as the
+            # verifier will (round 4, item 6)
+            read=self.files(repo, base) if self.files is not None else None,
         )
 
     def submit_task(self, raw: dict[str, Any]) -> SubmitOutcome:

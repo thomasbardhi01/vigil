@@ -68,9 +68,9 @@ def test_a_task_the_gate_refuses_leaves_no_orphan_job(
     client: TestClient, tokens: Tokens, store: Store
 ) -> None:
     t = _task()
-    t["spec"]["test_cmd"] = "yarn test"  # a runner the ParkAgent dev image lacks
+    t["spec"]["test_cmd"] = "pytest -q"  # a runner the ParkAgent dev image lacks
     r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
-    assert r.status_code == 422 and "yarn" in r.text
+    assert r.status_code == 422 and "pytest" in r.text
     assert store.list_jobs() == []
 
 
@@ -133,3 +133,17 @@ def test_two_resumable_pages_start_one_run(
     assert store.get_inbox_item(second).status == "resolved"  # closed with the first
     assert client.post(f"/api/inbox/{second}/resume", headers=auth(tokens.admin)).status_code == 409
     assert runner.resumed == [job_id]
+
+
+def test_the_gate_resolves_package_scripts_with_the_base_files(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:  # round 4, item 6
+    svc = client.app.state.services.jobs  # type: ignore[attr-defined]
+    pkg = {"server/package.json": '{"scripts": {"test": "vitest run", "lint": "eslint src"}}'}
+    svc.files = lambda repo, base: pkg.get
+    t = _task()
+    t["spec"]["test_cmd"] = "pnpm -C server run lint"
+    r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
+    assert r.status_code == 422 and "runs no test runner" in r.text
+    t["spec"]["test_cmd"] = "pnpm -C server test"
+    assert client.post("/api/tasks", json=t, headers=auth(tokens.admin)).status_code == 202

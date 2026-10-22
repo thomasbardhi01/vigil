@@ -484,3 +484,65 @@ def test_a_root_pytest_toml_cannot_change_how_tests_run(ws: Workspace, tmp_path:
     rec = _verify(ws, base, head, config=list(vigil.runner_config))
     assert "pytest.toml" in rec["runner_config"]["pinned_to_base"]
     assert rec["after"]["outcome"] == "fail"  # the regression is still run
+
+
+# --- review round 4, item 6: one resolver for the gate and the verifier ------------------------
+
+PKG = {
+    "server/package.json": '{"scripts": {"test": "vitest run", "lint": "eslint src"}}',
+    "package.json": '{"scripts": {"test": "vitest run"}}',
+}
+
+
+@pytest.mark.parametrize(
+    ("cmd", "want"),
+    [
+        (
+            "cd server && pnpm test",
+            "cd server && pnpm exec bash -o pipefail -o errexit -c 'vitest run --reporter=default"
+            " --reporter=junit --outputFile.junit=/tmp/vigil-report/vitest-1.xml'",
+        ),
+        (
+            "pnpm -C server test test/x.test.ts",  # arguments pass through
+            "pnpm -C server exec bash -o pipefail -o errexit -c 'vitest run test/x.test.ts"
+            " --reporter=default --reporter=junit --outputFile.junit=/tmp/vigil-report/vitest-1.xml'",
+        ),
+        (
+            "pnpm -C server run test",
+            "pnpm -C server exec bash -o pipefail -o errexit -c 'vitest run --reporter=default"
+            " --reporter=junit --outputFile.junit=/tmp/vigil-report/vitest-1.xml'",
+        ),
+        ("pytest -q tests", "pytest -q tests"),
+    ],
+)
+def test_the_resolver_attaches_a_report_and_keeps_arguments(cmd: str, want: str) -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(cmd, PKG.get)
+    assert plan.problems == [] and plan.command == want
+
+
+@pytest.mark.parametrize(
+    ("cmd", "why"),
+    [
+        ("pnpm --filter server test", "--filter"),
+        ("pnpm -C server run lint", "runs no test runner"),
+        ("pnpm -C server lint && grep -q x a", "runs no test runner"),
+        ("npm test", "npm"),
+        ("grep -q x docs/a.md", "runs no test runner"),
+    ],
+)
+def test_the_resolver_refuses_what_it_cant_attach_a_report_to(cmd: str, why: str) -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(cmd, PKG.get)
+    assert any(why in p for p in plan.problems), plan.problems
+
+
+def test_the_gate_uses_the_same_resolver() -> None:
+    from vigild.intake import spec_gate
+
+    test_cmd_problem = spec_gate.test_cmd_problem
+    assert test_cmd_problem("pnpm -C server run lint", PKG.get)
+    assert test_cmd_problem("pnpm --filter server test", PKG.get)
+    assert test_cmd_problem("cd server && pnpm test", PKG.get) is None

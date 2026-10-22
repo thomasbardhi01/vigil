@@ -22,7 +22,7 @@ from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
 from vigild.shellwords import Command, parse
-from vigild.verifier import can_report
+from vigild.verifier import ReadFile, plan_reports
 
 
 @dataclass(frozen=True)
@@ -79,17 +79,21 @@ def bad_test_cmd(cmd: str | None) -> str | None:
     return None
 
 
-def test_cmd_problem(cmd: str | None) -> str | None:
-    """bad_test_cmd, plus: the verifier decides by a test report (owner
-    direction, round 3), so a line that runs no test runner it can read
-    (pytest, vitest, or a package script) is refused here, before any spend."""
+def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | None:
+    """bad_test_cmd, plus the verifier's own report resolver (round 4, item 6):
+    a line it can't attach a test report to is refused here, before any
+    spend. Without the base's files (`read`), package scripts are taken on
+    trust here and checked again by the verifier."""
     if why := bad_test_cmd(cmd):
         return why
-    if not can_report(str(cmd)):
-        return (
-            f"test_cmd `{str(cmd).strip()}` runs no test runner vigil can read (pytest, vitest, "
-            "or a package script that runs one); write the check as a test"
-        )
+    plan = plan_reports(str(cmd), read)
+    problems = (
+        plan.problems
+        if read is not None
+        else [p for p in plan.problems if "can't be read" not in p]
+    )
+    if problems:
+        return f"test_cmd `{str(cmd).strip()}`: " + "; ".join(problems)
     return None
 
 
@@ -181,6 +185,7 @@ def check_job_spec(
     money_globs: Sequence[str],
     *,
     missing_tools: Callable[[str], list[str]] | None = None,
+    read: ReadFile | None = None,
 ) -> list[str]:
     errors: list[str] = []
     for entry in spec.files_in_scope:
@@ -194,7 +199,7 @@ def check_job_spec(
     for c in spec.criteria:
         if not c.test_cmd:
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
-        elif why := test_cmd_problem(c.test_cmd):
+        elif why := test_cmd_problem(c.test_cmd, read):
             errors.append(f"spec.md {c.ident}: {why}")
 
     errors.extend(plan.errors)
@@ -204,7 +209,7 @@ def check_job_spec(
     for dup in sorted({i for i in ids if ids.count(i) > 1}):
         errors.append(f"plan.md repeats worker {dup}")
     for w in plan.workers:
-        if why := test_cmd_problem(w.test_cmd):
+        if why := test_cmd_problem(w.test_cmd, read):
             errors.append(f"worker {w.task_id}: {why}")
         for dep in w.depends_on:
             if dep not in ids:
