@@ -23,3 +23,4 @@ container:
   memory: 4g
   pids_limit: 512
   uid: 10001
+  verifier_memory: 6g   # checkout + dependencies + a database, in tmpfs

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vigild.gitsafe import GitError, git
+from vigild.gitsafe import GitError, git, git_bytes
 from vigild.safefile import UnsafeFile, safe_read_bytes
 
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -235,15 +235,20 @@ class Workspace:
         *,
         overlay_from: str | None = None,
         paths: list[str] | tuple[str, ...] = (),
+        source: str = "vault",
     ) -> Path:
-        """A fresh checkout of `sha` from the vault for the verifier, under
+        """A fresh checkout of `sha` for the verifier, under
         <data>/verify/<name>/src: a new .git with hooks off, nothing from the
-        worker's clone. With `overlay_from`, `paths` are taken from that commit."""
+        worker's clone. With `overlay_from`, `paths` are taken from that commit.
+        `source` is the vault (a worker's result) or the mirror (a base commit,
+        for validating a dev image)."""
         if not ID.match(name) or not SHA.match(sha):
             raise WorkspaceError(f"bad verify checkout {name!r} {sha!r}")
         if overlay_from is not None and not SHA.match(overlay_from):
             raise WorkspaceError("bad overlay sha")
-        vault = self.vault(repo)
+        if source not in ("vault", "mirror"):
+            raise WorkspaceError(f"bad source {source!r}")
+        vault = self.vault(repo) if source == "vault" else self._mirror_path(repo)
         root = self.data_dir / "verify" / name
         if root.exists():
             shutil.rmtree(root)
@@ -262,6 +267,47 @@ class Workspace:
         if overlay_from and paths:
             self._git(src, "checkout", "--quiet", overlay_from, "--", *paths)
         return src
+
+    def head_sha(self, repo: str, branch: str) -> str:
+        """The tip of `branch` in a freshly fetched mirror."""
+        mirror = self.mirror(repo)
+        return self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+
+    def _tree_entries(self, repo: str, sha: str, paths: list[str]) -> dict[str, tuple[str, str]]:
+        if not SHA.match(sha):
+            raise WorkspaceError("bad sha")
+        out = self._git(self._mirror_path(repo), "ls-tree", "-z", sha, "--", *paths)
+        entries: dict[str, tuple[str, str]] = {}
+        for entry in filter(None, out.split("\0")):
+            meta, _, name = entry.partition("\t")
+            mode, kind, blob = meta.split()
+            if kind == "blob" and mode in ("100644", "100755"):
+                entries[name] = (mode, blob)
+        return entries
+
+    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]:
+        """Each path's blob id at `sha` in the mirror; None if absent or not a regular file."""
+        entries = self._tree_entries(repo, sha, paths)
+        return {p: (entries[p][1] if p in entries else None) for p in paths}
+
+    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None:
+        """Write the regular files among `paths` at `sha` under `dest` (a dev
+        image's build context: lockfiles only, never the source)."""
+        mirror = self._mirror_path(repo)
+        for path, (mode, blob) in self._tree_entries(repo, sha, paths).items():
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise WorkspaceError(f"bad path {path!r}")
+            size = int(self._git(mirror, "cat-file", "-s", blob))
+            if size > MAX_BUNDLE:
+                raise WorkspaceError(f"{path} is {size} bytes")
+            try:
+                data = git_bytes(mirror, "cat-file", "blob", blob)
+            except GitError as e:
+                raise WorkspaceError(str(e)) from e
+            target = dest / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o755 if mode == "100755" else 0o644)
 
     def changed(self, repo: str, base_sha: str, head: str) -> list[tuple[str, str]]:
         """(status, path) for every file changed; renames show as delete + add."""

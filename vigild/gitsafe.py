@@ -75,3 +75,19 @@ def git(
         raise GitError(f"git {args[0]} failed: {err.strip()[:300]}")
     stdout = out.stdout if isinstance(out.stdout, str) else out.stdout.decode(errors="replace")
     return stdout.strip() if not raw else stdout
+
+
+def git_bytes(cwd: Path, *args: str, timeout: int = 600) -> bytes:
+    """git's stdout as bytes (blob contents), under the same hardening."""
+    out = subprocess.run(
+        ["git", *HARDENING, *args],
+        cwd=cwd,
+        env=git_env(),
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if out.returncode != 0:
+        err = out.stderr.decode(errors="replace").strip()[:300]
+        raise GitError(f"git {args[0]} failed: {err}")
+    return bytes(out.stdout)

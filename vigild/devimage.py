@@ -1,26 +1,51 @@
-"""A pinned dev image per repo, validated nightly (owner decisions 2026-10-22).
+"""Per-repo dev images, built and validated by vigild (owner direction,
+review round 2). This replaces the nightly validation of a hand-built image.
 
-Each repo in configs/repos.yaml names the image its sessions run in and a
-smoke command that proves its toolchain works. `vigil validate-images` runs
-the command (nightly, from launchd; runbook) and records the image id. vigild
-refuses to dispatch a session for a repo whose image was never validated,
-was validated more than STALE_AFTER ago, failed its check, or has been
-rebuilt since (a different image id).
+- **Definition:** each repo in configs/repos.yaml names `dev_dockerfile`
+  (images/dev/<repo>.Dockerfile), the `dev_lockfiles` its build installs from,
+  the `dev_suites` that prove it, and `dev_excluded`: suites that can't run in
+  a Linux container, each with its reason.
+- **Key:** sha256 over the Dockerfile, each lockfile's blob id at the base
+  commit (from vigild's mirror), and the suites. The image is
+  `vigil-dev/<name>:<key[:16]>`. A new key is a new image.
+- **Build:** the context is only the lockfiles, copied from the base commit;
+  no repo source goes into the image. The build has the network; nothing after
+  it does.
+- **Validate:** every suite runs on a clean checkout of the base commit, inside
+  the image, through the verifier's runner: no network, the agent uid, output
+  capped. The image is fresh only if every suite passes.
+- **Fresh:** `ensure_fresh(repo, base_sha)` builds and validates a key it hasn't
+  seen. A failed build or validation, or an image that's gone or changed since
+  it was validated, raises StaleDevImage, which blocks dispatch for the repo,
+  and pages the owner once per key with `rebuild` or `dismiss`. A failed key
+  is not rebuilt until the owner asks (`force=True`).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shlex
+import shutil
+import subprocess
+import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol
 
-from vigild.config import Config
+from vigild.config import CONFIG_DIR, Config
 from vigild.db import Store, iso, utcnow
+from vigild.verifier import RunResult, TestRunner, outcome
 
-STALE_AFTER = timedelta(hours=26)  # nightly, plus slack
+ROOT = CONFIG_DIR.parent
+BUILD_SECONDS = 60 * 60
+SUITE_SECONDS = 30 * 60
+SUITE_OUTPUT = 256 << 10
+TAIL = 3000
 
 
 class StaleDevImage(RuntimeError):
@@ -51,93 +76,225 @@ def missing_tools(cfg: Config, repo: str, test_cmd: str | None) -> list[str]:
     return [t for t in tools_in(test_cmd or "") if t not in have]
 
 
-def check_command(cfg: Config, repo: str) -> str:
-    """The validation: the repo's smoke command, and every declared tool present."""
-    pol = cfg.repo(repo)
-    presence = " && ".join(f"command -v {t} >/dev/null" for t in pol.dev_image_tools)
-    return f"({pol.dev_image_check}) && {presence}" if presence else pol.dev_image_check
-
-
 class DockerLike(Protocol):
     def image_id_of(self, image: str) -> str | None: ...
-    def run_check(self, image: str, command: str) -> tuple[int, str]: ...
+    def build(
+        self, context: Path, dockerfile: Path, tag: str, *, timeout_s: int
+    ) -> tuple[bool, str]: ...
+
+
+class Sources(Protocol):
+    """What DevImages needs from the Workspace: blob ids and files at a commit
+    in vigild's mirror, and a clean checkout of it."""
+
+    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]: ...
+    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None: ...
+    def verify_checkout(
+        self,
+        repo: str,
+        name: str,
+        sha: str,
+        *,
+        overlay_from: str | None = None,
+        paths: list[str] | tuple[str, ...] = (),
+        source: str = "vault",
+    ) -> Path: ...
 
 
 @dataclass(frozen=True)
 class Validation:
     repo: str
+    key: str
     image: str
     image_id: str | None
     ok: bool
-    output: str
+    stage: str  # build | validate
+    output: str  # JSON: the build tail, or each suite's outcome and tail
+    base_sha: str
     validated_at: str
+
+
+OnFailure = Callable[[str, str, dict[str, Any]], None]
 
 
 class DevImages:
     def __init__(
-        self, cfg: Config, store: Store, docker: DockerLike, clock: Callable[[], datetime] = utcnow
+        self,
+        cfg: Config,
+        store: Store,
+        docker: DockerLike,
+        sources: Sources,
+        runner: TestRunner,
+        *,
+        on_failure: OnFailure | None = None,
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.cfg = cfg
         self.store = store
         self.docker = docker
+        self.sources = sources
+        self.runner = runner
+        self.on_failure = on_failure
         self.clock = clock
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_lock = threading.Lock()
 
-    def validate(self, repo: str) -> Validation:
+    # --- identity -------------------------------------------------------------------
+
+    def dockerfile(self, repo: str) -> Path:
+        return ROOT / self.cfg.repo(repo).dev_dockerfile
+
+    def key(self, repo: str, base_sha: str) -> str:
         pol = self.cfg.repo(repo)
-        image_id = self.docker.image_id_of(pol.dev_image)
-        if image_id is None:
-            code, out = 127, f"{pol.dev_image} is not present"
-        else:
-            code, out = self.docker.run_check(pol.dev_image, check_command(self.cfg, repo))
-        v = Validation(repo, pol.dev_image, image_id, code == 0, out[-2000:], iso(self.clock()))
+        blobs = self.sources.blob_ids(repo, base_sha, list(pol.dev_lockfiles))
+        h = hashlib.sha256()
+        h.update(self.dockerfile(repo).read_bytes())
+        for path in sorted(blobs):
+            h.update(f"\0{path}={blobs[path] or '-'}".encode())
+        h.update(b"\0" + json.dumps(pol.dev_suites, sort_keys=True).encode())
+        return h.hexdigest()
+
+    def tag(self, repo: str, key: str) -> str:
+        name = re.sub(r"[^a-z0-9._-]", "-", repo.split("/")[-1].lower())
+        return f"vigil-dev/{name}:{key[:16]}"
+
+    def latest(self, repo: str, key: str | None = None) -> dict[str, Any] | None:
+        sql, args = "SELECT * FROM dev_images WHERE repo=?", [repo]
+        if key is not None:
+            sql += " AND key=?"
+            args.append(key)
+        rows = self.store.q(sql + " ORDER BY id DESC LIMIT 1", tuple(args))
+        return dict(rows[0]) if rows else None
+
+    # --- freshness ------------------------------------------------------------------
+
+    def status(self, repo: str, base_sha: str) -> tuple[bool, str]:
+        """Is the image for this base built, validated and unchanged? No side effects."""
+        key = self.key(repo, base_sha)
+        tag = self.tag(repo, key)
+        last = self.latest(repo, key)
+        if last is None:
+            return False, f"{tag} not built yet (lockfiles changed or first run)"
+        if not last["ok"]:
+            return False, f"{tag} failed its {last['stage']} at {last['validated_at']}"
+        current = self.docker.image_id_of(tag)
+        if current is None:
+            return False, f"{tag} is not present"
+        if current != last["image_id"]:
+            return False, f"{tag} changed since it was validated"
+        return True, tag
+
+    def ensure_fresh(self, repo: str, base_sha: str, *, force: bool = False) -> str:
+        """The validated image for this base, built now if its key is new."""
+        with self._lock(repo):
+            key = self.key(repo, base_sha)
+            tag = self.tag(repo, key)
+            last = self.latest(repo, key)
+            if last is not None and not force:
+                if not last["ok"]:
+                    raise StaleDevImage(
+                        f"{repo}: dev image {tag} failed its {last['stage']}; "
+                        "rebuild it from the inbox"
+                    )
+                current = self.docker.image_id_of(tag)
+                if current is not None and current == last["image_id"]:
+                    return tag
+            v = self.build_and_validate(repo, base_sha, key)
+            if not v.ok:
+                self._page(v)
+                raise StaleDevImage(f"{repo}: dev image {tag} failed its {v.stage}")
+            return tag
+
+    def build_and_validate(self, repo: str, base_sha: str, key: str) -> Validation:
+        pol = self.cfg.repo(repo)
+        tag = self.tag(repo, key)
+        ctx = Path(tempfile.mkdtemp(prefix="vigil-devctx-"))
+        try:
+            self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx)
+            ok, out = self.docker.build(ctx, self.dockerfile(repo), tag, timeout_s=BUILD_SECONDS)
+        finally:
+            shutil.rmtree(ctx, ignore_errors=True)
+        image_id = self.docker.image_id_of(tag) if ok else None
+        if not ok or image_id is None:
+            failed: dict[str, Any] = {"build": out[-TAIL:]}
+            return self._record(repo, key, tag, None, False, "build", failed, base_sha)
+        src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source="mirror")
+        suites: dict[str, dict[str, Any]] = {}
+        try:
+            for name, cmd in pol.dev_suites.items():
+                r: RunResult = self.runner.run(
+                    tag, src, cmd, timeout_s=SUITE_SECONDS, max_output=SUITE_OUTPUT
+                )
+                suites[name] = {
+                    "exit": r.exit,
+                    "outcome": outcome(r.exit, r.timed_out),
+                    "tail": r.output[-TAIL:],
+                }
+        finally:
+            shutil.rmtree(src.parent, ignore_errors=True)
+        passed = all(s["outcome"] == "pass" for s in suites.values())
+        result: dict[str, Any] = {"suites": suites, "excluded": dict(pol.dev_excluded)}
+        return self._record(repo, key, tag, image_id, passed, "validate", result, base_sha)
+
+    # --- helpers --------------------------------------------------------------------
+
+    def _lock(self, repo: str) -> threading.Lock:
+        with self._locks_lock:
+            return self._locks.setdefault(repo, threading.Lock())
+
+    def _record(
+        self,
+        repo: str,
+        key: str,
+        tag: str,
+        image_id: str | None,
+        ok: bool,
+        stage: str,
+        body: dict[str, Any],
+        base_sha: str,
+    ) -> Validation:
+        v = Validation(
+            repo, key, tag, image_id, ok, stage, json.dumps(body), base_sha, iso(self.clock())
+        )
         self.store.x(
-            "INSERT INTO dev_images (repo, image, image_id, ok, output, validated_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (v.repo, v.image, v.image_id, int(v.ok), v.output, v.validated_at),
+            "INSERT INTO dev_images (repo, image, image_id, ok, output, validated_at, key, stage,"
+            " base_sha) VALUES (?,?,?,?,?,?,?,?,?)",
+            (repo, tag, image_id, int(ok), v.output, v.validated_at, key, stage, base_sha),
         )
         return v
 
-    def validate_all(self) -> list[Validation]:
-        return [self.validate(repo) for repo in self.cfg.repos.repos]
-
-    def due(self, repo: str, every: timedelta = timedelta(hours=24)) -> bool:
-        last = self.latest(repo)
-        if last is None:
-            return True
-        return self.clock() - datetime.fromisoformat(last["validated_at"]) >= every
-
-    def latest(self, repo: str) -> dict[str, Any] | None:
-        rows = self.store.q(
-            "SELECT * FROM dev_images WHERE repo=? ORDER BY id DESC LIMIT 1", (repo,)
+    def _page(self, v: Validation) -> None:
+        if self.on_failure is None:
+            return
+        body = json.loads(v.output)
+        failed = [n for n, s in (body.get("suites") or {}).items() if s.get("outcome") != "pass"]
+        suffix = f" ({', '.join(failed)})" if failed else ""
+        self.on_failure(
+            v.repo,
+            f"{v.repo}: dev image {v.stage} failed{suffix}",
+            {
+                "kind": "dev_image",
+                "repo": v.repo,
+                "key": v.key,
+                "image": v.image,
+                "stage": v.stage,
+                "base_sha": v.base_sha,
+                "failed_suites": failed,
+                "detail": body,
+                "actions": ["rebuild", "dismiss"],
+            },
         )
-        return dict(rows[0]) if rows else None
-
-    def ensure_fresh(self, repo: str) -> str:
-        """Return the image to run, or raise StaleDevImage."""
-        pol = self.cfg.repo(repo)
-        last = self.latest(repo)
-        if last is None or last["image"] != pol.dev_image:
-            raise StaleDevImage(f"{repo}: dev image {pol.dev_image} was never validated")
-        if not last["ok"]:
-            raise StaleDevImage(f"{repo}: dev image check failed at {last['validated_at']}")
-        age = self.clock() - datetime.fromisoformat(last["validated_at"])
-        if age > STALE_AFTER:
-            hours = int(age.total_seconds() // 3600)
-            raise StaleDevImage(f"{repo}: dev image last validated {hours} h ago")
-        current = self.docker.image_id_of(pol.dev_image)
-        if current is None:
-            raise StaleDevImage(f"{repo}: dev image {pol.dev_image} is not present")
-        if current != last["image_id"]:
-            raise StaleDevImage(f"{repo}: dev image changed since it was validated")
-        return pol.dev_image
 
 
 class DockerImages:
-    """The real DockerLike, over docker-py."""
+    """The real DockerLike. Builds go through the docker CLI, so they get
+    BuildKit (the dev Dockerfiles use heredocs and `COPY --chmod`); they have
+    the network, since they install from the lockfiles. Nothing that runs in
+    the image does."""
 
-    def __init__(self, client: Any, uid: int = 10001) -> None:
+    def __init__(self, client: Any, cli: str | None = None) -> None:
         self.client = client
-        self.uid = uid  # checks run as the agent uid, as test_cmd does in a session
+        self.cli = cli or shutil.which("docker") or str(Path.home() / ".docker/bin/docker")
 
     def image_id_of(self, image: str) -> str | None:
         import docker.errors
@@ -147,21 +304,22 @@ class DockerImages:
         except docker.errors.ImageNotFound:
             return None
 
-    def run_check(self, image: str, command: str) -> tuple[int, str]:
-        c = self.client.containers.run(
-            image,
-            entrypoint=["sh", "-c"],
-            command=[command],
-            user=f"{self.uid}:{self.uid}",
-            detach=True,
-            network_mode="none",
-            read_only=True,
-            tmpfs={"/tmp": "rw,mode=1777"},  # noqa: S108
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges"],
-        )
+    def build(
+        self, context: Path, dockerfile: Path, tag: str, *, timeout_s: int
+    ) -> tuple[bool, str]:
+        cmd = [self.cli, "build", "--progress=plain", "-f", str(dockerfile), "-t", tag,
+               "--label", f"dev.vigil.devimage={tag}", str(context)]  # fmt: skip
         try:
-            code = int(c.wait(timeout=300).get("StatusCode", -1))
-            return code, c.logs().decode(errors="replace")
-        finally:
-            c.remove(force=True)
+            p = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"the build took longer than {timeout_s} s"
+        except OSError as e:
+            return False, f"docker CLI: {e}"
+        return p.returncode == 0, (p.stdout + p.stderr)[-20000:]

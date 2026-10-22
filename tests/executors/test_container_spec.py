@@ -128,3 +128,20 @@ def test_proxy_container(cfg: Config, spec: SessionSpec) -> None:
     assert kw["read_only"] is True and kw["cap_drop"] == ["ALL"]
     assert kw["image"] == cfg.vigild.images.egress_proxy
     assert kw["mounts"][0]["Target"] == "/etc/smokescreen" and kw["mounts"][0]["ReadOnly"]
+
+
+def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
+    cfg: Config, tmp_path: Path
+) -> None:  # review round 2
+    from vigild.executors.runtime import PREPARE, verifier_kwargs
+
+    src = tmp_path / "verify" / "t-after" / "src"
+    kw = verifier_kwargs(cfg, "vigil-dev/x:1", src, "pytest -q")
+    assert kw["network_mode"] == "none" and "network" not in kw
+    assert kw["mounts"] == [
+        {"Target": "/src", "Source": str(src), "Type": "bind", "ReadOnly": True}
+    ]
+    assert set(kw["tmpfs"]) == {"/tmp", "/work"} and kw["read_only"] is True
+    assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
+    assert kw["command"] == [PREPARE, "pytest -q"]  # test_cmd is an argument, never spliced
+    assert kw["mem_limit"] == cfg.vigild.container.verifier_memory

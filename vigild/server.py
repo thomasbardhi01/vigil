@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -56,6 +55,9 @@ class NullRunner:
 
     def on_resume(self, job_id: str) -> None:
         log.info("job %s resumed; no runner attached", job_id)
+
+    def on_rebuild(self, repo: str, base_sha: str) -> None:
+        log.info("dev image rebuild for %s asked; no runner attached", repo)
 
 
 @dataclass
@@ -174,6 +176,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     ws = Workspace(v.cfg.vigild.data_path, token_for=read_token)
     publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
     runtime = DockerRuntime(v.cfg, client)
+    tests = DockerTestRunner(v.cfg, client)
+    images = DevImages(v.cfg, v.store, DockerImages(client), ws, tests)
     runner = JobRunner(
         v.cfg,
         v.store,
@@ -183,23 +187,13 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         ws,
         publisher,
         v.telemetry,
-        DevImages(v.cfg, v.store, DockerImages(client, v.cfg.vigild.container.uid)),
-        Verifier(ws, DockerTestRunner(v.cfg, client)),
+        images,
+        Verifier(ws, tests),
         reaper=runtime.reap,
     )
+    images.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
     return runner
-
-
-def validate_images_forever(images: DevImages, stop: threading.Event) -> None:
-    """Dev images are validated at start and every 24 hours by vigild itself
-    (item 21): one way to do it, no launchd job."""
-    while not stop.is_set():
-        for repo in images.cfg.repos.repos:
-            if images.due(repo):
-                v = images.validate(repo)
-                log.info("dev image %s for %s: %s", v.image, repo, "ok" if v.ok else "FAILED")
-        stop.wait(3600)
 
 
 def main() -> None:
@@ -219,15 +213,9 @@ def main() -> None:
         raise SystemExit(f"vigild: {e}") from e
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
-    # Validate the dev images before anything can start a session, then hold
-    # every job a restart interrupted; approved builds start only once the
-    # gateway is listening (review round 2, N11).
-    for repo in runner.dev_images.cfg.repos.repos:
-        if runner.dev_images.due(repo):
-            runner.dev_images.validate(repo)
+    # Hold every job a restart interrupted. Approved builds start only once the
+    # gateway is listening (review round 2, N11), and every session checks its
+    # repo's dev image first: built and validated when its lockfiles change,
+    # never on a timer (the nightly validation is gone).
     log.info("reconcile: %s", runner.reconcile())
-    stop = threading.Event()
-    threading.Thread(
-        target=validate_images_forever, args=(runner.dev_images, stop), daemon=True
-    ).start()
     asyncio.run(serve(v, on_ready=runner.start_deferred))

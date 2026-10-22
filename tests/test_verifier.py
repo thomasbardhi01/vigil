@@ -174,7 +174,13 @@ def test_the_hook_forgery_and_a_fifo_record_change_nothing(ws: Workspace, tmp_pa
 
 @pytest.mark.parametrize(
     ("code", "timed_out", "want"),
-    [(0, False, "pass"), (1, False, "fail"), (127, False, "unknown"), (None, True, "timeout")],
+    [
+        (0, False, "pass"),
+        (1, False, "fail"),
+        (125, False, "unknown"),
+        (127, False, "unknown"),
+        (None, True, "timeout"),
+    ],
 )
 def test_outcomes(code: int | None, timed_out: bool, want: str) -> None:
     assert outcome(code, timed_out) == want

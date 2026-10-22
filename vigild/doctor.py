@@ -199,7 +199,7 @@ def run_checks(
     if docker is None:
         out.append(Check("Docker", None, "not checked"))
     else:
-        from vigild.devimage import DevImages, DockerImages, StaleDevImage
+        from vigild.devimage import DockerImages
 
         out.append(_safe("Docker", lambda: (bool(docker.ping()), "")))
         for image in (cfg.vigild.images.claude_executor, cfg.vigild.images.egress_proxy):
@@ -215,15 +215,22 @@ def run_checks(
         from vigild.db import Store
 
         store = Store.open(cfg.vigild.data_path / "vigil.db")
-        images = DevImages(cfg, store, DockerImages(docker, cfg.vigild.container.uid))
         for repo in cfg.repos.repos:
 
-            def fresh(r: str = repo) -> tuple[bool, str]:
-                try:
-                    images.ensure_fresh(r)
-                    return True, ""
-                except StaleDevImage as e:
-                    return False, str(e).split(": ", 1)[-1]
+            def last_build(r: str = repo) -> tuple[bool, str]:
+                # what vigild last built and validated; doctor builds nothing
+                rows = store.q(
+                    "SELECT * FROM dev_images WHERE repo=? ORDER BY id DESC LIMIT 1", (r,)
+                )
+                if not rows:
+                    return False, "never built (the first job builds it; or `vigil dev-image`)"
+                row = rows[0]
+                if not row["ok"]:
+                    return False, f"{row['image']} failed its {row['stage'] or 'check'}"
+                current = DockerImages(docker).image_id_of(row["image"])
+                if current != row["image_id"]:
+                    return False, f"{row['image']} is gone or changed since it was validated"
+                return True, str(row["image"])
 
-            out.append(_safe(f"dev image fresh: {repo}", fresh))
+            out.append(_safe(f"dev image: {repo}", last_build))
     return out

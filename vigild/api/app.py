@@ -228,6 +228,18 @@ def abandon(request: Request, item_id: int) -> dict[str, Any]:
     return _act(request, item_id, "abandon")
 
 
+@router.post("/api/inbox/{item_id}/rebuild", dependencies=[ADMIN])
+def rebuild(request: Request, item_id: int) -> dict[str, Any]:
+    """Build and validate a repo's failed dev image again."""
+    try:
+        _svc(request).jobs.rebuild(item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"item_id": item_id, "status": "rebuilding"}
+
+
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:

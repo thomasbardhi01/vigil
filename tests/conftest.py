@@ -37,6 +37,7 @@ class RecordingRunner:
     created: list[str] = field(default_factory=list)
     approved: list[str] = field(default_factory=list)
     resumed: list[str] = field(default_factory=list)
+    rebuilt: list[tuple[str, str]] = field(default_factory=list)
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         self.created.append(job_id)
@@ -46,6 +47,9 @@ class RecordingRunner:
 
     def on_resume(self, job_id: str) -> None:
         self.resumed.append(job_id)
+
+    def on_rebuild(self, repo: str, base_sha: str) -> None:
+        self.rebuilt.append((repo, base_sha))
 
 
 @pytest.fixture

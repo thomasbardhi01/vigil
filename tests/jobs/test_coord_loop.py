@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from tests.conftest import auth, git
 from tests.harness import LocalTestRunner, finish_session
-from tests.test_devimage import FakeDocker
+from tests.test_devimage import FakeDocker, FakeSuites
 from vigild.api.app import create_app
 from vigild.budget import Budget
 from vigild.config import Config, RepoPolicy
@@ -262,8 +262,9 @@ def world(
         visibility="public",
         decider=["haiku"],
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
-        dev_image="vigil/claude-executor:2.1.306",
-        dev_image_check="true",
+        dev_dockerfile="images/dev/vigil.Dockerfile",
+        dev_lockfiles=["README.md"],
+        dev_suites={"smoke": "true"},
         dev_image_tools=["git", "grep"],
     )
     store = Store.open(":memory:")
@@ -272,9 +273,8 @@ def world(
     from vigild.gateway.service import Gateway
 
     gateway = Gateway(cfg, store, budget, Secrets({}))
-    images = DevImages(cfg, store, FakeDocker())
-    images.validate(REPO)
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    images = DevImages(cfg, store, FakeDocker(), ws, FakeSuites())
     standin, publisher, tests = StandIn(), BarePublisher(ws), LocalTestRunner()
     runner = JobRunner(
         cfg,
@@ -289,6 +289,7 @@ def world(
         Verifier(ws, tests),
         background=False,
     )
+    images.on_failure = runner.dev_image_failed
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)
@@ -420,13 +421,24 @@ def test_daily_cap_halts_dispatch(world: World) -> None:
     assert any("daily" in p["title"] for p in pages)
 
 
-def test_stale_dev_image_refuses_dispatch(world: World) -> None:
+def test_a_dev_image_that_fails_refuses_dispatch_and_offers_rebuild(world: World) -> None:
     w = world
-    w.images.docker.image_id = "sha256:rebuilt"  # type: ignore[attr-defined]
+    w.images.docker.ok = False  # type: ignore[attr-defined]  # the build fails
     job = _request(w)
     assert w.standin.calls == []
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     assert any(p["job_id"] == job and "dev image" in p["title"] for p in pages)
+    (item,) = [p for p in pages if p["body"].get("kind") == "dev_image"]
+    assert item["body"]["actions"] == ["rebuild", "dismiss"] and item["body"]["stage"] == "build"
+
+    w.images.docker.ok = True  # type: ignore[attr-defined]  # fixed; the owner rebuilds
+    r = w.client.post(f"/api/inbox/{item['id']}/rebuild", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.images.status(REPO, item["body"]["base_sha"])[0]
+    job_page = next(p for p in pages if p["job_id"] == job)
+    r = w.client.post(f"/api/inbox/{job_page['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert [c[0] for c in w.standin.calls] == ["coord"]
 
 
 def test_ask_coord_files_a_question(world: World) -> None:
@@ -891,11 +903,12 @@ def test_every_worker_failure_blocks_with_actions(world: World, cause: str) -> N
         real_fresh = w.images.ensure_fresh
         n = [0]
 
-        def fresh(repo: str) -> str:
+        def fresh(repo: str, base_sha: str, force: bool = False) -> str:
             n[0] += 1
-            if n[0] > 1:  # the coord ran; the image went stale before the workers
-                w.images.docker.image_id = "sha256:rebuilt"  # type: ignore[attr-defined]
-            return real_fresh(repo)
+            if n[0] > 1:  # the coord ran; the image is gone and won't build again
+                w.images.docker.ids.clear()  # type: ignore[attr-defined]
+                w.images.docker.ok = False  # type: ignore[attr-defined]
+            return real_fresh(repo, base_sha, force=force)
 
         w.images.ensure_fresh = fresh  # type: ignore[method-assign]
     if cause == "session_failed":

@@ -55,10 +55,16 @@ class RepoPolicy(_M):
     backends: list[str]
     worker_overflow: list[str] = Field(default_factory=list)
     auto_merge: bool = False
-    dev_image: str  # the pinned image this repo's sessions run in
-    dev_image_check: str  # smoke command the validation runs in it
-    # Commands a test_cmd may use in this image; validated present. A test_cmd
-    # that needs anything else is refused at the spec gate (review r1, blocker 4).
+    # The repo's dev image (owner direction, review round 2; vigild/devimage.py):
+    # vigild builds dev_dockerfile from dev_lockfiles at the base commit and
+    # validates it by running every dev_suites command, offline, on a clean
+    # checkout. dev_excluded names suites that can't run in a Linux container.
+    dev_dockerfile: str
+    dev_lockfiles: list[str] = Field(min_length=1)
+    dev_suites: dict[str, str] = Field(min_length=1)
+    dev_excluded: dict[str, str] = Field(default_factory=dict)
+    # Commands a test_cmd may use in the image. A test_cmd that needs anything
+    # else is refused at the spec gate (review r1, blocker 4).
     dev_image_tools: list[str]
 
 
@@ -165,6 +171,9 @@ class ContainerLimits(_M):
     memory: str
     pids_limit: int
     uid: int
+    # The verifier's container holds the checkout, the repo's dependencies and
+    # a database in tmpfs, so it gets more (review round 2).
+    verifier_memory: str = "6g"
 
 
 class Vigild(_M):
@@ -241,6 +250,13 @@ def validate(cfg: Config) -> None:
     for p in presets.values():
         if p.model and p.locality == "hosted" and p.model not in cfg.prices.models:
             raise ConfigError(f"no price for hosted model {p.model} in prices.yaml")
+    for repo, pol in cfg.repos.repos.items():
+        df = CONFIG_DIR.parent / pol.dev_dockerfile
+        if not pol.dev_dockerfile.startswith("images/dev/") or not df.is_file():
+            raise ConfigError(f"{repo}: dev_dockerfile {pol.dev_dockerfile} is not in images/dev/")
+        for path in pol.dev_lockfiles:
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise ConfigError(f"{repo}: bad dev_lockfiles entry {path!r}")
     validate_repo_policies(cfg)
 
 

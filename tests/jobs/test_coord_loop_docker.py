@@ -57,14 +57,16 @@ def live(
         visibility="public",
         decider=["haiku"],
         backends=["claude-haiku"],
-        dev_image=cfg.vigild.images.claude_executor,
-        dev_image_check="git --version",
+        dev_dockerfile="images/dev/fixture.Dockerfile",
+        dev_lockfiles=["README.md"],
+        dev_suites={"smoke": "git --version && grep -q fixture README.md"},
         dev_image_tools=["git", "grep"],
     )
     client = docker.from_env()
-    images = DevImages(cfg, v.store, DockerImages(client))
-    assert images.validate(REPO).ok
     ws = Workspace(tmp_path / "work", remote_url=lambda r: str(fixture_repo["bare"]))
+    tests = DockerTestRunner(cfg, client)
+    images = DevImages(cfg, v.store, DockerImages(client), ws, tests)
+    images.ensure_fresh(REPO, ws.head_sha(REPO, "main"))
     publisher = BarePublisher(ws)
     runner = JobRunner(
         cfg,
@@ -76,7 +78,7 @@ def live(
         publisher,
         v.telemetry,
         images,
-        Verifier(ws, DockerTestRunner(cfg, client)),
+        Verifier(ws, tests),
         background=False,
     )
     v.services.jobs.runner = runner

@@ -23,8 +23,9 @@ def _private(**kw: Any) -> dict[str, Any]:
         "visibility": "private",
         "decider": [],
         "backends": [],
-        "dev_image": "img",
-        "dev_image_check": "true",
+        "dev_dockerfile": "images/dev/vigil.Dockerfile",
+        "dev_lockfiles": ["uv.lock"],
+        "dev_suites": {"t": "true"},
         "dev_image_tools": [],
     }
     base.update(kw)
@@ -81,8 +82,9 @@ def test_public_repo_may_list_any_hosted_entry() -> None:
                 "visibility": "public",
                 "decider": ["jev-openrouter", "haiku"],
                 "backends": ["openrouter", "claude-opus"],
-                "dev_image": "img",
-                "dev_image_check": "true",
+                "dev_dockerfile": "images/dev/vigil.Dockerfile",
+                "dev_lockfiles": ["uv.lock"],
+                "dev_suites": {"t": "true"},
                 "dev_image_tools": [],
             }
         }

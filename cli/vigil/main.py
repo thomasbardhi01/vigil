@@ -1,8 +1,8 @@
-"""The `vigil` CLI. Phase 1 ships `doctor` and `validate-images`; `run`,
-`batch`, `ls`, `trace` and `kill` arrive in phase 2 as clients of the API.
+"""The `vigil` CLI. Phase 1 ships `doctor` and `dev-image`; `run`, `batch`,
+`ls`, `trace` and `kill` arrive in phase 2 as clients of the API.
 
   uv run python -m vigil doctor
-  uv run python -m vigil validate-images     # nightly, from launchd (runbook)
+  uv run python -m vigil dev-image --repo owner/name [--rebuild]
 """
 
 from __future__ import annotations
@@ -43,23 +43,34 @@ def doctor(
     raise typer.Exit(0 if all(c.ok is not False for c in checks) else 1)
 
 
-@app.command("validate-images")
-def validate_images() -> None:
-    """Run each repo's dev-image check and record it (vigild/devimage.py)."""
-    import docker
+@app.command("dev-image")
+def dev_image(
+    repo: str = typer.Option(..., "--repo", help="owner/name, as in configs/repos.yaml"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="Build again even if validated."),
+) -> None:
+    """Build and validate a repo's dev image at its base branch's tip, as the
+    first job would (vigild/devimage.py). Prints each suite's outcome."""
+    import json
 
-    from vigild import config
-    from vigild.db import Store
-    from vigild.devimage import DevImages, DockerImages
+    from vigild.devimage import StaleDevImage
+    from vigild.server import _github_app, build, build_runner
 
-    cfg = config.load()
-    cfg.vigild.data_path.mkdir(parents=True, exist_ok=True)
-    images = DevImages(
-        cfg, Store.open(cfg.vigild.data_path / "vigil.db"), DockerImages(docker.from_env())
-    )
-    failed = False
-    for repo in cfg.repos.repos:
-        v = images.validate(repo)
-        typer.echo(f"{'pass' if v.ok else 'fail'}  {repo}  {v.image}")
-        failed |= not v.ok
-    raise typer.Exit(1 if failed else 0)
+    v = build()
+    runner = build_runner(v, _github_app(v))
+    images = runner.dev_images
+    base = runner.workspace.head_sha(repo, "main")
+    ok = True
+    try:
+        tag = images.ensure_fresh(repo, base, force=rebuild)
+        typer.echo(f"pass  {repo}  {tag}")
+    except StaleDevImage as e:
+        ok = False
+        typer.echo(f"fail  {repo}  {e}")
+    last = images.latest(repo)
+    if last:
+        detail = json.loads(last["output"])
+        for name, suite in (detail.get("suites") or {}).items():
+            typer.echo(f"  {suite['outcome']:<8} {name}")
+        for name, why in (detail.get("excluded") or {}).items():
+            typer.echo(f"  excluded {name}: {why}")
+    raise typer.Exit(0 if ok else 1)

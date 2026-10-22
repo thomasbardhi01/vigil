@@ -121,29 +121,49 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
     }
 
 
+# The verifier's first step. The dev image's vigil-prepare copies the checkout
+# into /work with the dependencies it installed, and starts what the suites
+# need (a database on loopback); an image without one gets a plain copy.
+# Exit 125 means the tree couldn't be prepared: the outcome is `unknown`.
+PREPARE = (
+    "if [ -x /usr/local/bin/vigil-prepare ]; then /usr/local/bin/vigil-prepare || exit 125; "
+    "else cp -a /src/. /work/ || exit 125; fi; "
+    'cd /work && exec sh -c "$0"'
+)
+
+
 def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
-    image, the vault checkout read-only at /work, no network at all, the agent
-    uid with no capabilities, and nothing else mounted."""
+    image, vigild's checkout read-only at /src, no network at all, the agent
+    uid with no capabilities, and nothing else mounted. The suites write (build
+    output, caches), so they run on a copy in the container's own tmpfs at
+    /work; the checkout itself can't change."""
     uid = cfg.vigild.container.uid
+    tmp = f"rw,exec,uid={uid},gid={uid}"
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [command],
+        "command": [PREPARE, command],
         "user": f"{uid}:{uid}",
         "network_mode": "none",
-        "mounts": [_mount(str(source), "/work", read_only=True)],
-        "tmpfs": {"/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "mounts": [_mount(str(source), "/src", read_only=True)],
+        "tmpfs": {
+            "/tmp": f"{tmp},size=2g,mode=1777",  # noqa: S108
+            "/work": f"{tmp},size=4g,mode=0755",
+        },
         "working_dir": "/work",
         "environment": {  # caches on the container's own tmpfs, never the source
             "HOME": "/tmp/home",  # noqa: S108
             "XDG_CACHE_HOME": "/tmp/cache",  # noqa: S108
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": "/tmp/pycache",  # noqa: S108
+            "NO_COLOR": "1",
         },
         "stdin_open": False,
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
         **_hardening(cfg),
+        "mem_limit": cfg.vigild.container.verifier_memory,
+        "pids_limit": max(cfg.vigild.container.pids_limit, 2048),
     }
 
 

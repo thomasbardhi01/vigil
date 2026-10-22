@@ -35,6 +35,7 @@ class Runner(Protocol):
     def on_job_created(self, job_id: str, needs_spec: bool) -> None: ...
     def on_approved(self, job_id: str) -> None: ...
     def on_resume(self, job_id: str) -> None: ...
+    def on_rebuild(self, repo: str, base_sha: str) -> None: ...
 
 
 class SubmitError(ValueError):
@@ -455,6 +456,20 @@ class JobService:
                 if other.job_id == job.id and other.queue == "questions":
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
         return job
+
+    def rebuild(self, item_id: int) -> None:
+        """Build and validate a repo's failed dev image again (round 2)."""
+        with self.store.tx():
+            item = self._question(item_id)
+            if item.body.get("kind") != "dev_image" or "rebuild" not in (
+                item.body.get("actions") or []
+            ):
+                raise Conflict(f"inbox item {item_id} doesn't offer rebuild")
+            self.store.add_event("rebuild", {"inbox_item_id": item_id, **{
+                k: item.body.get(k) for k in ("repo", "key", "base_sha")
+            }}, Provenance.HUMAN)  # fmt: skip
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        self.runner.on_rebuild(str(item.body["repo"]), str(item.body["base_sha"]))
 
     def dismiss(self, item_id: int) -> None:
         with self.store.tx():

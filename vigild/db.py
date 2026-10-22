@@ -119,7 +119,15 @@ def _m1_gateway_token_binding(conn: sqlite3.Connection) -> None:
 # Ordered steps; PRAGMA user_version is how many have run (review round 2, N8).
 # Each step is idempotent, since SCHEMA's CREATE IF NOT EXISTS may already
 # have made a table in its newest shape. Append only; never reorder.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_m1_gateway_token_binding]
+def _m2_dev_image_keys(conn: sqlite3.Connection) -> None:
+    """Review round 2: dev images are built per lockfile key and validated by stage."""
+    _add_columns(conn, "dev_images", {"key": "TEXT", "stage": "TEXT", "base_sha": "TEXT"})
+
+
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _m1_gateway_token_binding,
+    _m2_dev_image_keys,
+]
 
 
 def migrate(conn: sqlite3.Connection) -> int:

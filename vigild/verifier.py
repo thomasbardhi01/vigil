@@ -51,8 +51,8 @@ def outcome(code: int | None, timed_out: bool) -> str:
         return "timeout"
     if code == 0:
         return "pass"
-    if code in (126, 127):
-        return "unknown"  # couldn't run in this image
+    if code in (125, 126, 127):
+        return "unknown"  # couldn't prepare the tree (125) or run the command in this image
     return "fail"
 
 

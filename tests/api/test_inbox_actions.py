@@ -68,9 +68,9 @@ def test_a_task_the_gate_refuses_leaves_no_orphan_job(
     client: TestClient, tokens: Tokens, store: Store
 ) -> None:
     t = _task()
-    t["spec"]["test_cmd"] = "pnpm test"  # the ParkAgent dev image has no pnpm
+    t["spec"]["test_cmd"] = "xcodebuild test"  # iOS: no Linux dev image has Xcode
     r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
-    assert r.status_code == 422 and "pnpm" in r.text
+    assert r.status_code == 422 and "xcodebuild" in r.text
     assert store.list_jobs() == []
 
 

@@ -1,5 +1,6 @@
-"""The verifier's container, for real (pytest -m docker): no network, read-only
-source, the agent uid with no capabilities, output capped, a timeout that kills."""
+"""The verifier's container, for real (pytest -m docker): no network, a
+read-only checkout copied into the container's tmpfs, the agent uid with no
+capabilities, output capped, a timeout that kills."""
 
 from __future__ import annotations
 
@@ -44,8 +45,9 @@ def test_no_network_read_only_source_agent_uid(
         runner,
         cfg,
         source,
-        "id -u; grep CapEff /proc/self/status; cat ok.txt; "
-        "touch /work/x 2>/dev/null; echo SRC=$?; touch /tmp/x; echo TMP=$?; "
+        "id -u; grep CapEff /proc/self/status; pwd; cat ok.txt; "
+        "touch /src/x 2>/dev/null; echo SRC=$?; touch /work/x; echo WORK=$?; "
+        "touch /tmp/x; echo TMP=$?; touch /etc/x 2>/dev/null; echo ROOTFS=$?; "
         'python -c "import urllib.request as u\n'
         "try:\n u.urlopen('https://pypi.org/simple/', timeout=5); print('REACHED')\n"
         "except Exception as e:\n print('BLOCKED', type(e).__name__)\"; exit 3",
@@ -54,7 +56,11 @@ def test_no_network_read_only_source_agent_uid(
     lines = r.output.splitlines()
     assert lines[0] == "10001", r.output
     assert "CapEff:\t0000000000000000" in r.output
-    assert "ok" in lines and "SRC=1" in r.output and "TMP=0" in r.output
+    # the checkout is read-only; the suite runs on a copy in the container's tmpfs
+    assert "/work" in lines and "ok" in lines
+    assert "SRC=1" in r.output and "WORK=0" in r.output and "TMP=0" in r.output
+    assert "ROOTFS=1" in r.output
+    assert not (source / "x").exists()
     assert "BLOCKED" in r.output and "REACHED" not in r.output
 
 

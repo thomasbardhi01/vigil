@@ -25,7 +25,8 @@
   keeps money held (review round 1, item 7).
 
 Every session reserves its budget before it starts, gets a gateway token that
-expires and is revoked when it ends, runs in its repo's validated dev image,
+expires and is revoked when it ends, runs in the executor image (its tests
+run in the repo's validated dev image, through the verifier),
 and writes its events (secrets redacted).
 """
 
@@ -255,6 +256,34 @@ class JobRunner:
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
 
+    def dev_image_failed(self, repo: str, title: str, body: dict[str, Any]) -> None:
+        """DevImages' pager: one open item per failed image key."""
+        assert self.jobs is not None
+        for item in self.store.list_inbox():
+            if item.body.get("kind") == "dev_image" and item.body.get("key") == body.get("key"):
+                return
+        self._page(None, title, body)
+
+    def on_rebuild(self, repo: str, base_sha: str) -> None:
+        """The owner asked for a failed dev image to be built again."""
+
+        def go(_: str) -> None:
+            self.dev_images.ensure_fresh(repo, base_sha, force=True)
+
+        def safe(j: str) -> None:
+            try:
+                go(j)
+            except StaleDevImage:
+                pass  # DevImages paged the owner with what failed
+            except Exception as e:
+                log.exception("dev image rebuild failed for %s", repo)
+                self._page(None, f"{repo}: dev image rebuild error", {"error": str(e)[:1000]})
+
+        if self.background:
+            threading.Thread(target=safe, args=(repo,), daemon=True).start()
+        else:
+            safe(repo)
+
     def start_deferred(self) -> int:
         """Start the builds reconcile queued. vigild calls this only once its
         gateway is listening and the dev images are validated (N11)."""
@@ -338,7 +367,9 @@ class JobRunner:
         job = self.store.get_job(job_id)
         preset = self.cfg.routing.coord
         try:
-            image = self.dev_images.ensure_fresh(job.repo)
+            # the repo's dev image must be fresh before any work starts on it;
+            # a new lockfile builds one here (owner direction, round 2)
+            self.dev_images.ensure_fresh(job.repo, self.workspace.head_sha(job.repo, job.base))
             check_backend(self.cfg, job.repo, preset)
         except (StaleDevImage, RepoPolicyError) as e:
             why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
@@ -375,7 +406,7 @@ class JobRunner:
                 return
             try:
                 draft = self._coord_attempt(
-                    job, coord, rid, attempt, image, branch, meta, gate_errors, previous
+                    job, coord, rid, attempt, branch, meta, gate_errors, previous
                 )
             except Exception:
                 self.budget.settle(rid)
@@ -408,7 +439,6 @@ class JobRunner:
         coord: SessionRow,
         rid: int,
         attempt: int,
-        image: str,
         branch: str,
         meta: dict[str, Any],
         gate_errors: list[str] | None,
@@ -466,7 +496,7 @@ class JobRunner:
             max_budget_usd=self.cfg.budgets.coord_session_usd,
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
-            image=image,
+            image=None,  # sessions run in the executor image; tests run in the dev image
         )
         out = self._run_session(
             coord,
@@ -752,8 +782,10 @@ class JobRunner:
         held["s"] = s
         # the gateway sees this session's headroom through its reservation
         self.store.x("UPDATE reservations SET session_id=? WHERE id=?", (s.id, reservation))
+        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
+        base_sha = self.workspace.base_sha(task_id)
         try:
-            image = self.dev_images.ensure_fresh(job.repo)
+            image = self.dev_images.ensure_fresh(job.repo, base_sha)  # what the verifier runs
         except StaleDevImage as e:
             self.budget.settle(reservation, 0.0)
             return self._fail(
@@ -764,8 +796,6 @@ class JobRunner:
                 {"error": str(e)},
                 state="waiting",
             )
-        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
-        base_sha = self.workspace.base_sha(task_id)
         paths = []
         for name in ("spec.md", "plan.md", "approval.json"):
             art = self.store.get_artifact(job_id, name)
@@ -804,7 +834,7 @@ class JobRunner:
             max_budget_usd=amount,  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
-            image=image,
+            image=None,  # the executor image; the verifier runs `image`
         )
         attrs = {
             "vigil.job_id": job_id,
