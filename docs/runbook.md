@@ -193,9 +193,12 @@ image, with no network. There is no timer and no launchd job.
   cache). It fails, pages and rebuilds like a dev image. The generic
   `vigil/claude-executor` image (`scripts/build-images.py`) is the same layer
   over the pinned Python base; the security tests run against all three.
-- **Test commands** must run pytest or vitest (directly, or through a package
-  script): the verifier judges by their JUnit report, and the spec gate
-  refuses anything else.
+- **Test commands** must run pytest or vitest (directly, or through a pnpm
+  script, optionally after `cd` or with `-C`): the verifier judges by their
+  JUnit report, and the spec gate refuses anything else (`--filter`, npm and
+  yarn scripts included). Verifier containers run one at a time
+  (`container.verifier_concurrency` in `configs/vigild.yaml`); raise it only
+  if the Docker VM has the memory (6 GiB each, plus tmpfs).
 - **A task that needs a dependency** blocks with an inbox item listing the
   packages and the worker's manifest and lockfile diff. Until phase 2's deps
   job exists, make the dependency change yourself in its own PR (manifest and
