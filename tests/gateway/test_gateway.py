@@ -393,3 +393,133 @@ def test_token_is_bound_to_the_sessions_model(
     # the CLI's own small-model side calls (titles, summaries) are the one exception
     r = client.post("/v1/messages", json=_msg(model="claude-haiku-5-5"), headers={"x-api-key": tok})
     assert r.status_code == 200
+
+
+# --- review round 2, N4: content blocks are allowlisted at every level -----------------------
+
+IMG_URL = {"type": "image", "source": {"type": "url", "url": "https://evil.example/x.png"}}
+IMG_B64 = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}}
+DOC_URL = {"type": "document", "source": {"type": "url", "url": "https://evil.example/x.pdf"}}
+DOC_B64 = {
+    "type": "document",
+    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"},
+}
+TOOL_USE = {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+
+
+def _result(*content: Any) -> dict[str, Any]:
+    return {"type": "tool_result", "tool_use_id": "toolu_1", "content": list(content)}
+
+
+def _turns(user_blocks: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}, TOOL_USE]},
+        {"role": "user", "content": user_blocks},
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"messages": _turns([_result(IMG_URL)])},  # the owner's case: nested in a tool_result
+        {"messages": _turns([_result({"type": "text", "text": "x"}, DOC_URL)])},
+        {"messages": [{"role": "user", "content": [IMG_URL]}]},
+        {"messages": [{"role": "user", "content": [DOC_URL]}]},
+        {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "f"}}]}]},
+        {"messages": [{"role": "assistant", "content": [{"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "web_search_tool_result", "tool_use_id": "s", "content": []}]}]},
+        {"messages": [{"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m", "name": "x", "server_name": "s", "input": {}}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m", "content": []}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "search_result", "source": "https://x", "title": "t", "content": []}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "container_upload", "file_id": "f"}]}]},
+        {"messages": [{"role": "user", "content": [{"text": "no type"}]}]},
+        {"messages": [{"role": "user", "content": [_result(_result({"type": "text", "text": "x"}))]}]},
+        {"system": [{"type": "text", "text": "s"}, IMG_URL]},
+        {"system": [{"type": "image", "source": IMG_B64["source"]}]},
+        {"messages": "not a list"},
+    ],
+)
+def test_content_blocks_outside_the_allowlist_are_refused(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    body: dict[str, Any],
+) -> None:
+    _, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(**body), headers={"x-api-key": tok})
+    assert r.status_code in (400, 403), r.text
+    assert upstream.requests == []
+
+
+def test_allowed_content_blocks_pass(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway
+) -> None:
+    _, tok = _session(store, budget, gw)
+    body = _msg(
+        system=[{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "look"}, IMG_B64, DOC_B64]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hm", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "abc"},
+                    TOOL_USE,
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    _result({"type": "text", "text": "out"}, IMG_B64),
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "plain"},
+                ],
+            },
+        ],
+    )
+    assert client.post("/v1/messages", json=body, headers={"x-api-key": tok}).status_code == 200
+
+
+# --- review round 2, N7 -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("max_tokens", [0, -5, "many", 1.5, True])
+def test_max_tokens_must_be_a_positive_integer(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    max_tokens: Any,
+) -> None:
+    _, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(max_tokens=max_tokens), headers={"x-api-key": tok})
+    assert r.status_code == 400, r.text
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_call_is_booked_before_its_hold_is_released(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, stream: bool
+) -> None:
+    """Between release and record, a concurrent call would see the session's
+    spend without this call and its hold both: record first."""
+    sid, tok = _session(store, budget, gw)
+    seen: list[int] = []
+    real = gw.release
+
+    def release(hold: Any) -> None:
+        seen.append(len(store.q("SELECT 1 FROM model_calls WHERE session_id=?", (sid,))))
+        real(hold)
+
+    gw.release = release  # type: ignore[method-assign]
+    if stream:
+        with client.stream(
+            "POST", "/v1/messages", json=_msg(stream=True), headers={"x-api-key": tok}
+        ) as r:
+            b"".join(r.iter_bytes())
+    else:
+        client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert seen and seen[0] == 1

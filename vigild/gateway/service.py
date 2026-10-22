@@ -82,6 +82,15 @@ ALLOWED_BETAS = frozenset(
         "thinking-display-updates-2026-08-18",
     }
 )
+# Review round 2, N4: content blocks are allowlisted at every level. A URL
+# source would have Anthropic fetch a host the session's proxy never allowed;
+# server-tool, MCP and search blocks carry content from tools vigild doesn't run.
+# Thinking blocks are the model's own output, echoed back in assistant turns.
+MESSAGE_BLOCKS = frozenset({"text", "image", "document", "tool_use", "tool_result"})
+ASSISTANT_ONLY_BLOCKS = frozenset({"thinking", "redacted_thinking"})
+TOOL_RESULT_BLOCKS = frozenset({"text", "image", "document"})
+SYSTEM_BLOCKS = frozenset({"text"})
+SOURCED_BLOCKS = frozenset({"image", "document"})
 # The CLI's own small-model side calls (titles, summaries) use this model; it is
 # the one model a session may call besides its routed one, where the repo allows it.
 SIDE_MODELS = frozenset({"claude-haiku-5-5"})
@@ -91,6 +100,43 @@ FREE_PATHS = ("/v1/messages/count_tokens",)
 CHARS_PER_TOKEN = 3  # deliberately low, so the input estimate errs high
 DEFAULT_MAX_TOKENS = 4096
 UPSTREAM_TIMEOUT = httpx2.Timeout(600.0, connect=10.0)
+
+
+def _refuse_block(where: str, why: str) -> GatewayError:
+    return GatewayError(403, "permission_error", f"{where}: {why}")
+
+
+def _check_blocks(blocks: Any, allowed: frozenset[str], where: str) -> None:
+    if isinstance(blocks, str):
+        return
+    if not isinstance(blocks, list):
+        raise GatewayError(400, "invalid_request_error", f"{where} must be a string or a list")
+    for i, b in enumerate(blocks):
+        at = f"{where}[{i}]"
+        kind = b.get("type") if isinstance(b, dict) else None
+        if kind not in allowed:
+            raise _refuse_block(at, f"content block {kind!r} is not allowed")
+        if kind in SOURCED_BLOCKS:
+            src = b.get("source")
+            if not isinstance(src, dict) or src.get("type") != "base64":
+                got = src.get("type") if isinstance(src, dict) else None
+                raise _refuse_block(at, f"{kind} source {got!r} is not allowed; base64 only")
+        if kind == "tool_result":
+            _check_blocks(b.get("content", ""), TOOL_RESULT_BLOCKS, f"{at}.content")
+
+
+def check_content(body: dict[str, Any]) -> None:
+    """Walk `system` and every message's content (review round 2, N4)."""
+    if "system" in body:
+        _check_blocks(body["system"], SYSTEM_BLOCKS, "system")
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        raise GatewayError(400, "invalid_request_error", "messages must be a list")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            raise GatewayError(400, "invalid_request_error", f"messages[{i}] must be an object")
+        allowed = MESSAGE_BLOCKS | (ASSISTANT_ONLY_BLOCKS if m.get("role") == "assistant" else set())
+        _check_blocks(m.get("content", ""), frozenset(allowed), f"messages[{i}].content")
 
 
 class GatewayError(Exception):
@@ -259,6 +305,10 @@ class Gateway:
         extra = sorted(set(body) - ALLOWED_BODY_KEYS)
         if extra:
             raise GatewayError(403, "permission_error", f"request fields not allowed: {extra}")
+        mt = body.get("max_tokens", DEFAULT_MAX_TOKENS)
+        if isinstance(mt, bool) or not isinstance(mt, int) or mt < 1:
+            raise GatewayError(400, "invalid_request_error", "max_tokens must be an integer >= 1")
+        check_content(body)
         for tool in body.get("tools") or []:
             kind = tool.get("type") if isinstance(tool, dict) else None
             if kind is not None and not CLIENT_TOOL_TYPES.match(str(kind)):
@@ -406,40 +456,43 @@ class Gateway:
                         tap.feed(chunk)
                         yield chunk
                 finally:
-                    await resp.aclose()
-                    self.release(hold)
-                    self._record(
-                        gs=gs,
-                        preset_name=gs.preset,
-                        preset=preset,
-                        model=tap.model or body["model"],
-                        usage=tap.usage(),
-                        started=started,
-                        purpose="session",
-                    )
+                    # book the call, then let go of its hold (review round 2, N7)
+                    try:
+                        await resp.aclose()
+                        self._record(
+                            gs=gs,
+                            preset_name=gs.preset,
+                            preset=preset,
+                            model=tap.model or body["model"],
+                            usage=tap.usage(),
+                            started=started,
+                            purpose="session",
+                        )
+                    finally:
+                        self.release(hold)
 
             return resp.status_code, out_headers, gen()
         try:
             data = await resp.aread()
             await resp.aclose()
+            if resp.status_code == 200:
+                try:
+                    payload = json.loads(data)
+                    usage = payload.get("usage") or {}
+                    self._record(
+                        gs=gs,
+                        preset_name=gs.preset,
+                        preset=preset,
+                        model=payload.get("model") or body["model"],
+                        usage=usage_from_anthropic(usage),
+                        started=started,
+                        purpose="session",
+                        provider_cost=usage.get("cost"),
+                    )
+                except json.JSONDecodeError, AttributeError:
+                    pass
         finally:
-            self.release(hold)
-        if resp.status_code == 200:
-            try:
-                payload = json.loads(data)
-                usage = payload.get("usage") or {}
-                self._record(
-                    gs=gs,
-                    preset_name=gs.preset,
-                    preset=preset,
-                    model=payload.get("model") or body["model"],
-                    usage=usage_from_anthropic(usage),
-                    started=started,
-                    purpose="session",
-                    provider_cost=usage.get("cost"),
-                )
-            except json.JSONDecodeError, AttributeError:
-                pass
+            self.release(hold)  # only after the call is booked (review round 2, N7)
         return resp.status_code, out_headers, data
 
     # --- vigild's own calls -------------------------------------------------------------
