@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from vigild.verifier import RunResult
+from vigild.verifier import REPORT_DIR, RunResult
 
 PINS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
         "-c", "user.name=vigil-worker[bot]", "-c", "user.email=w@vigil.invalid")  # fmt: skip
@@ -64,15 +66,33 @@ class LocalTestRunner:
         self.calls.append(
             {"source": str(source), "command": command, "hooksPath": hooks, "worker_files": planted}
         )
+        # as in the container: bash with pipefail and errexit, pytest asked for
+        # a JUnit report in a directory outside the checkout
+        reports = Path(tempfile.mkdtemp(prefix="vigil-report-"))
+        env = {
+            **os.environ,
+            "PYTEST_ADDOPTS": f"--junitxml={reports}/pytest.xml -p no:cacheprovider",
+        }
         try:
             p = subprocess.run(
-                ["sh", "-c", command],
+                [
+                    "bash",
+                    "-o",
+                    "pipefail",
+                    "-o",
+                    "errexit",
+                    "-c",
+                    command.replace(REPORT_DIR, str(reports)),
+                ],
                 cwd=source,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return RunResult(None, "", timed_out=True)
-        return RunResult(p.returncode, (p.stdout + p.stderr)[-max_output:])
+        found = {f.name: f.read_bytes() for f in reports.glob("*.xml")}
+        shutil.rmtree(reports, ignore_errors=True)
+        return RunResult(p.returncode, (p.stdout + p.stderr)[-max_output:], reports=found)

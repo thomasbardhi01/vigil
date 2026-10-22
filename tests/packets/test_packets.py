@@ -32,7 +32,7 @@ def _contract(**over: Any) -> dict[str, Any]:
         "risk": 1,
         "spec": {
             "goal": "Add the rate limit to the feature map",
-            "test_cmd": "grep -q 'rate limit' docs/feature-map.md",
+            "test_cmd": "pytest -q tests/test_feature_map.py",
             "done_when": "the feature map lists the rate limit; the runbook is untouched",
             "files_in_scope": ["docs/feature-map.md"],
             "out_of_scope": ["src/**"],

@@ -20,7 +20,7 @@ PA = "thomasbardhi01/parkagent"
 def _task(**over: Any) -> dict[str, Any]:
     t: dict[str, Any] = {
         "repo": PA, "why": "w", "value": 3, "risk": 1, "labels": ["docs"],
-        "spec": {"goal": "Document the limit", "test_cmd": "grep -q 'rate limit' docs/a.md",
+        "spec": {"goal": "Document the limit", "test_cmd": "pnpm -C server test",
                  "done_when": "listed", "files_in_scope": ["docs/a.md"]},
     }  # fmt: skip
     t.update(over)
@@ -68,9 +68,9 @@ def test_a_task_the_gate_refuses_leaves_no_orphan_job(
     client: TestClient, tokens: Tokens, store: Store
 ) -> None:
     t = _task()
-    t["spec"]["test_cmd"] = "xcodebuild test"  # iOS: no Linux dev image has Xcode
+    t["spec"]["test_cmd"] = "yarn test"  # a runner the ParkAgent dev image lacks
     r = client.post("/api/tasks", json=t, headers=auth(tokens.admin))
-    assert r.status_code == 422 and "xcodebuild" in r.text
+    assert r.status_code == 422 and "yarn" in r.text
     assert store.list_jobs() == []
 
 

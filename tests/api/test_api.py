@@ -25,7 +25,7 @@ def _task(**over: Any) -> dict[str, Any]:
         "labels": ["docs"],
         "spec": {
             "goal": "Document the rate limit",
-            "test_cmd": "grep -q 'rate limit' docs/feature-map.md",
+            "test_cmd": "pnpm -C server test",
             "done_when": "the feature map lists the rate limit",
             "files_in_scope": ["docs/feature-map.md"],
         },

@@ -20,7 +20,7 @@ CONTRACT: dict[str, Any] = {
     "job_id": "fx-0001",
     "spec": {
         "goal": "g",
-        "test_cmd": "grep -q 'rate limit' docs/feature-map.md",
+        "test_cmd": "pytest -q tests/test_feature_map.py",
         "done_when": "d",
         "must_fail_first": True,
         "files_in_scope": ["docs/feature-map.md"],
@@ -156,3 +156,55 @@ def test_over_the_cost_limit_fails(ws: Workspace, tmp_path: Path) -> None:
 def test_report_must_match_the_task(ws: Workspace, tmp_path: Path) -> None:
     base, head = _result(ws, tmp_path)
     assert any("task_id" in e for e in _check(ws, base, head, report=_report(task_id="other")))
+
+
+# --- review round 3, F1 and F3 ----------------------------------------------------------
+
+
+def _with(contract: dict[str, Any], scope: list[str]) -> dict[str, Any]:
+    return {**contract, "spec": {**contract["spec"], "files_in_scope": scope}}
+
+
+def test_a_runner_config_change_is_rejected_unless_named(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import runner_config_changes
+
+    base, head = _result(ws, tmp_path, lambda c: (c / "README.md").write_text("x\n"))
+    cfg = ["README.md"]  # stands in for package.json
+    # a glob that covers it is not enough: the spec must name the exact path
+    wide = _with(CONTRACT, ["docs/feature-map.md", "*.md"])
+    errors = check_worker(ws, REPO, base, head, wide, _report(), TESTS_OK, cost=0.1,
+                          runner_config=cfg)  # fmt: skip
+    assert any("changes how tests run" in e and "README.md" in e for e in errors), errors
+    named = _with(CONTRACT, ["docs/feature-map.md", "README.md"])
+    assert check_worker(ws, REPO, base, head, named, _report(), TESTS_OK, cost=0.1,
+                        runner_config=cfg) == []  # fmt: skip
+    refused, allowed = runner_config_changes(ws, REPO, base, head, named, cfg)
+    assert refused == [] and allowed == ["README.md"]
+
+
+def test_a_script_test_cmd_runs_is_runner_config(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        (c / "run_tests.sh").write_text("exit 0\n")
+
+    base, head = _result(ws, tmp_path, edit)
+    contract = _with(CONTRACT, ["docs/feature-map.md", "*.sh"])
+    contract["spec"]["test_cmd"] = "sh run_tests.sh"
+    errors = check_worker(ws, REPO, base, head, contract, _report(), TESTS_OK, cost=0.1)
+    assert any("run_tests.sh" in e and "changes how tests run" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    ("ids", "want"),
+    [
+        ({"checked": True, "failing_before": [], "not_passing_after": []}, "none of"),
+        ({"checked": True, "failing_before": ["t::a"], "not_passing_after": ["t::a"]}, "t::a"),
+    ],
+)
+def test_test_ids_decide_must_fail_first_when_checked(
+    ws: Workspace, tmp_path: Path, ids: dict[str, Any], want: str
+) -> None:
+    base, head = _result(ws, tmp_path)
+    errors = _check(ws, base, head, tests={**TESTS_OK, "ids": ids})
+    assert any(want in e for e in errors), errors
+    ok = {"checked": True, "failing_before": ["t::a"], "not_passing_after": []}
+    assert _check(ws, base, head, tests={**TESTS_OK, "ids": ok}) == []

@@ -15,9 +15,10 @@ from typing import Any
 
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import out_of_scope
+from vigild.intake.paths import in_scope
+from vigild.verifier import TEST_FILE, invoked_scripts
 from vigild.workspace import Workspace
 
-TEST_FILE = re.compile(r"(^|/)(tests?/|test_[^/]*$|[^/]*_test\.[a-z]+$|[^/]*\.test\.[a-z]+$)")
 ASSERT = re.compile(r"\b(assert|expect|should|XCTAssert)")
 
 
@@ -52,7 +53,44 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
         errors.append(f"must_fail_first: the verifier saw the test {before or 'not run'} before")
     if after != "pass":
         errors.append(f"test_cmd must pass; the verifier saw it {after or 'not run'} after")
+    ids = tests.get("ids") or {}
+    if spec.get("must_fail_first", True) and ids.get("checked"):
+        # round 3, F3: the failure "before" must be the worker's own test failing
+        if not ids.get("failing_before"):
+            errors.append(
+                "must_fail_first: none of the worker's new or changed tests failed before; "
+                "the failure was elsewhere in test_cmd"
+            )
+        if ids.get("not_passing_after"):
+            still = ids["not_passing_after"]
+            errors.append(f"the worker's tests that failed before don't pass after: {still}")
+    ran = tests.get("ran") or {}
+    if ran.get("checked") and not ran.get("ok"):
+        # owner direction, round 3: head may add tests, never run fewer or skip more
+        errors.append(
+            "head ran less than base: "
+            f"missing ids {ran.get('missing_ids')}, missing files {ran.get('missing_files')}, "
+            f"skipped {ran.get('skipped')}, xfail {ran.get('xfail')}"
+        )
     return errors
+
+
+def runner_config_changes(
+    ws: Workspace,
+    repo: str,
+    base_sha: str,
+    head: str,
+    contract: dict[str, Any],
+    runner_config: list[str] | tuple[str, ...],
+) -> tuple[list[str], list[str]]:
+    """(refused, allowed): changed files that decide how tests run (round 3,
+    F1). Allowed only when the spec names the exact path, not a glob."""
+    spec = contract["spec"]
+    globs = [*runner_config, *invoked_scripts(str(spec.get("test_cmd") or ""))]
+    named = set(spec.get("files_in_scope") or [])
+    changed = sorted({path for _, path in ws.changed(repo, base_sha, head)})
+    hits = [p for p in changed if in_scope(p, globs)]
+    return [p for p in hits if p not in named], [p for p in hits if p in named]
 
 
 def check_worker(
@@ -65,9 +103,16 @@ def check_worker(
     tests: dict[str, Any] | None,
     *,
     cost: float,
+    runner_config: list[str] | tuple[str, ...] = (),
 ) -> list[str]:
     spec = contract["spec"]
     errors: list[str] = []
+    refused, _ = runner_config_changes(ws, repo, base_sha, head, contract, runner_config)
+    if refused:
+        errors.append(
+            f"changes how tests run: {refused}; the approved spec must name each of these "
+            "by its exact path in files in scope"
+        )
     if report.task_id != contract["task_id"]:
         errors.append(f"report task_id {report.task_id} is not {contract['task_id']}")
     errors += check_tests(spec, tests)

@@ -233,22 +233,23 @@ class Workspace:
         name: str,
         sha: str,
         *,
-        overlay_from: str | None = None,
-        paths: list[str] | tuple[str, ...] = (),
+        take: list[tuple[str, list[str]]] | None = None,
         source: str = "vault",
     ) -> Path:
         """A fresh checkout of `sha` for the verifier, under
         <data>/verify/<name>/src: a new .git with hooks off, nothing from the
-        worker's clone. With `overlay_from`, `paths` are taken from that commit.
+        worker's clone. `take` lays files over it: for each (commit, paths),
+        each path as it is at that commit, or removed if it isn't there.
         `source` is the vault (a worker's result) or the mirror (a base commit,
         for validating a dev image)."""
+        take = take or []
         if not ID.match(name) or not SHA.match(sha):
             raise WorkspaceError(f"bad verify checkout {name!r} {sha!r}")
-        if overlay_from is not None and not SHA.match(overlay_from):
+        if any(not SHA.match(c) for c, _ in take):
             raise WorkspaceError("bad overlay sha")
         if source not in ("vault", "mirror"):
             raise WorkspaceError(f"bad source {source!r}")
-        vault = self.vault(repo) if source == "vault" else self._mirror_path(repo)
+        origin = self.vault(repo) if source == "vault" else self._mirror_path(repo)
         root = self.data_dir / "verify" / name
         if root.exists():
             shutil.rmtree(root)
@@ -257,16 +258,32 @@ class Workspace:
         self._git(src.parent, "init", "--quiet", str(src))
         self._git(src, "config", "core.hooksPath", "/dev/null")
         self._git(src, "config", "core.fsmonitor", "false")
-        wants = [sha] + ([overlay_from] if overlay_from else [])
+        wants = sorted({sha, *(c for c, _ in take)})
         with self._repo_lock(f"vault:{repo}"):
             self._git(
                 src, "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--quiet",
-                "--no-tags", str(vault), *wants,
+                "--no-tags", str(origin), *wants,
             )  # fmt: skip
         self._git(src, "checkout", "--quiet", "--detach", sha)
-        if overlay_from and paths:
-            self._git(src, "checkout", "--quiet", overlay_from, "--", *paths)
+        for commit, paths in take:
+            if not paths:
+                continue
+            listed = self._git(src, "ls-tree", "-r", "-z", "--name-only", commit, "--", *paths)
+            there = set(filter(None, listed.split("\0")))
+            present = [p for p in paths if p in there]
+            absent = [p for p in paths if p not in there]
+            if present:
+                self._git(src, "checkout", "--quiet", commit, "--", *present)
+            if absent:
+                self._git(src, "rm", "-q", "-f", "--ignore-unmatch", "--", *absent)
         return src
+
+    def tree_paths(self, repo: str, sha: str) -> set[str]:
+        """Every file path at `sha` in the vault."""
+        if not SHA.match(sha):
+            raise WorkspaceError("bad sha")
+        out = self._git(self.vault(repo), "ls-tree", "-r", "-z", "--name-only", sha)
+        return set(filter(None, out.split("\0")))
 
     def head_sha(self, repo: str, branch: str) -> str:
         """The tip of `branch` in a freshly fetched mirror."""

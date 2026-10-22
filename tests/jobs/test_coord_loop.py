@@ -48,12 +48,14 @@ The feature map and the runbook both describe the rate limit.
 - Changing the limit.
 
 ## Acceptance criteria
-- AC1: the feature map names the rate limit. test: `grep -q 'rate limit' docs/feature-map.md`
-- AC2: the runbook says how to change it. test: `grep -q 'RATE_LIMIT' docs/runbook.md`
+- AC1: the feature map names the rate limit. test: `pytest -q tests/test_feature_map.py`
+- AC2: the runbook says how to change it. test: `pytest -q tests/test_runbook.py`
 
 ## Files in scope
 - `docs/feature-map.md`
 - `docs/runbook.md`
+- `tests/test_feature_map.py`
+- `tests/test_runbook.py`
 
 ## Files out of scope
 - `src/**`
@@ -62,7 +64,7 @@ The feature map and the runbook both describe the rate limit.
 none
 
 ## Interfaces
-- None shared: each worker edits only its own file (`docs/feature-map.md` or `docs/runbook.md`).
+- None shared: each worker edits only its own doc and test (`docs/feature-map.md` and `tests/test_feature_map.py`, or `docs/runbook.md` and `tests/test_runbook.py`).
 
 ## Risks
 - None.
@@ -81,9 +83,9 @@ def plan(job: str) -> str:
             "value": 3,
             "risk": 1,
             "size": "XS",
-            "test_cmd": "grep -q 'rate limit' docs/feature-map.md",
+            "test_cmd": "pytest -q tests/test_feature_map.py",
             "done_when": "AC1 holds",
-            "files_in_scope": ["docs/feature-map.md"],
+            "files_in_scope": ["docs/feature-map.md", "tests/test_feature_map.py"],
             "labels": ["docs"],
         },
         {
@@ -93,9 +95,9 @@ def plan(job: str) -> str:
             "value": 3,
             "risk": 1,
             "size": "XS",
-            "test_cmd": "grep -q 'RATE_LIMIT' docs/runbook.md",
+            "test_cmd": "pytest -q tests/test_runbook.py",
             "done_when": "AC2 holds",
-            "files_in_scope": ["docs/runbook.md"],
+            "files_in_scope": ["docs/runbook.md", "tests/test_runbook.py"],
             "labels": ["docs"],
         },
     ]
@@ -114,6 +116,26 @@ EDITS = {
     "docs/feature-map.md": "# Feature map\n\n| rate limit | 10 req/min |\n",
     "docs/runbook.md": "# Runbook\n\nSet RATE_LIMIT in the env to change the limit.\n",
 }
+TESTS = {
+    "docs/feature-map.md": (
+        "tests/test_feature_map.py",
+        "from pathlib import Path\n\n\ndef test_rate_limit():\n"
+        "    assert 'rate limit' in Path('docs/feature-map.md').read_text()\n",
+    ),
+    "docs/runbook.md": (
+        "tests/test_runbook.py",
+        "from pathlib import Path\n\n\ndef test_rate_limit_var():\n"
+        "    assert 'RATE_LIMIT' in Path('docs/runbook.md').read_text()\n",
+    ),
+}
+
+
+def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
+    """A worker's change: its test first, then (if honest) the doc it checks."""
+    test, text = TESTS[doc]
+    (clone / test).parent.mkdir(parents=True, exist_ok=True)
+    (clone / test).write_text(text)
+    (clone / doc).write_text(EDITS[doc] if honest else "nothing relevant\n")
 
 
 @dataclass
@@ -169,7 +191,7 @@ class StandIn:
                 self.worker_edit(spec, task)
             else:
                 f = task["spec"]["files_in_scope"][0]
-                (spec.clone / f).write_text(EDITS[f])
+                _work(spec.clone, f)
             d = spec.clone / ".vigil" / spec.job_id / spec.task_id  # type: ignore[operator]
             d.mkdir(parents=True, exist_ok=True)
             if not (d / "ask_coord.json").exists():
@@ -265,7 +287,7 @@ def world(
         dev_dockerfile="images/dev/vigil.Dockerfile",
         dev_lockfiles=["README.md"],
         dev_suites={"smoke": "true"},
-        dev_image_tools=["git", "grep"],
+        dev_image_tools=["git", "grep", "pytest"],
     )
     store = Store.open(":memory:")
     budget = Budget(store, cfg.budgets)
@@ -338,8 +360,8 @@ def test_end_to_end(world: World) -> None:
     assert [x["task_id"] for x in item["body"]["workers"]] == [f"{job}-w1", f"{job}-w2"]
     # the owner sees the exact command the verifier will run (round 2, N2)
     assert [x["test_cmd"] for x in item["body"]["workers"]] == [
-        "grep -q 'rate limit' docs/feature-map.md",
-        "grep -q 'RATE_LIMIT' docs/runbook.md",
+        "pytest -q tests/test_feature_map.py",
+        "pytest -q tests/test_runbook.py",
     ]
     assert all(x["must_fail_first"] for x in item["body"]["workers"])
     assert w.store.get_job(job).state.value == "spec_pending"
@@ -378,7 +400,7 @@ def test_end_to_end(world: World) -> None:
 
 def test_coord_revises_after_a_gate_failure(world: World) -> None:
     w = world
-    bad = SPEC.replace(" test: `grep -q 'RATE_LIMIT' docs/runbook.md`", "")
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
     w.standin.coord_drafts = [lambda j: (bad, plan(j))]
     job = _request(w)
     assert [c[0] for c in w.standin.calls] == ["coord", "coord"]
@@ -388,7 +410,7 @@ def test_coord_revises_after_a_gate_failure(world: World) -> None:
 
 def test_coord_pages_the_owner_after_three_failed_drafts(world: World) -> None:
     w = world
-    bad = SPEC.replace(" test: `grep -q 'RATE_LIMIT' docs/runbook.md`", "")
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
     w.standin.coord_drafts = [lambda j: (bad, plan(j))] * 3
     job = _request(w)
     inbox = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
@@ -451,7 +473,7 @@ def test_ask_coord_files_a_question(world: World) -> None:
             (d / "ask_coord.json").write_text(json.dumps({"question": "Which env var name?"}))
         else:
             f = task["spec"]["files_in_scope"][0]
-            (spec.clone / f).write_text(EDITS[f])
+            _work(spec.clone, f)
 
     w.standin.worker_edit = ask
     job = _approve(w)
@@ -468,7 +490,7 @@ def test_out_of_scope_worker_is_not_published(world: World) -> None:
 
     def sneaky(spec: SessionSpec, task: dict[str, Any]) -> None:
         f = task["spec"]["files_in_scope"][0]
-        (spec.clone / f).write_text(EDITS[f])
+        _work(spec.clone, f)
         (spec.clone / "README.md").write_text("sneaky\n")
 
     w.standin.worker_edit = sneaky
@@ -507,7 +529,7 @@ def test_the_reports_test_claims_are_ignored(world: World) -> None:  # round 2, 
 
     def lie(spec: SessionSpec, task: dict[str, Any]) -> None:
         f = task["spec"]["files_in_scope"][0]
-        (spec.clone / f).write_text("nothing relevant\n")
+        _work(spec.clone, f, honest=False)
 
     w.standin.worker_edit = lie
     job = _approve(w)
@@ -553,7 +575,7 @@ def test_hook_forgery_and_a_fifo_record_change_no_verdict(
         os.mkfifo(out / "harness_tests.json")
         f = task["spec"]["files_in_scope"][0]
         honest = bool(spec.task_id and spec.task_id.endswith("w1"))
-        (spec.clone / f).write_text(EDITS[f] if honest else "nothing relevant\n")
+        _work(spec.clone, f, honest=honest)
 
     w.standin.worker_edit = hostile
     done = threading.Event()
@@ -595,7 +617,7 @@ def test_each_coord_draft_is_its_own_session_and_books_once(world: World) -> Non
     from vigild.metering.prices import PriceTable
 
     w = world
-    bad = SPEC.replace(" test: `grep -q 'RATE_LIMIT' docs/runbook.md`", "")
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
     w.standin.coord_drafts = [lambda j: (bad, plan(j))]
     prices = PriceTable(w.runner.cfg.prices)
 
@@ -628,15 +650,17 @@ def test_dependents_of_a_failed_worker_wait_and_the_job_blocks(world: World) -> 
 
     def chained(j: str) -> tuple[str, str]:
         p = plan(j).replace(
-            '"files_in_scope": [\n    "docs/runbook.md"\n   ],',
-            '"files_in_scope": [\n    "docs/runbook.md"\n   ],\n   "depends_on": ["' + j + '-w1"],',
+            '"files_in_scope": [\n    "docs/runbook.md",\n    "tests/test_runbook.py"\n   ],',
+            '"files_in_scope": [\n    "docs/runbook.md",\n    "tests/test_runbook.py"\n   ],\n   "depends_on": ["'
+            + j
+            + '-w1"],',
         )
         assert "depends_on" in p
         return SPEC, p
 
     def fail_w1(spec: SessionSpec, task: dict[str, Any]) -> None:
         f = task["spec"]["files_in_scope"][0]
-        (spec.clone / f).write_text(EDITS[f])
+        _work(spec.clone, f)
         if spec.task_id and spec.task_id.endswith("w1"):
             (spec.clone / "README.md").write_text("out of scope\n")
 
@@ -780,7 +804,7 @@ def _flaky(fail_first: set[str]) -> Callable[[SessionSpec, dict[str, Any]], None
         tid = str(spec.task_id)
         tries[tid] = tries.get(tid, 0) + 1
         f = task["spec"]["files_in_scope"][0]
-        (spec.clone / f).write_text(EDITS[f])
+        _work(spec.clone, f)
         if tries[tid] == 1 and tid[-2:] in fail_first:
             (spec.clone / "README.md").write_text("out of scope\n")
 
@@ -892,7 +916,7 @@ def test_every_worker_failure_blocks_with_actions(world: World, cause: str) -> N
 
     def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
         f = task["spec"]["files_in_scope"][0]
-        (spec.clone / f).write_text(EDITS[f])
+        _work(spec.clone, f)
         if cause == "ask_coord" and str(spec.task_id).endswith("w1"):
             d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
             d.mkdir(parents=True, exist_ok=True)

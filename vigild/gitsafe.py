@@ -43,6 +43,7 @@ def git_env(token: str | None = None) -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LITERAL_PATHSPECS": "1",  # a path is a path, never a pattern (round 3, F8)
             "GIT_ASKPASS": "/usr/bin/false",
         }
     )

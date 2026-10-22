@@ -60,8 +60,8 @@ Document the limit.
 - Changing the limit.
 
 ## Acceptance criteria
-- AC1: the feature map lists the limit. test: `grep -q 'rate limit' docs/feature-map.md`
-- AC2: the runbook says how to change it. test: `grep -q 'RATE_LIMIT' docs/runbook.md`
+- AC1: the feature map lists the limit. test: `pytest -q tests/test_feature_map.py`
+- AC2: the runbook says how to change it. test: `pytest -q tests/test_runbook.py`
 
 ## Files in scope
 - `docs/feature-map.md`
@@ -93,10 +93,10 @@ PLAN = """<!-- provenance: claude -->
 ```json
 {"workers": [
   {"task_id": "pa-0001-w1", "goal": "feature map row", "why": "AC1", "value": 3, "risk": 1,
-   "size": "XS", "test_cmd": "grep -q 'rate limit' docs/feature-map.md",
+   "size": "XS", "test_cmd": "pytest -q tests/test_feature_map.py",
    "done_when": "AC1 holds", "files_in_scope": ["docs/feature-map.md"], "must_fail_first": true},
   {"task_id": "pa-0001-w2", "goal": "runbook section", "why": "AC2", "value": 3, "risk": 1,
-   "size": "XS", "test_cmd": "grep -q 'RATE_LIMIT' docs/runbook.md",
+   "size": "XS", "test_cmd": "pytest -q tests/test_runbook.py",
    "done_when": "AC2 holds", "files_in_scope": ["docs/runbook.md"], "must_fail_first": true}
 ],
  "verify": [
@@ -112,7 +112,7 @@ def test_valid_spec_and_plan_pass() -> None:
 
 
 def test_criterion_without_a_test_command_fails() -> None:
-    spec = SPEC.replace(" test: `grep -q 'RATE_LIMIT' docs/runbook.md`", "")
+    spec = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
     errors = check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
     assert any("AC2" in e and "test" in e for e in errors)
 
@@ -125,8 +125,8 @@ def test_missing_section_fails() -> None:
 
 def test_invalid_worker_contract_fails() -> None:
     plan = PLAN.replace(
-        '"value": 3, "risk": 1,\n   "size": "XS", "test_cmd": "grep -q \'RATE',
-        '"value": 9, "risk": 1,\n   "size": "XS", "test_cmd": "grep -q \'RATE',
+        '"value": 3, "risk": 1,\n   "size": "XS", "test_cmd": "pytest -q tests/test_runbook',
+        '"value": 9, "risk": 1,\n   "size": "XS", "test_cmd": "pytest -q tests/test_runbook',
     )
     errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
     assert any("pa-0001-w2" in e for e in errors)
@@ -310,7 +310,7 @@ def test_interfaces_must_name_something() -> None:  # nit
 
 def test_a_test_cmd_the_dev_image_cannot_run_fails() -> None:  # blocker 4
     plan = PLAN.replace(
-        'grep -q \'RATE_LIMIT\' docs/runbook.md",\n   "done_when"', 'pnpm test",\n   "done_when"'
+        'pytest -q tests/test_runbook.py",\n   "done_when"', 'pnpm test",\n   "done_when"'
     )
     errors = check_job_spec(
         parse_spec(SPEC),
@@ -337,9 +337,26 @@ NO_OPS = [
     "(true)",
     "{ true; }",
     "pytest -q || true",
-    "grep -q x docs/a.md; exit 0",
     "make test || echo failed",
     "TERM=dumb true",
+    # review round 3, F2: the reviewer's always-0 commands
+    "pytest &",
+    "true & pytest",
+    "sh -c true",
+    'bash -c "exit 0"',
+    "bash -c 'pytest -q'",
+    "test 1",
+    "[ 1 ]",
+    "test -f docs/a.md",
+    "/bin/true",
+    "env true",
+    "exit 00",
+    "exit 1",
+    "cat /dev/null",
+    "head -c 0 /dev/zero",
+    "tail -n 1 README.md",
+    "pytest -q || :",
+    "test 1 && echo ok",
 ]
 
 
@@ -348,9 +365,9 @@ def test_a_no_op_test_cmd_is_refused(cmd: str) -> None:
     assert bad_test_cmd(cmd), cmd
     r = check_task(_task(test_cmd=cmd))
     assert not r.ok and any("test_cmd" in e for e in r.errors)
-    plan = PLAN.replace("\"test_cmd\": \"grep -q 'RATE_LIMIT' docs/runbook.md\"",
+    plan = PLAN.replace("\"test_cmd\": \"pytest -q tests/test_runbook.py\"",
                         f'"test_cmd": {json.dumps(cmd)}')  # fmt: skip
-    spec = SPEC.replace("test: `grep -q 'RATE_LIMIT' docs/runbook.md`", f"test: `{cmd}`")
+    spec = SPEC.replace("test: `pytest -q tests/test_runbook.py`", f"test: `{cmd}`")
     errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY)
     assert any("pa-0001-w2" in e and "test_cmd" in e for e in errors), errors
     if cmd.strip():
@@ -360,16 +377,26 @@ def test_a_no_op_test_cmd_is_refused(cmd: str) -> None:
 @pytest.mark.parametrize(
     "cmd",
     [
-        "grep -q 'rate limit' docs/feature-map.md",
+        "pytest -q tests/test_feature_map.py",
         "pytest -q tests/test_a.py",
         "true && pytest -q",
         "echo start; pytest -q",
-        "test -f docs/a.md",
         "sh scripts/check.sh && echo ok",
+        # under `bash -o pipefail -o errexit` these are honest (round 3, F2)
+        "pnpm test 2>&1 | tail -n 50",
+        "pytest | cat",
+        "grep -q x docs/a.md; exit 0",
+        "pnpm -C server test &> /tmp/log && echo done",
     ],
 )
 def test_a_real_test_cmd_passes(cmd: str) -> None:
     assert bad_test_cmd(cmd) is None, cmd
+
+
+def test_the_refusals_say_why() -> None:
+    assert "background" in str(bad_test_cmd("pytest &"))
+    assert "||" in str(bad_test_cmd("pytest || true"))
+    assert "can't fail" in str(bad_test_cmd("/bin/true"))
 
 
 def test_the_worker_contract_refuses_a_blank_test_cmd() -> None:
@@ -382,3 +409,34 @@ def test_the_worker_contract_refuses_a_blank_test_cmd() -> None:
     for bad in ("", "  \n"):
         with pytest.raises(ValidationError):
             WorkerContract.model_validate({**base, "test_cmd": bad})
+
+
+# --- review round 3: the verifier needs a test report; say so at the gate -----------------
+
+
+@pytest.mark.parametrize("cmd", ["grep -q x docs/a.md", "sh scripts/check.sh", "make check"])
+def test_a_test_cmd_no_runner_reports_on_is_refused(cmd: str) -> None:
+    r = check_task(_task(test_cmd=cmd))
+    assert not r.ok and any("test runner" in e for e in r.errors), r.errors
+    plan = PLAN.replace('"test_cmd": "pytest -q tests/test_runbook.py"', f'"test_cmd": "{cmd}"')
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("pa-0001-w2" in e and "test runner" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pytest -q tests",
+        "uv run pytest -q",
+        "python -m pytest tests/test_a.py",
+        "pnpm -C server test",
+        "npm test",
+        "npx vitest run test/a.test.ts",
+        "pnpm -C server exec vitest run",
+        "cd server && pnpm test 2>&1 | tail -n 50",
+    ],
+)
+def test_a_reporting_runner_is_accepted(cmd: str) -> None:
+    from vigild.verifier import can_report
+
+    assert can_report(cmd), cmd

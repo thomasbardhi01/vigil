@@ -15,13 +15,14 @@ the ones the path rules find.
 from __future__ import annotations
 
 import re
-import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
+from vigild.shellwords import Command, parse
+from vigild.verifier import can_report
 
 
 @dataclass(frozen=True)
@@ -31,45 +32,55 @@ class GateResult:
     errors: list[str] = field(default_factory=list)
 
 
-LIST_OPS = re.compile(r"(&&|\|\||;|\||\n)")
-ALWAYS_ZERO = {"true", ":", "echo", "printf"}
+# Commands that can't be a test on their own: they exit 0 (or a fixed code)
+# whatever the code does, or hide the real command from the gate.
+NO_OP = {"true", ":", "echo", "printf", "exit", "test", "[", "cat", "head", "tail"}
+SHELLS = {"sh", "bash", "dash", "zsh"}
 
 
-def _words(segment: str) -> list[str]:
-    seg = segment.strip().strip("(){} \t")
-    try:
-        words = shlex.split(seg)
-    except ValueError:
-        words = seg.split()
-    return [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
-
-
-def _always_zero(words: list[str]) -> bool:
-    if not words:
+def _trivial(c: Command) -> bool:
+    if not c.words:
         return True
-    return words[0] in ALWAYS_ZERO or words == ["exit", "0"]
+    if c.program in SHELLS and "-c" in c.args:
+        return True
+    return c.program in NO_OP
 
 
 def bad_test_cmd(cmd: str | None) -> str | None:
-    """Why a test_cmd can't be a test, or None (review round 2, N2): it's
-    empty, every part of it is a no-op (`true`, `:`, `exit 0`, `echo ...`),
-    or it ends in a no-op after `;`, `||` or `|`, so it exits 0 whatever ran
-    before. vigild runs test_cmd to decide; one that can't fail decides nothing."""
+    """Why a test_cmd can't be a test, or None (review rounds 2 and 3, N2/F2).
+
+    The verifier runs test_cmd under `bash -o pipefail -o errexit -c`, so a
+    failure anywhere in a pipe or a list fails the run. What's left to refuse:
+    `&` (the test runs in the background and the line exits 0), `||` (a
+    failure is caught: `|| true` and its relatives), and a line whose every
+    command can't fail on the code's account: `true`, `:`, `echo`, `printf`,
+    `exit <n>`, `test`/`[ … ]`, `cat`/`head`/`tail`, `/bin/true`, `env true`,
+    or a `sh -c`/`bash -c` that hides the real command from this check."""
     if not (cmd or "").strip():
         return "test_cmd is empty"
     assert cmd is not None
-    parts = LIST_OPS.split(cmd)
-    segments, ops = parts[0::2], parts[1::2]
-    words = [_words(seg) for seg in segments]
-    if all(_always_zero(w) or w == ["exit"] for w in words):
-        return f"test_cmd `{cmd.strip()}` can't fail: it's a no-op"
-    # drop empty trailing segments (a trailing `;` or newline)
-    while len(words) > 1 and not words[-1]:
-        words.pop()
-        ops.pop()
-    if ops and ops[-1] in (";", "||", "|", "\n") and _always_zero(words[-1]):
-        tail = f"{ops[-1].strip() or 'newline'} {' '.join(words[-1])}"
-        return f"test_cmd `{cmd.strip()}` always exits 0: it ends in `{tail}`"
+    line = parse(cmd)
+    shown = cmd.strip()
+    if "&" in line.ops:
+        return f"test_cmd `{shown}` runs something in the background (`&`), so it exits 0"
+    if "||" in line.ops:
+        return f"test_cmd `{shown}` catches a failure with `||`; a test must fail when it fails"
+    if all(_trivial(c) for c in line.commands):
+        return f"test_cmd `{shown}` can't fail on the code's account: it's a no-op"
+    return None
+
+
+def test_cmd_problem(cmd: str | None) -> str | None:
+    """bad_test_cmd, plus: the verifier decides by a test report (owner
+    direction, round 3), so a line that runs no test runner it can read
+    (pytest, vitest, or a package script) is refused here, before any spend."""
+    if why := bad_test_cmd(cmd):
+        return why
+    if not can_report(str(cmd)):
+        return (
+            f"test_cmd `{str(cmd).strip()}` runs no test runner vigil can read (pytest, vitest, "
+            "or a package script that runs one); write the check as a test"
+        )
     return None
 
 
@@ -79,7 +90,7 @@ def check_task(task: Task) -> GateResult:
         for key in ("test_cmd", "done_when")
         if not (getattr(task.spec, key) or "").strip()
     ]
-    if (task.spec.test_cmd or "").strip() and (why := bad_test_cmd(task.spec.test_cmd)):
+    if (task.spec.test_cmd or "").strip() and (why := test_cmd_problem(task.spec.test_cmd)):
         errors.append(why)
     return GateResult(ok=not errors, needs_spec=bool(errors), errors=errors)
 
@@ -164,7 +175,7 @@ def check_job_spec(
     for c in spec.criteria:
         if not c.test_cmd:
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
-        elif why := bad_test_cmd(c.test_cmd):
+        elif why := test_cmd_problem(c.test_cmd):
             errors.append(f"spec.md {c.ident}: {why}")
 
     errors.extend(plan.errors)
@@ -174,7 +185,7 @@ def check_job_spec(
     for dup in sorted({i for i in ids if ids.count(i) > 1}):
         errors.append(f"plan.md repeats worker {dup}")
     for w in plan.workers:
-        if why := bad_test_cmd(w.test_cmd):
+        if why := test_cmd_problem(w.test_cmd):
             errors.append(f"worker {w.task_id}: {why}")
         for dep in w.depends_on:
             if dep not in ids:

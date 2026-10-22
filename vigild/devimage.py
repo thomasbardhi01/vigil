@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +38,7 @@ from typing import Any, Protocol
 
 from vigild.config import CONFIG_DIR, Config
 from vigild.db import Store, iso, utcnow
+from vigild.shellwords import programs
 from vigild.verifier import RunResult, TestRunner, outcome
 
 ROOT = CONFIG_DIR.parent
@@ -52,22 +52,12 @@ class StaleDevImage(RuntimeError):
     pass
 
 
-SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
 SHELL_BUILTINS = {"cd", "true", "false", "test", "[", "echo", "exit", "export", "set"}
 
 
 def tools_in(test_cmd: str) -> list[str]:
-    """The command each segment of a shell line starts with, env assignments skipped."""
-    tools: list[str] = []
-    for seg in SEPARATORS.split(test_cmd):
-        try:
-            words = shlex.split(seg)
-        except ValueError:
-            words = seg.split()
-        words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
-        if words and words[0] not in tools:
-            tools.append(words[0])
-    return tools
+    """The program each command in a shell line runs (the one parser, F8)."""
+    return programs(test_cmd)
 
 
 def missing_tools(cfg: Config, repo: str, test_cmd: str | None) -> list[str]:
@@ -95,8 +85,7 @@ class Sources(Protocol):
         name: str,
         sha: str,
         *,
-        overlay_from: str | None = None,
-        paths: list[str] | tuple[str, ...] = (),
+        take: list[tuple[str, list[str]]] | None = None,
         source: str = "vault",
     ) -> Path: ...
 
