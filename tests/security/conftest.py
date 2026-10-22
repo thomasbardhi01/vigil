@@ -38,9 +38,34 @@ def runtime(cfg: Config) -> DockerRuntime:
     return DockerRuntime(cfg, client)
 
 
+LAYERED = ("parkagent", "vigil")
+
+
+def _latest_session_image(name: str) -> str:
+    """The newest `vigil-session/<name>:*` image vigild (or `vigil dev-image`) built."""
+    client = _docker()
+    tags = [
+        (img.attrs.get("Created", ""), t)
+        for img in client.images.list(name=f"vigil-session/{name}")  # type: ignore[attr-defined]
+        for t in img.tags
+    ]
+    if not tags:
+        pytest.fail(f"no vigil-session/{name} image: run `vigil dev-image --repo .../{name}`")
+    return sorted(tags)[-1][1]
+
+
+@pytest.fixture(params=["generic", *LAYERED])
+def executor_image(request: pytest.FixtureRequest, cfg: Config) -> str:
+    """Owner direction, round 3: the threat rows run against the generic
+    executor image and against the layered ParkAgent and vigil session images."""
+    if request.param == "generic":
+        return cfg.vigild.images.claude_executor
+    return _latest_session_image(request.param)
+
+
 @pytest.fixture
 def make_spec(
-    tmp_path: Path, fixture_repo: dict[str, Path], cfg: Config
+    tmp_path: Path, fixture_repo: dict[str, Path], cfg: Config, executor_image: str
 ) -> Callable[..., SessionSpec]:
     # Docker Desktop shares /private; keep paths short for socket limits.
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
@@ -77,6 +102,7 @@ def make_spec(
             max_budget_usd=0.05,
             mounts=ws.overlays(clone),
             packet="(probe)",
+            image=executor_image,
         )
 
     yield make

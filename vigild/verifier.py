@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable
@@ -168,24 +169,44 @@ def can_report(test_cmd: str) -> bool:
     return False
 
 
+def _dir_option(c: Command) -> str:
+    args = list(c.args)
+    for flag in ("-C", "--dir", "--prefix"):
+        if flag in args and args.index(flag) + 1 < len(args):
+            return f"{flag} {shlex.quote(args[args.index(flag) + 1])} "
+    return ""
+
+
 def with_reports(test_cmd: str, read: ReadFile | None = None) -> str:
-    """Ask each vitest run for a JUnit report too: a direct `vitest run`, or a
-    package script that runs vitest (pnpm and npm pass the extra arguments on).
+    """Ask each vitest run for a JUnit report too. A direct `vitest run` gets
+    the flags appended. A pnpm script that ends in vitest runs as
+    `pnpm exec bash -c '<the base's script> <flags>'`, since pnpm reads
+    `--reporter` as its own option; npm passes arguments after `--` on.
     pytest gets its report through PYTEST_ADDOPTS in the container's environment."""
     out, pos, n = [], 0, 0
     for c in parse(test_cmd).commands:
         direct = c.program == "vitest" or ("vitest" in c.args and "run" in c.args)
         script = _package_script(c, read) if read and c.program in PACKAGE_MANAGERS else ""
-        if direct or "vitest" in script:
-            n += 1
-            sep = " --" if c.program == "npm" else ""
-            extra = (
-                f"{sep} --reporter=default --reporter=junit"
-                f" --outputFile.junit={REPORT_DIR}/vitest-{n}.xml"
-            )
-            end = c.start + len(c.text.rstrip())
-            out.append(test_cmd[pos:end] + extra)
-            pos = end
+        last = parse(script).commands[-1] if script.strip() else None
+        via_script = last is not None and (
+            last.program == "vitest" or ("vitest" in last.args and "run" in last.args)
+        )
+        if not (direct or via_script):
+            continue
+        n += 1
+        flags = (
+            f" --reporter=default --reporter=junit --outputFile.junit={REPORT_DIR}/vitest-{n}.xml"
+        )
+        end = c.start + len(c.text.rstrip())
+        if direct:
+            out.append(test_cmd[pos:end] + flags)
+        elif c.program == "pnpm":
+            inner = shlex.quote(script + flags)
+            run = f"pnpm {_dir_option(c)}exec bash -o pipefail -o errexit -c {inner}"
+            out.append(test_cmd[pos : c.start] + c.text[: len(c.text) - len(c.text.lstrip())] + run)
+        else:  # npm and yarn pass extra arguments to the script
+            out.append(test_cmd[pos:end] + (" --" if c.program == "npm" else "") + flags)
+        pos = end
     out.append(test_cmd[pos:])
     return "".join(out)
 

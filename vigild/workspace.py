@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import shutil
 import threading
 from collections.abc import Callable, Iterator
@@ -250,9 +251,9 @@ class Workspace:
         if source not in ("vault", "mirror"):
             raise WorkspaceError(f"bad source {source!r}")
         origin = self.vault(repo) if source == "vault" else self._mirror_path(repo)
-        root = self.data_dir / "verify" / name
-        if root.exists():
-            shutil.rmtree(root)
+        # a new directory every time: Docker Desktop's file sharing can refuse a
+        # bind mount of a path that was just removed and made again
+        root = self.data_dir / "verify" / f"{name}-{secrets.token_hex(4)}"
         src = root / "src"
         src.parent.mkdir(parents=True)
         self._git(src.parent, "init", "--quiet", str(src))

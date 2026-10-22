@@ -316,10 +316,16 @@ def test_a_runner_with_no_report_is_unknown_at_head(ws: Workspace, tmp_path: Pat
 def test_a_vitest_package_script_is_asked_for_a_report() -> None:
     pkg = {"server/package.json": '{"scripts": {"test": "vitest run"}}'}
     got = with_reports("pnpm -C server test 2>&1 | tail -n 50", pkg.get)
+    # pnpm reads --reporter as its own option, so the base's script runs
+    # through pnpm exec with the flags added
     assert got == (
-        "pnpm -C server test 2>&1 --reporter=default --reporter=junit"
-        " --outputFile.junit=/tmp/vigil-report/vitest-1.xml | tail -n 50"
-    )  # bash takes words after a redirection; the pipe still gets everything
+        "pnpm -C server exec bash -o pipefail -o errexit -c 'vitest run --reporter=default"
+        " --reporter=junit --outputFile.junit=/tmp/vigil-report/vitest-1.xml' | tail -n 50"
+    )
+    pkg2 = {"package.json": '{"scripts": {"test": "prisma generate && vitest run"}}'}
+    assert "prisma generate && vitest run --reporter" in with_reports("pnpm test", pkg2.get)
+    pkg3 = {"package.json": '{"scripts": {"test": "vitest run; echo done"}}'}
+    assert with_reports("pnpm test", pkg3.get) == "pnpm test"  # vitest isn't last: no flags
     assert with_reports("pnpm -C server lint", pkg.get) == "pnpm -C server lint"
     assert "--reporter=junit" in with_reports("npx vitest run test/a.test.ts")
 

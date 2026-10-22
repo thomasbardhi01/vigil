@@ -28,3 +28,8 @@ Rules:
 - Edit nothing outside `.vigil/<job>/`.
 - Do not run git push, open PRs, or call GitHub.
 - If the request is unclear, write the question into spec.md's Risks section; do not guess.
+
+## Test commands
+Every `test_cmd` runs a test runner vigild can read: pytest, vitest, or a
+package script that runs one (`pnpm -C server test`). A shell check (`grep`,
+`test -f`) is refused at the gate: write it as a test. No `&`, no `||`.

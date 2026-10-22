@@ -375,6 +375,16 @@ Role prompts are short, imperative, and never change mid-job. Changing a prompt 
 
 **When to move on.** A stage advances only when its acceptance column is true and the owner has written the artifact. Vigild enforces this in one state machine (`vigild/jobs/fsm.py`) with a test per transition. There is no manual override except yours from the inbox, and that is logged.
 
+**Dependency changes are their own job** (owner direction, 2026-10-22). A worker never adds a dependency: verification runs the base's runner files on images built from the base's lockfiles, so a dependency change can't pass. Instead:
+1. The worker's task blocks with "needs dep <name>@<version>": it reports `needs_deps: [{ecosystem, package, version, why}]` in `worker_report.json`, or vigild reads it from a manifest or lockfile the worker changed. The inbox item shows the requested deps and the worker's manifest and lockfile diff, fenced as untrusted.
+2. vigild opens a child **deps job** (shape `deps`; the blocked task's `blocked_on`) that changes only the manifest and the lockfile. It runs **no model**: vigild runs the package manager's lockfile-only update (`pnpm add <pkg>@<ver> --lockfile-only`, `uv add …`) in a dedicated build container with registry egress and nothing else: no repo secrets, no gateway token, no model. A diff that touches anything but manifests and lockfiles fails the job.
+3. **Pins:** the requested version must be a release at least 14 days old by the registry's publish time, and so must every other package the lockfile pulls in, or the job fails with the list.
+4. **Gates:** the dev image is rebuilt from the new lockfile, the full suite runs offline on base plus the new lockfile, and vigild opens the PR. `deps` starts at rung 1 and always needs your review, like money paths.
+5. After that PR merges, the dev image key changes, and the original task resumes on the new image.
+6. Dependabot-style bumps come in the same way: a scheduled intake, or a Dependabot PR adopted as a deps job.
+
+Phase 1 builds the block, the inbox item and the job link in the state machine (you resume from the inbox); phase 2 the deps job and auto-resume; phase 6 the Dependabot intake.
+
 ## Documentation standard: context baked into every job
 
 The rule: **the repo is the source of truth, every job reads from it through one assembled packet, and every job writes back to it before it closes.** Nothing a job learns lives only in a chat. This follows Anthropic's guidance (curate what the model sees and when; keep `CLAUDE.md` light and about real gotchas; load reference material progressively as a tree, not one giant file; use dedicated skills for verification and review; prefer the model's judgment to long rulebooks) and Cognition's (share full context, keep writes single-threaded, review with a clean context, invest in context engineering rather than prompt tricks).

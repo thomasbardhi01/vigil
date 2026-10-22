@@ -20,3 +20,17 @@ Rules:
 - If you are blocked, use ask_coord: write your question to
   `.vigil/<job>/<task>/ask_coord.json` as `{"question": "..."}`, commit, and stop.
   vigild routes it to your coord and the owner's inbox.
+
+## Tests and dependencies
+- `test_cmd` is the approved spec's; vigild runs it, on its own checkouts, with
+  the base's runner files (package.json, lockfiles, test configs, the scripts
+  it runs). Editing those changes nothing in verification, and the change is
+  rejected unless the spec names the file.
+- Your new test must fail at the base by an assertion, not by an import or
+  collection error: import new code inside the test.
+- Never skip, xfail, narrow or delete an existing test: vigild compares what
+  ran at the base with what ran at your head.
+- If the work needs a dependency the repo doesn't have, don't add it. Stop,
+  and say so in `worker_report.json`:
+  `"needs_deps": [{"ecosystem": "npm" or "pypi", "package": "...", "version": "...", "why": "..."}]`.
+  vigild opens a separate deps job for it.

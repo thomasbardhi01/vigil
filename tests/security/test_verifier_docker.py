@@ -46,8 +46,11 @@ def test_no_network_read_only_source_agent_uid(
         cfg,
         source,
         "id -u; grep CapEff /proc/self/status; pwd; cat ok.txt; "
-        "touch /src/x 2>/dev/null; echo SRC=$?; touch /work/x; echo WORK=$?; "
-        "touch /tmp/x; echo TMP=$?; touch /etc/x 2>/dev/null; echo ROOTFS=$?; "
+        # errexit is on: a probe that may fail goes in an `if`
+        "if touch /src/x 2>/dev/null; then echo SRC=0; else echo SRC=1; fi; "
+        "if touch /work/x; then echo WORK=0; else echo WORK=1; fi; "
+        "if touch /tmp/x; then echo TMP=0; else echo TMP=1; fi; "
+        "if touch /etc/x 2>/dev/null; then echo ROOTFS=0; else echo ROOTFS=1; fi; "
         'python -c "import urllib.request as u\n'
         "try:\n u.urlopen('https://pypi.org/simple/', timeout=5); print('REACHED')\n"
         "except Exception as e:\n print('BLOCKED', type(e).__name__)\"; exit 3",
@@ -75,3 +78,23 @@ def test_output_is_capped_to_its_tail(runner: DockerTestRunner, cfg: Config, sou
 def test_a_hung_test_is_killed(runner: DockerTestRunner, cfg: Config, source: Path) -> None:
     r = _run(runner, cfg, source, "sleep 60", timeout_s=3)
     assert r.timed_out and outcome(r.exit, r.timed_out) == "timeout"
+
+
+def test_pipefail_and_errexit_are_on(runner: DockerTestRunner, cfg: Config, source: Path) -> None:
+    """Round 3, F2: a failure anywhere in a pipe or a list fails the run."""
+    r = _run(runner, cfg, source, "false | cat; echo AFTER")
+    assert r.exit == 1 and "AFTER" not in r.output
+    r = _run(runner, cfg, source, "ls /nope 2>&1 | tail -n 1; echo AFTER")
+    assert r.exit != 0 and "AFTER" not in r.output
+
+
+def test_a_pytest_report_comes_back_over_the_stream(
+    runner: DockerTestRunner, cfg: Config, source: Path
+) -> None:
+    """The generic image has Python but no pytest; vigil's own dev image has
+    both, and the dev-image validation runs pytest there. Here a stand-in
+    writes the report where pytest would."""
+    xml = "<testsuite><testcase classname='tests.test_a' name='test_a'/></testsuite>"
+    r = _run(runner, cfg, source, f'printf %s "{xml}" > /tmp/vigil-report/pytest.xml')
+    assert r.exit == 0 and r.reports == {"pytest.xml": xml.encode()}
+    assert "VIGIL-REPORT" not in r.output
