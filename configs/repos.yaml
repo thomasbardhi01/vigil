@@ -3,6 +3,9 @@
 # repo lists a hosted entry other than jev-cloudflare. The one exception,
 # `anthropic` for thomasbardhi01/vigil (owner, 2026-10-22, Q2), is hard-coded
 # in vigild/repos.py and can't be extended from this file.
+#
+# dev_image: the pinned image a repo's sessions run in, validated nightly by
+# `vigil validate-images`; dispatch is refused when it is stale (vigild/devimage.py).
 repos:
   thomasbardhi01/parkagent:
     visibility: public
@@ -10,9 +13,13 @@ repos:
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
+    dev_image: vigil/claude-executor:2.1.306
+    dev_image_check: "git --version && python --version && node --version && claude --version"
   thomasbardhi01/vigil:
     visibility: private
     decider: [haiku, jev-cloudflare]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
+    dev_image: vigil/claude-executor:2.1.306
+    dev_image_check: "git --version && python --version && claude --version"

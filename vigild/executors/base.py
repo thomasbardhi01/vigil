@@ -30,6 +30,7 @@ class SessionSpec:
     mounts: list[Mount] = field(default_factory=list)
     traceparent: str | None = None
     packet: str = ""
+    image: str | None = None  # the repo's pinned dev image; None means the default executor
 
 
 @dataclass

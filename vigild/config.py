@@ -55,6 +55,8 @@ class RepoPolicy(_M):
     backends: list[str]
     worker_overflow: list[str] = Field(default_factory=list)
     auto_merge: bool = False
+    dev_image: str  # the pinned image this repo's sessions run in
+    dev_image_check: str  # smoke command the nightly validation runs in it
 
 
 class ReposFile(_M):
@@ -135,6 +137,9 @@ class Bind(_M):
     host: str
     port: int
     tailscale_host: str | None = None
+    # The UI session cookie's Secure flag: true only when the UI is reached over
+    # HTTPS (`tailscale serve`); a Secure cookie is never sent over plain HTTP.
+    cookie_secure: bool = False
 
 
 class Images(_M):

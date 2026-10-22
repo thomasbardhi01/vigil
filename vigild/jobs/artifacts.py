@@ -18,7 +18,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from vigild.contract.models import Plan, WorkerContract, WorkerReport
+from vigild.contract.models import CriterionVerify, WorkerContract, WorkerReport
 from vigild.provenance import Provenance, ProvenanceError, require
 
 JOB_ARTIFACTS = {
@@ -30,7 +30,13 @@ JOB_ARTIFACTS = {
     "verify.json",
     "close.md",
 }
-TASK_ARTIFACTS = {"worker_report.json", "review.json", "audit.json", "harness_tests.json"}
+TASK_ARTIFACTS = {
+    "worker_report.json",
+    "review.json",
+    "audit.json",
+    "harness_tests.json",
+    "ask_coord.json",
+}
 NAMES = JOB_ARTIFACTS | TASK_ARTIFACTS
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MD_PROV = re.compile(r"^<!-- provenance: (\w+) -->\n?")
@@ -130,12 +136,14 @@ class SpecDoc:
     files_in_scope: list[str] = field(default_factory=list)
     files_out_of_scope: list[str] = field(default_factory=list)
     money_paths: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
 
 
 @dataclass
 class PlanDoc:
     text: str
     workers: list[WorkerContract] = field(default_factory=list)
+    verify: list[CriterionVerify] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -170,6 +178,7 @@ def parse_spec(text: str) -> SpecDoc:
         ("Money paths", "money_paths"),
     ):
         setattr(doc, attr, [t for item in _items(secs.get(key, "")) for t in TICK.findall(item)])
+    doc.interfaces = _items(secs.get("Interfaces", ""))
     return doc
 
 
@@ -196,7 +205,14 @@ def parse_plan(text: str) -> PlanDoc:
         except ValidationError as e:
             msgs = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
             doc.errors.append(f"worker {tid} does not validate: {msgs}")
-    # Validate the whole document shape too, so the schema is the one source.
-    if not doc.errors:
-        Plan(workers=doc.workers)
+    raw_verify = raw.get("verify")
+    if not isinstance(raw_verify, list) or not raw_verify:
+        doc.errors.append("plan.md must list `verify`: each criterion's level and, at 0, why")
+    else:
+        for i, v in enumerate(raw_verify):
+            try:
+                doc.verify.append(CriterionVerify.model_validate(v))
+            except ValidationError as e:
+                msgs = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
+                doc.errors.append(f"verify entry {i + 1} does not validate: {msgs}")
     return doc

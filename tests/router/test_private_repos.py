@@ -19,7 +19,13 @@ def _load_with(repos: dict[str, Any]) -> Config:
 
 
 def _private(**kw: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {"visibility": "private", "decider": [], "backends": []}
+    base: dict[str, Any] = {
+        "visibility": "private",
+        "decider": [],
+        "backends": [],
+        "dev_image": "img",
+        "dev_image_check": "true",
+    }
     base.update(kw)
     return base
 
@@ -74,6 +80,8 @@ def test_public_repo_may_list_any_hosted_entry() -> None:
                 "visibility": "public",
                 "decider": ["jev-openrouter", "haiku"],
                 "backends": ["openrouter", "claude-opus"],
+                "dev_image": "img",
+                "dev_image_check": "true",
             }
         }
     )

@@ -10,9 +10,17 @@ import dataclasses
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from vigild.api.auth import Scope, require
+from vigild.api.auth import (
+    COOKIE,
+    UI_SESSION_TTL,
+    Scope,
+    create_ui_session,
+    end_ui_session,
+    identify,
+    require,
+)
 from vigild.db import Store
 from vigild.jobs.service import Conflict, JobRequest, NotFound, SubmitError
 from vigild.jobs.tree import job_tree
@@ -50,6 +58,38 @@ def health(request: Request) -> dict[str, Any]:
     except Exception as e:  # pragma: no cover - a broken DB is the point of the check
         db = f"error: {e}"
     return {"ok": db == "ok", "db": db, "degraded": sorted(svc.degraded), "version": "0.1.0"}
+
+
+# --- the web UI's session (P7: no token in the browser) -----------------------------
+
+
+@router.post("/api/login", status_code=204)
+def login(request: Request, body: Annotated[dict[str, Any], Body()]) -> Response:
+    svc = _svc(request)
+    token = body.get("token") if isinstance(body.get("token"), str) else None
+    scope = identify(svc.tokens, f"Bearer {token}") if token else None
+    if scope not in (Scope.ADMIN, Scope.READ):
+        raise HTTPException(401, "invalid token")
+    assert scope is not None
+    resp = Response(status_code=204)
+    resp.set_cookie(
+        COOKIE,
+        create_ui_session(svc.store, scope),
+        max_age=int(UI_SESSION_TTL.total_seconds()),
+        path="/",
+        httponly=True,
+        samesite="strict",
+        secure=svc.cfg.vigild.api.cookie_secure,
+    )
+    return resp
+
+
+@router.post("/api/logout", status_code=204, dependencies=[READ])
+def logout(request: Request) -> Response:
+    end_ui_session(_svc(request).store, request.cookies.get(COOKIE))
+    resp = Response(status_code=204)
+    resp.delete_cookie(COOKIE, path="/")
+    return resp
 
 
 # --- tasks and jobs ---------------------------------------------------------------

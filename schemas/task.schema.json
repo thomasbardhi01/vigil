@@ -137,12 +137,41 @@
           ],
           "default": null,
           "title": "Test Cmd"
+        },
+        "verify": {
+          "$ref": "#/$defs/Verify"
         }
       },
       "required": [
         "goal"
       ],
       "title": "Spec",
+      "type": "object"
+    },
+    "Verify": {
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "default": 0,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
+        }
+      },
+      "title": "Verify",
       "type": "object"
     }
   },

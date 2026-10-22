@@ -122,10 +122,25 @@ def render_plan(task: Task) -> str:
         "depends_on": [],
         "labels": task.labels,
         "max_cost_usd": task.limits.max_cost_usd,
+        "verify_level": task.spec.verify.level,
     }
     return (
         "# Plan\n\nOne worker, from the submitted contract.\n\n## Workers\n```json\n"
-        + json.dumps({"workers": [worker]}, indent=2)
+        + json.dumps(
+            {
+                "workers": [worker],
+                "verify": [
+                    {
+                        "criterion": "AC1",
+                        "level": task.spec.verify.level,
+                        "why_not_higher": "submitted as a single contract; phase 1 builds level 0"
+                        if task.spec.verify.level == 0
+                        else None,
+                    }
+                ],
+            },
+            indent=2,
+        )
         + "\n```\n"
     )
 

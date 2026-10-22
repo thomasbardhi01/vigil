@@ -81,3 +81,25 @@ def test_claude_md_limits(tmp_path: Path) -> None:
 
 def test_real_repo_claude_md_is_clean() -> None:
     assert cm.check(ROOT) == []
+
+
+ds = _load("check-docs-same-pr.py")
+
+
+def test_flow_change_without_architecture_fails() -> None:
+    errors = ds.check(["vigild/jobs/fsm.py", "tests/jobs/test_fsm.py"])
+    assert errors and "job state machine" in errors[0]
+
+
+def test_flow_change_with_architecture_passes() -> None:
+    assert ds.check(["vigild/gateway/service.py", "docs/architecture.md"]) == []
+
+
+def test_non_flow_change_passes() -> None:
+    assert ds.check(["vigild/decider/questions.py", "README.md"]) == []
+
+
+def test_nested_flow_files_match() -> None:
+    assert ds.touched_flows(["images/claude-executor/Dockerfile"]) == {
+        "isolation and deploy": ["images/claude-executor/Dockerfile"]
+    }

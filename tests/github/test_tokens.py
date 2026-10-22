@@ -66,10 +66,11 @@ def fake() -> FakeGitHub:
 @pytest.fixture
 def app(keypair: tuple[bytes, rsa.RSAPublicKey], fake: FakeGitHub) -> GitHubApp:
     return GitHubApp(
-        "Iv1.testclientid",
+        "123456",
         keypair[0],
         http=httpx2.Client(transport=httpx2.MockTransport(fake)),
         claude_mods=CLAUDE_MODS,
+        allowed_repos=["thomasbardhi01/parkagent", "thomasbardhi01/vigil"],
     )
 
 
@@ -79,7 +80,7 @@ def test_jwt_is_rs256_with_a_short_life(
     token = app.jwt()
     claims = jwt.decode(token, keypair[1], algorithms=["RS256"])
     now = time.time()
-    assert claims["iss"] == "Iv1.testclientid"
+    assert claims["iss"] == "123456"  # the numeric App ID (GITHUB_APP_ID)
     assert now - 70 <= claims["iat"] <= now - 50
     assert claims["exp"] - claims["iat"] <= 600
 
@@ -142,3 +143,29 @@ def test_lease_revokes_on_exit_even_on_error(app: GitHubApp, fake: FakeGitHub) -
 def test_token_repr_never_shows_the_token(app: GitHubApp) -> None:
     tok = app.mint("thomasbardhi01/parkagent", WORKER_PERMISSIONS)
     assert "ghs_" not in repr(tok) and "ghs_" not in str(tok)
+
+
+@pytest.mark.parametrize(
+    "repo", ["thomasbardhi01/hearth", "thomasbardhi01/other", "evil/parkagent"]
+)
+def test_no_token_for_a_repo_outside_repos_yaml(
+    app: GitHubApp, fake: FakeGitHub, repo: str
+) -> None:
+    """The installation covers all eight of the owner's repos; vigild mints only
+    for the ones configs/repos.yaml lists (plus claude-mods, read-only)."""
+    with pytest.raises(TokenPolicyError, match=r"repos\.yaml"):
+        app.mint(repo, WORKER_PERMISSIONS)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("perm", ["issues", "checks", "artifact_metadata"])
+def test_publish_tokens_never_carry_the_apps_other_permissions(perm: str) -> None:
+    """The App holds issues:write, checks:read and artifact_metadata:read too;
+    a publish token is down-scoped to what pushing and opening a PR needs."""
+    assert perm not in WORKER_PERMISSIONS
+
+
+def test_issues_read_is_allowed_for_label_intake(app: GitHubApp, fake: FakeGitHub) -> None:
+    app.mint("thomasbardhi01/parkagent", {"issues": "read", "metadata": "read"})
+    with pytest.raises(TokenPolicyError):
+        app.mint("thomasbardhi01/parkagent", {"issues": "write"})

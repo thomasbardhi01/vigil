@@ -16,4 +16,7 @@ You build one contract on one branch. The contract is the whole task.
 
 Rules:
 - Never merge, approve, push to main, deploy, or read secrets or `.env*` files.
-- If you are blocked, write the question into `open_questions` and stop.
+- Subagents you start are read-only: they search and read, never edit.
+- If you are blocked, use ask_coord: write your question to
+  `.vigil/<job>/<task>/ask_coord.json` as `{"question": "..."}`, commit, and stop.
+  vigild routes it to your coord and the owner's inbox.

@@ -74,7 +74,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
     return {
-        "image": cfg.vigild.images.claude_executor,
+        "image": spec.image or cfg.vigild.images.claude_executor,
         "name": f"vigil-{spec.session_id}",
         "user": f"{uid}:{uid}",
         "network": network,

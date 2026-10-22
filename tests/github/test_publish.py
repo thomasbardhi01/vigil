@@ -1,7 +1,8 @@
-"""Push + open draft PR: one function, so moving it into vigild later (P2) is small."""
+"""vigild publishes from the host (P2): checks, push, draft PR. Workers hold no token."""
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ def test_publish_pushes_the_branch_and_opens_a_draft(
         title="t",
         body="b",
         pulls=pulls,
+        scope=["docs/feature-map.md"],
     )
     assert url == "https://github.com/o/fixture/pull/1"
     assert pulls.prs[0]["draft"] is True and pulls.prs[0]["base"] == "main"
@@ -80,6 +82,7 @@ def test_publish_refuses_anything_but_a_vigil_branch(
             title="t",
             body="b",
             pulls=FakePulls(fixture_repo["bare"]),
+            scope=["docs/feature-map.md"],
         )
 
 
@@ -96,6 +99,7 @@ def test_publish_refuses_when_head_is_not_the_branch(
             title="t",
             body="b",
             pulls=FakePulls(fixture_repo["bare"]),
+            scope=["docs/feature-map.md"],
         )
 
 
@@ -110,6 +114,7 @@ def test_publish_never_falls_back_to_a_non_draft(work: Path, fixture_repo: dict[
             title="t",
             body="b",
             pulls=pulls,
+            scope=["docs/feature-map.md"],
         )
     assert pulls.prs == []
 
@@ -129,4 +134,44 @@ def test_publish_with_nothing_committed_fails(
             title="t",
             body="b",
             pulls=FakePulls(fixture_repo["bare"]),
+            scope=["docs/feature-map.md"],
         )
+
+
+def test_publish_refuses_files_outside_the_scope(work: Path, fixture_repo: dict[str, Path]) -> None:
+    (work / "README.md").write_text("sneaky\n")
+    git(work, "commit", "-qam", "out of scope")
+    pulls = FakePulls(fixture_repo["bare"])
+    with pytest.raises(PublishError, match=r"README\.md"):
+        publish(
+            work,
+            repo="o/fixture",
+            branch="vigil/fx-0001-w1-doc",
+            base="main",
+            title="t",
+            body="b",
+            pulls=pulls,
+            scope=["docs/feature-map.md"],
+        )
+    # nothing was pushed
+    with pytest.raises(subprocess.CalledProcessError):
+        git(fixture_repo["bare"], "rev-parse", "--verify", "refs/heads/vigil/fx-0001-w1-doc")
+    assert pulls.prs == []
+
+
+def test_vigil_artifacts_are_always_in_scope(work: Path, fixture_repo: dict[str, Path]) -> None:
+    (work / ".vigil" / "fx-0001" / "fx-0001-w1").mkdir(parents=True)
+    (work / ".vigil" / "fx-0001" / "fx-0001-w1" / "worker_report.json").write_text("{}")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "report")
+    url = publish(
+        work,
+        repo="o/fixture",
+        branch="vigil/fx-0001-w1-doc",
+        base="main",
+        title="t",
+        body="b",
+        pulls=FakePulls(fixture_repo["bare"]),
+        scope=["docs/feature-map.md"],
+    )
+    assert url.endswith("/pull/1")

@@ -224,3 +224,19 @@ def test_git_log_is_read_from_the_clone(clone: Path) -> None:
     git(clone, "commit", "-qam", "touch the map")
     p = assemble_worker(clone, _contract(), untrusted={})
     assert "touch the map" in p.parts["context_pack"]
+
+
+def test_each_layer_has_its_own_budget(clone: Path) -> None:
+    (clone / "docs" / "architecture.md").write_text(
+        "# Architecture\n"
+        + "\n".join(f"docs/feature-map.md line {i} " + "x" * 80 for i in range(400))
+    )
+    p = assemble_worker(clone, _contract(), untrusted={})
+    # the architecture excerpt blew its layer budget; the files in scope still made it
+    assert any(d.startswith("layer 2") for d in p.dropped)
+    assert "# Feature map" in p.parts["context_pack"]
+
+
+def test_worker_packet_explains_ask_coord(clone: Path) -> None:
+    p = assemble_worker(clone, _contract(), untrusted={})
+    assert ".vigil/fx-0001/fx-0001-w1/ask_coord.json" in p.parts["output_schema"]

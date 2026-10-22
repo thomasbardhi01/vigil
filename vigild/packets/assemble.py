@@ -102,49 +102,65 @@ def _excerpt(doc: str, needles: list[str]) -> str:
     return "\n".join(keep)
 
 
+# Per-layer budgets, in tokens (~4 characters each), from the documentation
+# standard: layer 1 (CLAUDE.md) always goes whole, in part 1.
+LAYER_BUDGET_TOKENS: dict[str, int] = {
+    "layer 6 (parent artifacts, fix jobs)": 6_000,
+    "layer 3 (feature map)": 2_000,
+    "layer 2 (architecture)": 3_000,
+    "files in scope": 15_000,
+    "related tests": 4_000,
+    "history": 500,
+}
+
+
 def _context_pack(
     repo: Path, files: list[str], budget: int, fix_context: dict[str, str] | None
 ) -> tuple[str, list[str]]:
-    items: list[tuple[str, str]] = []
+    items: list[tuple[str, str, str]] = []  # (layer, name, body)
+    l6 = "layer 6 (parent artifacts, fix jobs)"
     if fix_context and fix_context.get("parent_spec"):
-        items.append(("parent spec (fix job)", fix_context["parent_spec"]))
+        items.append((l6, "parent spec (fix job)", fix_context["parent_spec"]))
     if fix_context and fix_context.get("parent_diff"):
-        items.append(("parent diff (fix job)", fix_context["parent_diff"]))
+        items.append((l6, "parent diff (fix job)", fix_context["parent_diff"]))
     needles = files + [Path(f).name for f in files]
-    for doc in ("docs/feature-map.md", "docs/architecture.md"):
+    for layer, doc in (
+        ("layer 3 (feature map)", "docs/feature-map.md"),
+        ("layer 2 (architecture)", "docs/architecture.md"),
+    ):
         text = _read(repo / doc)
         if text and doc not in files:
             ex = _excerpt(text, needles)
             if ex:
-                items.append((f"{doc} (excerpt)", ex))
+                items.append((layer, f"{doc} (excerpt)", ex))
     for f in files:
         if "*" in f:
             continue
         text = _read(repo / f)
-        items.append((f, text if text is not None else "(does not exist yet)"))
+        items.append(("files in scope", f, text if text is not None else "(does not exist yet)"))
         stem = Path(f).stem
-        for t in (
-            sorted((repo / "tests").rglob(f"test_{stem}*.py"))[:3]
-            if (repo / "tests").is_dir()
-            else []
-        ):
+        tests_dir = repo / "tests"
+        for t in sorted(tests_dir.rglob(f"test_{stem}*.py"))[:3] if tests_dir.is_dir() else []:
             rel = str(t.relative_to(repo))
             if rel not in files:
-                items.append((f"{rel} (related test)", t.read_text()))
+                items.append(("related tests", f"{rel} (related test)", t.read_text()))
     log = _git_log(repo, [f for f in files if "*" not in f])
     if log:
-        items.append(("last commits touching these files", log))
+        items.append(("history", "last commits touching these files", log))
 
     out: list[str] = []
     dropped: list[str] = []
     used = 0
-    for name, body in items:
+    per_layer: dict[str, int] = {}
+    for layer, name, body in items:
         block = f"## {name}\n\n```\n{body.rstrip()}\n```"
-        if used + len(block) > budget:
-            dropped.append(f"{name} ({len(body)} chars)")
+        layer_used = per_layer.get(layer, 0)
+        if used + len(block) > budget or layer_used + len(block) > LAYER_BUDGET_TOKENS[layer] * 4:
+            dropped.append(f"{layer}: {name} ({len(body)} chars)")
             continue
         out.append(block)
         used += len(block)
+        per_layer[layer] = layer_used + len(block)
     if dropped:
         out.append("## Dropped for the budget\n\n" + "\n".join(f"- {d}" for d in dropped))
     return "\n\n".join(out), dropped
@@ -187,7 +203,9 @@ def assemble_worker(
     schema = json.dumps(WorkerReport.model_json_schema(), indent=1, sort_keys=True)
     output = (
         f"End by writing `{report.as_posix()}` (relative to the repo root), valid against this "
-        f"schema, with `provenance` set to `claude`. Then commit.\n\n```json\n{schema}\n```"
+        f"schema, with `provenance` set to `claude`. Then commit.\n\n```json\n{schema}\n```\n\n"
+        f"ask_coord: if you are blocked on a question only your coord can answer, write "
+        f'`{report.parent.as_posix()}/ask_coord.json` as {{"question": "..."}}, commit, and stop.'
     )
     self_check = "Answer each in the report's `self_check`:\n" + "\n".join(
         f"{i}. {q}" for i, q in enumerate(SELF_CHECK, start=1)

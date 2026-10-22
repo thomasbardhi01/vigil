@@ -1,5 +1,39 @@
 {
   "$defs": {
+    "CriterionVerify": {
+      "additionalProperties": false,
+      "description": "How high one acceptance criterion's verification reaches, and why not higher.",
+      "properties": {
+        "criterion": {
+          "title": "Criterion",
+          "type": "string"
+        },
+        "level": {
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "why_not_higher": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Why Not Higher"
+        }
+      },
+      "required": [
+        "criterion",
+        "level"
+      ],
+      "title": "CriterionVerify",
+      "type": "object"
+    },
     "Size": {
       "enum": [
         "XS",
@@ -92,6 +126,13 @@
           "title": "Value",
           "type": "integer"
         },
+        "verify_level": {
+          "default": 0,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Verify Level",
+          "type": "integer"
+        },
         "why": {
           "title": "Why",
           "type": "string"
@@ -115,6 +156,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "verify": {
+      "items": {
+        "$ref": "#/$defs/CriterionVerify"
+      },
+      "minItems": 1,
+      "title": "Verify",
+      "type": "array"
+    },
     "workers": {
       "items": {
         "$ref": "#/$defs/WorkerContract"
@@ -124,7 +173,8 @@
     }
   },
   "required": [
-    "workers"
+    "workers",
+    "verify"
   ],
   "title": "Plan",
   "type": "object"

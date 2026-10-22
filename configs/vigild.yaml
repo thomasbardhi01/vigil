@@ -4,6 +4,7 @@ api:
   host: 127.0.0.1
   port: 8787
   tailscale_host: null            # the Mac's 100.x address, to serve the API on the tailnet too
+  cookie_secure: false            # true when the UI is reached through `tailscale serve` (HTTPS)
 gateway:
   host: 127.0.0.1                 # containers reach it as host.docker.internal (configs/egress.yaml)
   port: 8788

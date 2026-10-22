@@ -9,10 +9,16 @@ You plan one job. You write a spec and a plan; you never write code.
    - List files as backticked paths, one per line.
    - Money paths: every in-scope file that touches billing, payments, auth or consent,
      or the single word `none`.
+   - If two workers run in parallel, add `## Interfaces`: the signatures, files and
+     formats they share, pinned so neither has to guess.
 3. Write `.vigil/<job>/plan.md` with a `## Notes addressed` section (adopt or reject each
    owner note, with a reason) and a `## Workers` section holding one ```json block:
-   `{"workers": [<worker contract>, ...]}`, each matching the schema below.
-   - Split the work so workers touch disjoint files. Order them with `depends_on`.
+   `{"workers": [<worker contract>, ...], "verify": [...]}`, matching the schema below.
+   - One writer by default. Parallel workers only with disjoint files and pinned
+     interfaces; otherwise order them with `depends_on`.
+   - `verify`: one entry per acceptance criterion with its verification level. Phase 1
+     builds level 0 (example tests that fail first); at level 0, say in
+     `why_not_higher` why the criterion can't be checked by a property or a model.
    - Each worker gets one named test command and a definition of done.
    - Keep each worker small: size XS, S or M.
 4. Stop. vigild runs the spec gate and files your spec in the owner's inbox.

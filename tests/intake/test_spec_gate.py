@@ -72,6 +72,9 @@ none
 ## Risks
 - Stale numbers.
 
+## Interfaces
+- None shared: each worker edits its own doc file.
+
 ## Rollback
 Revert the PR.
 """
@@ -91,6 +94,10 @@ PLAN = """<!-- provenance: claude -->
   {"task_id": "pa-0001-w2", "goal": "runbook section", "why": "AC2", "value": 3, "risk": 1,
    "size": "XS", "test_cmd": "grep -q 'RATE_LIMIT' docs/runbook.md",
    "done_when": "AC2 holds", "files_in_scope": ["docs/runbook.md"], "must_fail_first": true}
+],
+ "verify": [
+  {"criterion": "AC1", "level": 0, "why_not_higher": "a grep over a doc has no property to state"},
+  {"criterion": "AC2", "level": 0, "why_not_higher": "same"}
 ]}
 ```
 """
@@ -156,3 +163,66 @@ def test_dependency_on_unknown_worker_fails() -> None:
     )
     errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
     assert any("nope" in e for e in errors)
+
+
+# --- owner decisions 2026-10-22: parallel writers and the verification ladder ---
+
+
+def test_parallel_workers_with_overlapping_files_fail() -> None:
+    plan = PLAN.replace(
+        '"files_in_scope": ["docs/runbook.md"]', '"files_in_scope": ["docs/feature-map.md"]'
+    )
+    spec = SPEC.replace("- `docs/runbook.md`\n", "", 1)
+    errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY)
+    assert any("disjoint" in e and "pa-0001-w1" in e and "pa-0001-w2" in e for e in errors)
+
+
+def test_overlapping_workers_are_fine_when_ordered() -> None:
+    plan = PLAN.replace(
+        '"files_in_scope": ["docs/runbook.md"]', '"files_in_scope": ["docs/feature-map.md"]'
+    )
+    plan = plan.replace(
+        '"must_fail_first": true}\n]', '"must_fail_first": true, "depends_on": ["pa-0001-w1"]}\n]'
+    )
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert not any("disjoint" in e for e in errors)
+
+
+def test_parallel_workers_need_pinned_interfaces() -> None:
+    spec = SPEC.replace("## Interfaces\n- None shared: each worker edits its own doc file.\n\n", "")
+    errors = check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
+    assert any("Interfaces" in e for e in errors)
+
+
+def test_a_single_writer_needs_no_interfaces_section() -> None:
+    spec = SPEC.replace("## Interfaces\n- None shared: each worker edits its own doc file.\n\n", "")
+    plan = PLAN.replace(
+        '"must_fail_first": true}\n]', '"must_fail_first": true, "depends_on": ["pa-0001-w1"]}\n]'
+    )
+    assert check_job_spec(parse_spec(spec), parse_plan(plan), MONEY) == []
+
+
+def test_every_criterion_needs_a_verify_entry() -> None:
+    plan = PLAN.replace(',\n  {"criterion": "AC2", "level": 0, "why_not_higher": "same"}', "")
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("AC2" in e and "verify" in e for e in errors)
+
+
+def test_level_zero_must_say_why_not_higher() -> None:
+    plan = PLAN.replace('"why_not_higher": "same"', '"why_not_higher": ""')
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("why_not_higher" in e for e in errors)
+
+
+def test_levels_not_built_yet_are_refused() -> None:
+    plan = PLAN.replace(
+        '{"criterion": "AC2", "level": 0, "why_not_higher": "same"}',
+        '{"criterion": "AC2", "level": 1}',
+    )
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("level 1" in e for e in errors)
+
+
+def test_task_spec_has_a_verify_field_at_level_zero() -> None:
+    t = _task()
+    assert t.spec.verify.level == 0

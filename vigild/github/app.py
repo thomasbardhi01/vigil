@@ -1,7 +1,11 @@
 """The vigil-worker GitHub App (B19): JWT, installation tokens, revoke.
 
-Every token is minted for one repository with down-scoped permissions and
-lives at most one hour; `lease()` revokes it when the session ends.
+The App is installed on all of the owner's repos and holds contents:write,
+pull_requests:write, issues:write, checks:read, metadata:read and
+artifact_metadata:read. vigild mints only for repos configs/repos.yaml lists
+(plus claude-mods, read-only), and every token is down-scoped to its use:
+publishing a branch needs contents:write + pull_requests:write; label intake
+needs issues:read. Tokens live at most one hour; `lease()` revokes them.
 claude-mods tokens are always `{"contents": "read"}`: the App's
 installation there could write (GitHub sets one permission set per App), so
 this module refuses every other request for that repo, whatever the caller
@@ -26,7 +30,13 @@ WORKER_PERMISSIONS: Mapping[str, str] = {
     "metadata": "read",
 }
 READ_ONLY: Mapping[str, str] = {"contents": "read"}
-ALLOWED = {"contents", "pull_requests", "metadata", "issues"}
+# The most each permission may ever be minted at. Nothing else is minted.
+ALLOWED: Mapping[str, set[str]] = {
+    "contents": {"read", "write"},
+    "pull_requests": {"read", "write"},
+    "metadata": {"read"},
+    "issues": {"read"},
+}
 TIMEOUT = 20.0
 
 
@@ -58,15 +68,17 @@ def _norm(repo: str) -> str:
 class GitHubApp:
     def __init__(
         self,
-        client_id: str,
+        app_id: str,
         private_key_pem: bytes,
         *,
         http: httpx2.Client,
         claude_mods: str,
+        allowed_repos: list[str],
         api: str = API,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self.client_id = client_id
+        self.app_id = app_id
+        self.allowed = {_norm(r) for r in allowed_repos}
         self._key = private_key_pem
         self.http = http
         self.claude_mods = _norm(claude_mods)
@@ -75,7 +87,7 @@ class GitHubApp:
 
     def jwt(self) -> str:
         now = int(self.clock())
-        claims = {"iat": now - 60, "exp": now + 9 * 60, "iss": self.client_id}
+        claims = {"iat": now - 60, "exp": now + 9 * 60, "iss": self.app_id}
         return jwt.encode(claims, self._key, algorithm="RS256")
 
     def _app_headers(self) -> dict[str, str]:
@@ -93,11 +105,11 @@ class GitHubApp:
                     f"{repo} tokens are always {dict(READ_ONLY)}; refused {perms}"
                 )
             return
-        bad = set(perms) - ALLOWED
+        if _norm(repo) not in self.allowed:
+            raise TokenPolicyError(f"{repo} is not in configs/repos.yaml; no token minted")
+        bad = {k: v for k, v in perms.items() if v not in ALLOWED.get(k, set())}
         if bad:
-            raise TokenPolicyError(
-                f"refusing permissions {sorted(bad)}; allowed: {sorted(ALLOWED)}"
-            )
+            raise TokenPolicyError(f"refusing permissions {bad}; allowed: {dict(ALLOWED)}")
         if not perms:
             raise TokenPolicyError("a token must name its permissions")
 

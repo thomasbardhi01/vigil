@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE TABLE IF NOT EXISTS gateway_tokens (
   token_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL, repo TEXT NOT NULL,
   backend_preset TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT);
+CREATE TABLE IF NOT EXISTS dev_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, image TEXT NOT NULL,
+  image_id TEXT, ok INTEGER NOT NULL, output TEXT NOT NULL, validated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ui_sessions (
+  id_hash TEXT PRIMARY KEY, scope TEXT NOT NULL, created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL, revoked_at TEXT);
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);

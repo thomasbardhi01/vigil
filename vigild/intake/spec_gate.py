@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from vigild.contract.models import Task
+from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import matches, matches_any
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
 
@@ -37,6 +37,36 @@ def check_task(task: Task) -> GateResult:
 
 def _in_scope(path: str, scope: Sequence[str]) -> bool:
     return any(path == s or matches(path, s) for s in scope)
+
+
+def _overlap(a: str, b: str) -> bool:
+    return a == b or matches(a, b) or matches(b, a)
+
+
+def _ordered(workers: list[WorkerContract]) -> set[tuple[str, str]]:
+    """Pairs (x, y) where y runs after x, through any chain of depends_on."""
+    deps = {w.task_id: set(w.depends_on) for w in workers}
+    after: set[tuple[str, str]] = set()
+    for w in workers:
+        stack, seen = list(deps[w.task_id]), set()
+        while stack:
+            d = stack.pop()
+            if d in seen or d not in deps:
+                continue
+            seen.add(d)
+            after.add((d, w.task_id))
+            stack.extend(deps[d])
+    return after
+
+
+def parallel_pairs(workers: list[WorkerContract]) -> list[tuple[WorkerContract, WorkerContract]]:
+    order = _ordered(workers)
+    return [
+        (a, b)
+        for i, a in enumerate(workers)
+        for b in workers[i + 1 :]
+        if (a.task_id, b.task_id) not in order and (b.task_id, a.task_id) not in order
+    ]
 
 
 def check_job_spec(spec: SpecDoc, plan: PlanDoc, money_globs: Sequence[str]) -> list[str]:
@@ -63,6 +93,28 @@ def check_job_spec(spec: SpecDoc, plan: PlanDoc, money_globs: Sequence[str]) -> 
         for f in w.files_in_scope:
             if not _in_scope(f, spec.files_in_scope):
                 errors.append(f"worker {w.task_id} scope {f} is outside spec.md's files in scope")
+
+    # Single writer by default; parallel writers only with disjoint files and
+    # interfaces pinned in spec.md (owner decisions 2026-10-22).
+    pairs = parallel_pairs(plan.workers)
+    for a, b in pairs:
+        shared = sorted({f for f in a.files_in_scope for g in b.files_in_scope if _overlap(f, g)})
+        if shared:
+            errors.append(
+                f"workers {a.task_id} and {b.task_id} run in parallel but their files are not "
+                f"disjoint: {shared}; order them with depends_on or split the files"
+            )
+    if pairs and not spec.interfaces:
+        errors.append("parallel workers need their shared interfaces pinned in '## Interfaces'")
+
+    # The verification ladder: every criterion's level, and why not higher at 0.
+    levels = {v.criterion: v for v in plan.verify}
+    for c in spec.criteria:
+        if c.ident not in levels and not plan.errors:
+            errors.append(f"plan.md has no verify entry for {c.ident}")
+    for v in plan.verify:
+        if v.level not in BUILT_VERIFY_LEVELS:
+            errors.append(f"{v.criterion}: verify level {v.level} isn't built yet (phase 1: 0)")
 
     in_scope = set(spec.files_in_scope) | {f for w in plan.workers for f in w.files_in_scope}
     found = {f for f in in_scope if matches_any(f, money_globs)}

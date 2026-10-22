@@ -10,7 +10,7 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vigild.provenance import Provenance
 
@@ -44,6 +44,17 @@ class Backend(Strict):
         return v
 
 
+# The verification ladder (owner decisions 2026-10-22). Level 0: example tests
+# that fail first. Level 1 (phase 2): properties derived from the criteria.
+# Level 3 (after phase 2): models of state machines. 2, 4, 5: later options.
+BUILT_VERIFY_LEVELS = frozenset({0})
+
+
+class Verify(Strict):
+    level: int = Field(default=0, ge=0, le=5)
+    method: str | None = None
+
+
 class Spec(Strict):
     goal: str
     test_cmd: str | None = None
@@ -51,6 +62,7 @@ class Spec(Strict):
     files_in_scope: list[str] = Field(default_factory=list)
     done_when: str | None = None
     out_of_scope: list[str] = Field(default_factory=list)
+    verify: Verify = Field(default_factory=Verify)
 
 
 class Limits(Strict):
@@ -189,10 +201,26 @@ class WorkerContract(Strict):
     depends_on: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    verify_level: int = Field(default=0, ge=0, le=5)
+
+
+class CriterionVerify(Strict):
+    """How high one acceptance criterion's verification reaches, and why not higher."""
+
+    criterion: str
+    level: int = Field(ge=0, le=5)
+    why_not_higher: str | None = None
+
+    @model_validator(mode="after")
+    def _say_why(self) -> CriterionVerify:
+        if self.level == 0 and not (self.why_not_higher or "").strip():
+            raise ValueError(f"{self.criterion}: why_not_higher is required at level 0")
+        return self
 
 
 class Plan(Strict):
     workers: list[WorkerContract]
+    verify: list[CriterionVerify] = Field(min_length=1)
 
 
 Verdict = Literal["clean", "changes"]
