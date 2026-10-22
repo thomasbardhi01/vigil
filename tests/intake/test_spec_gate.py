@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from vigild.contract.models import Task
 from vigild.intake.spec_gate import check_job_spec, check_task
 from vigild.jobs.artifacts import parse_plan, parse_spec
@@ -73,7 +75,7 @@ none
 - Stale numbers.
 
 ## Interfaces
-- None shared: each worker edits its own doc file.
+- None shared: each worker edits only `docs/feature-map.md` or `docs/runbook.md`.
 
 ## Rollback
 Revert the PR.
@@ -189,13 +191,19 @@ def test_overlapping_workers_are_fine_when_ordered() -> None:
 
 
 def test_parallel_workers_need_pinned_interfaces() -> None:
-    spec = SPEC.replace("## Interfaces\n- None shared: each worker edits its own doc file.\n\n", "")
+    spec = SPEC.replace(
+        "## Interfaces\n- None shared: each worker edits only `docs/feature-map.md` or `docs/runbook.md`.\n\n",
+        "",
+    )
     errors = check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
     assert any("Interfaces" in e for e in errors)
 
 
 def test_a_single_writer_needs_no_interfaces_section() -> None:
-    spec = SPEC.replace("## Interfaces\n- None shared: each worker edits its own doc file.\n\n", "")
+    spec = SPEC.replace(
+        "## Interfaces\n- None shared: each worker edits only `docs/feature-map.md` or `docs/runbook.md`.\n\n",
+        "",
+    )
     plan = PLAN.replace(
         '"must_fail_first": true}\n]', '"must_fail_first": true, "depends_on": ["pa-0001-w1"]}\n]'
     )
@@ -226,3 +234,86 @@ def test_levels_not_built_yet_are_refused() -> None:
 def test_task_spec_has_a_verify_field_at_level_zero() -> None:
     t = _task()
     assert t.spec.verify.level == 0
+
+
+# --- review round 1 -----------------------------------------------------------------------
+
+
+def _with_scope(entry: str) -> str:
+    return PLAN.replace('"files_in_scope": ["docs/runbook.md"]', f'"files_in_scope": ["{entry}"]')
+
+
+def test_scope_entries_with_dotdot_or_absolute_paths_fail() -> None:  # item 14
+    for bad in ("../etc/passwd", "/etc/passwd"):
+        spec = SPEC.replace("- `docs/runbook.md`\n", f"- `docs/runbook.md`\n- `{bad}`\n")
+        errors = check_job_spec(parse_spec(spec), parse_plan(_with_scope(bad)), MONEY)
+        assert any(bad in e and "relative" in e for e in errors), errors
+
+
+def test_worker_scope_must_sit_inside_spec_scope_strictly() -> None:  # item 14
+    spec = SPEC.replace("- `docs/runbook.md`\n", "- `docs/*.md`\n")
+    errors = check_job_spec(parse_spec(spec), parse_plan(_with_scope("docs/sub/x.md")), MONEY)
+    assert any("docs/sub/x.md" in e for e in errors)
+
+
+def test_parallel_globs_that_may_overlap_fail() -> None:  # item 15
+    plan = PLAN.replace(
+        '"files_in_scope": ["docs/feature-map.md"]', '"files_in_scope": ["docs/*.md"]'
+    )
+    plan = plan.replace('"files_in_scope": ["docs/runbook.md"]', '"files_in_scope": ["docs/r*"]')
+    spec = SPEC.replace("- `docs/feature-map.md`\n- `docs/runbook.md`\n", "- `docs/**`\n")
+    errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY)
+    assert any("disjoint" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    "deps",
+    [
+        (
+            '"must_fail_first": true}\n]',
+            '"must_fail_first": true, "depends_on": ["pa-0001-w2"]}\n]',
+        ),
+        (
+            '"files_in_scope": ["docs/feature-map.md"], "must_fail_first": true}',
+            '"files_in_scope": ["docs/feature-map.md"], "must_fail_first": true, "depends_on": ["pa-0001-w1"]}',
+        ),
+    ],
+)
+def test_dependency_cycles_fail(deps: tuple[str, str]) -> None:  # item 17
+    plan = PLAN.replace(*deps)
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("cycle" in e for e in errors), errors
+
+
+def test_a_two_worker_cycle_fails() -> None:  # item 17
+    plan = PLAN.replace(
+        '"files_in_scope": ["docs/feature-map.md"], "must_fail_first": true}',
+        '"files_in_scope": ["docs/feature-map.md"], "must_fail_first": true, "depends_on": ["pa-0001-w2"]}',
+    ).replace(
+        '"must_fail_first": true}\n]', '"must_fail_first": true, "depends_on": ["pa-0001-w1"]}\n]'
+    )
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("cycle" in e for e in errors)
+
+
+def test_interfaces_must_name_something() -> None:  # nit
+    assert check_job_spec(parse_spec(SPEC), parse_plan(PLAN), MONEY) == []
+    vague = SPEC.replace(
+        "- None shared: each worker edits only `docs/feature-map.md` or `docs/runbook.md`.",
+        "- stuff",
+    )
+    errors = check_job_spec(parse_spec(vague), parse_plan(PLAN), MONEY)
+    assert any("Interfaces" in e for e in errors)
+
+
+def test_a_test_cmd_the_dev_image_cannot_run_fails() -> None:  # blocker 4
+    plan = PLAN.replace(
+        'grep -q \'RATE_LIMIT\' docs/runbook.md",\n   "done_when"', 'pnpm test",\n   "done_when"'
+    )
+    errors = check_job_spec(
+        parse_spec(SPEC),
+        parse_plan(plan),
+        MONEY,
+        missing_tools=lambda cmd: ["pnpm"] if "pnpm" in cmd else [],
+    )
+    assert any("pnpm" in e and "dev image" in e for e in errors), errors

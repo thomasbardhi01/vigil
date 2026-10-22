@@ -52,8 +52,18 @@ class Budget:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE day=?", (self._day(),))
 
     def open_today(self) -> float:
-        # Every open reservation counts against today, whatever day it was made.
-        return self._sum("SELECT SUM(amount_usd) FROM reservations WHERE status='open'", ())
+        # Open reservations count against the day they were made. One left open
+        # by a crash stops counting at midnight; the startup reconcile settles it.
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND day=?",
+            (self._day(),),
+        )
+
+    def open_month(self) -> float:
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND month=?",
+            (self._month(),),
+        )
 
     def spent_month(self) -> float:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE month=?", (self._month(),))
@@ -86,7 +96,7 @@ class Budget:
                 raise BudgetExceeded(
                     "daily", f"{day_used:.2f} of {self.cfg.daily_usd:.2f} used; {amount:.2f} more"
                 )
-            month_used = self.spent_month() + self.open_today()
+            month_used = self.spent_month() + self.open_month()
             if month_used + amount > self.cfg.monthly_usd + EPS:
                 raise BudgetExceeded(
                     "monthly",

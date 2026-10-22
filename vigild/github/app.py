@@ -165,3 +165,18 @@ class GitHubApp:
             yield tok
         finally:
             self.revoke(tok.token)
+
+    def is_private(self, repo: str) -> bool:
+        """The repo's real visibility, read with a metadata-only token (item 10)."""
+        with self.lease(repo, {"metadata": "read"}) as tok:
+            r = self.http.get(
+                f"{self.api}/repos/{repo.strip()}",
+                headers={
+                    "Authorization": f"Bearer {tok.token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=TIMEOUT,
+            )
+        if r.status_code != 200:
+            raise GitHubError(f"reading {repo} failed (HTTP {r.status_code})")
+        return bool(r.json()["private"])

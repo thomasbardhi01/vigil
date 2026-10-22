@@ -1,18 +1,22 @@
-"""Stage 3 acceptance, machine-checked on the host after the worker exits."""
+"""Stage 3 acceptance, machine-checked on the host, in the vault, after the
+worker exits. It fails closed when the harness couldn't observe the test."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.conftest import git
+from tests.harness import finish_session
 from vigild.contract.models import WorkerReport
 from vigild.jobs.acceptance import check_worker
 from vigild.workspace import Workspace
 
-CONTRACT = {
-    "task_id": "fx-0001-w1",
+REPO, TID, BRANCH = "o/fixture", "fx-0001-w1", "vigil/fx-0001-w1"
+CONTRACT: dict[str, Any] = {
+    "task_id": TID,
     "job_id": "fx-0001",
     "spec": {
         "goal": "g",
@@ -23,89 +27,123 @@ CONTRACT = {
     },
     "limits": {"max_cost_usd": 1.0},
 }
+HARNESS_OK = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}
 
 
 def _report(**kw: object) -> WorkerReport:
     base: dict[str, object] = {
-        "task_id": "fx-0001-w1",
-        "job_id": "fx-0001",
-        "test_before": "fail",
-        "test_after": "pass",
-        "files_changed": ["docs/feature-map.md"],
-        "summary": "s",
-        "self_check": {
-            "test_failed_first": True,
-            "outside_scope": [],
-            "not_done": "-",
-            "reviewer_would_flag": "-",
-            "could_delete": "-",
-        },
+        "task_id": TID, "job_id": "fx-0001", "test_before": "fail", "test_after": "pass",
+        "files_changed": ["docs/feature-map.md"], "summary": "s",
+        "self_check": {"test_failed_first": True, "outside_scope": [], "not_done": "-",
+                       "reviewer_would_flag": "-", "could_delete": "-"},
         "provenance": "claude",
-    }
+    }  # fmt: skip
     base.update(kw)
     return WorkerReport.model_validate(base)
 
 
-HARNESS_OK = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}
-
-
 @pytest.fixture
-def clone(tmp_path: Path, fixture_repo: dict[str, Path]) -> Path:
-    ws = Workspace(tmp_path / "d", remote_url=lambda r: str(fixture_repo["bare"]))
-    c = ws.clone("o/fixture", "fx-0001-w1", branch="vigil/fx-0001-w1", base="main")
+def ws(tmp_path: Path, fixture_repo: dict[str, Path]) -> Workspace:
+    return Workspace(tmp_path / "d", remote_url=lambda r: str(fixture_repo["bare"]))
+
+
+def _result(ws: Workspace, tmp_path: Path, extra: object = None) -> tuple[str, str]:
+    c = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
     (c / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
-    git(c, "commit", "-qam", "w")
-    return c
+    if callable(extra):
+        extra(c)
+    finish_session(c, tmp_path / "out", branch=BRANCH, base_sha=base)
+    return base, ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base)
 
 
-def test_clean_worker_passes(clone: Path) -> None:
-    assert check_worker(clone, "main", CONTRACT, _report(), HARNESS_OK, cost=0.2) == []
+def _check(
+    ws: Workspace,
+    base: str,
+    head: str,
+    *,
+    contract: dict[str, Any] = CONTRACT,
+    report: WorkerReport | None = None,
+    harness: Any = HARNESS_OK,
+    cost: float = 0.2,
+) -> list[str]:
+    return check_worker(ws, REPO, base, head, contract, report or _report(), harness, cost=cost)
 
 
-def test_test_must_fail_first(clone: Path) -> None:
-    errs = check_worker(clone, "main", CONTRACT, _report(test_before="pass"), HARNESS_OK, cost=0)
-    assert any("fail first" in e for e in errs)
-    harness = {"before": {"outcome": "pass"}, "after": {"outcome": "pass"}}
-    errs = check_worker(clone, "main", CONTRACT, _report(), harness, cost=0)
-    assert any("harness" in e for e in errs)
+def test_clean_worker_passes(ws: Workspace, tmp_path: Path) -> None:
+    assert _check(ws, *_result(ws, tmp_path)) == []
 
 
-def test_test_must_pass_after(clone: Path) -> None:
-    harness = {"before": {"outcome": "fail"}, "after": {"outcome": "fail"}}
+def test_test_must_fail_first(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
     assert any(
-        "pass" in e for e in check_worker(clone, "main", CONTRACT, _report(), harness, cost=0)
+        "fail first" in e for e in _check(ws, base, head, report=_report(test_before="pass"))
     )
+    passed_before = {"before": {"outcome": "pass"}, "after": {"outcome": "pass"}}
+    assert any("harness" in e for e in _check(ws, base, head, harness=passed_before))
 
 
-def test_files_outside_scope_fail(clone: Path) -> None:
-    (clone / "README.md").write_text("x\n")
-    git(clone, "commit", "-qam", "x")
-    errs = check_worker(clone, "main", CONTRACT, _report(), HARNESS_OK, cost=0)
-    assert any("README.md" in e for e in errs)
+def test_test_must_pass_after(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    failed = {"before": {"outcome": "fail"}, "after": {"outcome": "fail"}}
+    assert any("must pass" in e for e in _check(ws, base, head, harness=failed))
 
 
-def test_a_weakened_test_fails(clone: Path) -> None:
-    (clone / "tests").mkdir()
-    (clone / "tests" / "test_x.py").write_text("def test_a():\n    assert 1\n    assert 2\n")
-    git(clone, "add", "-A")
-    git(clone, "commit", "-qm", "t")
-    git(clone, "push", "-q", "origin", "HEAD:main")
-    git(clone, "fetch", "-q", "origin")
-    contract = {**CONTRACT, "spec": {**CONTRACT["spec"], "files_in_scope": ["tests/test_x.py"]}}  # type: ignore[dict-item]
-    (clone / "tests" / "test_x.py").write_text("def test_a():\n    assert 1\n")
-    git(clone, "commit", "-qam", "weaken")
-    errs = check_worker(
-        clone, "main", contract, _report(files_changed=["tests/test_x.py"]), HARNESS_OK, cost=0
+# blocker 4: the harness record is required, and "unknown" is not a pass
+@pytest.mark.parametrize("harness", [None, {}])
+def test_a_missing_harness_record_is_a_rejection(
+    ws: Workspace, tmp_path: Path, harness: Any
+) -> None:
+    base, head = _result(ws, tmp_path)
+    assert any("harness record is missing" in e for e in _check(ws, base, head, harness=harness))
+
+
+@pytest.mark.parametrize("which", ["before", "after"])
+def test_unknown_outcome_is_a_rejection(ws: Workspace, tmp_path: Path, which: str) -> None:
+    base, head = _result(ws, tmp_path)
+    harness = {**HARNESS_OK, which: {"outcome": "unknown"}}
+    assert _check(ws, base, head, harness=harness)
+
+
+def test_no_test_cmd_needs_no_harness(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    contract = {
+        **CONTRACT,
+        "spec": {**CONTRACT["spec"], "test_cmd": None, "must_fail_first": False},
+    }
+    assert _check(ws, base, head, contract=contract, harness=None) == []
+
+
+def test_files_outside_scope_fail(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path, lambda c: (c / "README.md").write_text("x\n"))
+    assert any("README.md" in e for e in _check(ws, base, head))
+
+
+def test_a_weakened_test_fails(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    seed = fixture_repo["seed"]
+    (seed / "tests").mkdir()
+    (seed / "tests" / "test_x.py").write_text("def test_a():\n    assert 1\n    assert 2\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "t")
+    git(seed, "push", "-q", "origin", "main")
+    base, head = _result(
+        ws,
+        tmp_path,
+        lambda c: (c / "tests" / "test_x.py").write_text("def test_a():\n    assert 1\n"),
     )
-    assert any("weaken" in e for e in errs)
+    contract = {
+        **CONTRACT,
+        "spec": {**CONTRACT["spec"], "files_in_scope": ["docs/feature-map.md", "tests/test_x.py"]},
+    }
+    assert any("weaken" in e for e in _check(ws, base, head, contract=contract))
 
 
-def test_over_the_cost_limit_fails(clone: Path) -> None:
-    assert any(
-        "cost" in e for e in check_worker(clone, "main", CONTRACT, _report(), HARNESS_OK, cost=1.5)
-    )
+def test_over_the_cost_limit_fails(ws: Workspace, tmp_path: Path) -> None:
+    assert any("cost" in e for e in _check(ws, *_result(ws, tmp_path), cost=1.5))
 
 
-def test_report_must_match_the_task(clone: Path) -> None:
-    errs = check_worker(clone, "main", CONTRACT, _report(task_id="other"), HARNESS_OK, cost=0)
-    assert any("task_id" in e for e in errs)
+def test_report_must_match_the_task(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    assert any("task_id" in e for e in _check(ws, base, head, report=_report(task_id="other")))

@@ -14,6 +14,7 @@ assembled here, in six parts:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from vigild.contract.models import Plan, WorkerReport
+from vigild.intake.paths import scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
 from vigild.jobs.model import Role
 from vigild.packets.fence import UNTRUSTED_RULE, fence
@@ -60,16 +62,29 @@ class Packet:
         return "\n\n".join(f"# {TITLES[k]}\n\n{v.strip()}" for k, v in self.parts.items()) + "\n"
 
 
-def _read(path: Path) -> str | None:
+MAX_FILE = 2 << 20
+
+
+def _read(repo: Path, rel: str) -> str | None:
+    """A file of the repo, only if it resolves inside the repo (review r1, item
+    14): `..`, absolute paths and symlinks that leave the clone read nothing."""
+    if scope_entry_error(rel):
+        return None
+    root = Path(os.path.realpath(repo))
+    real = Path(os.path.realpath(repo / rel))
+    if real != root and root not in real.parents:
+        return None
     try:
-        return path.read_text()
-    except FileNotFoundError, IsADirectoryError, UnicodeDecodeError:
+        if not real.is_file() or real.stat().st_size > MAX_FILE:
+            return None
+        return real.read_text()
+    except OSError, UnicodeDecodeError:
         return None
 
 
 def _role_and_rules(role: Role, repo: Path) -> str:
     prompt = (PROMPTS_DIR / f"{role.value}.md").read_text()
-    rules = _read(repo / "CLAUDE.md") or _read(repo / "AGENTS.md") or "(no CLAUDE.md in this repo)"
+    rules = _read(repo, "CLAUDE.md") or _read(repo, "AGENTS.md") or "(no CLAUDE.md in this repo)"
     return f"{prompt.strip()}\n\n{UNTRUSTED_RULE}\n\n## The repo's CLAUDE.md\n\n{rules.strip()}"
 
 
@@ -128,7 +143,7 @@ def _context_pack(
         ("layer 3 (feature map)", "docs/feature-map.md"),
         ("layer 2 (architecture)", "docs/architecture.md"),
     ):
-        text = _read(repo / doc)
+        text = _read(repo, doc)
         if text and doc not in files:
             ex = _excerpt(text, needles)
             if ex:
@@ -136,14 +151,16 @@ def _context_pack(
     for f in files:
         if "*" in f:
             continue
-        text = _read(repo / f)
+        text = _read(repo, f)
         items.append(("files in scope", f, text if text is not None else "(does not exist yet)"))
         stem = Path(f).stem
         tests_dir = repo / "tests"
         for t in sorted(tests_dir.rglob(f"test_{stem}*.py"))[:3] if tests_dir.is_dir() else []:
             rel = str(t.relative_to(repo))
             if rel not in files:
-                items.append(("related tests", f"{rel} (related test)", t.read_text()))
+                body = _read(repo, rel)
+                if body is not None:
+                    items.append(("related tests", f"{rel} (related test)", body))
     log = _git_log(repo, [f for f in files if "*" not in f])
     if log:
         items.append(("history", "last commits touching these files", log))
@@ -237,7 +254,7 @@ def assemble_coord(
     dropped: list[str] = []
     used = 0
     for doc in ("README.md", "docs/feature-map.md", "docs/architecture.md"):
-        text = _read(repo / doc)
+        text = _read(repo, doc)
         if text is None:
             continue
         block = f"## {doc}\n\n```\n{text.rstrip()}\n```"

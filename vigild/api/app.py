@@ -63,8 +63,19 @@ def health(request: Request) -> dict[str, Any]:
 # --- the web UI's session (P7: no token in the browser) -----------------------------
 
 
+def _ui_only(request: Request) -> None:
+    """P7: the cookie login exists only on the Tailscale listener (item 20)."""
+    if not getattr(request.app.state, "ui", False):
+        raise HTTPException(404, "not found")
+
+
+def _https(request: Request) -> bool:
+    return request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+
+
 @router.post("/api/login", status_code=204)
 def login(request: Request, body: Annotated[dict[str, Any], Body()]) -> Response:
+    _ui_only(request)
     svc = _svc(request)
     token = body.get("token") if isinstance(body.get("token"), str) else None
     scope = identify(svc.tokens, f"Bearer {token}") if token else None
@@ -79,13 +90,14 @@ def login(request: Request, body: Annotated[dict[str, Any], Body()]) -> Response
         path="/",
         httponly=True,
         samesite="strict",
-        secure=svc.cfg.vigild.api.cookie_secure,
+        secure=svc.cfg.vigild.api.cookie_secure or _https(request),
     )
     return resp
 
 
 @router.post("/api/logout", status_code=204, dependencies=[READ])
 def logout(request: Request) -> Response:
+    _ui_only(request)
     end_ui_session(_svc(request).store, request.cookies.get(COOKIE))
     resp = Response(status_code=204)
     resp.delete_cookie(COOKIE, path="/")
@@ -177,6 +189,28 @@ def approve(
     return {"job_id": job.id, "state": job.state.value}
 
 
+@router.post("/api/inbox/{item_id}/resume", dependencies=[ADMIN])
+def resume(request: Request, item_id: int) -> dict[str, Any]:
+    try:
+        job = _svc(request).jobs.resume(item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value}
+
+
+@router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
+def dismiss(request: Request, item_id: int) -> dict[str, Any]:
+    try:
+        _svc(request).jobs.dismiss(item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"item_id": item_id, "status": "resolved"}
+
+
 # --- sessions -----------------------------------------------------------------------
 
 
@@ -193,9 +227,12 @@ def get_session(request: Request, session_id: str) -> dict[str, Any]:
         raise HTTPException(404, "no such session") from e
 
 
-def create_app(services: Services) -> FastAPI:
+def create_app(services: Services, *, ui: bool = False) -> FastAPI:
+    """`ui=True` only for the listener on the Mac's Tailscale address: it adds
+    the cookie login (P7). The loopback listener is bearer-only (CLI, MCP)."""
     app = FastAPI(title="vigild", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.services = services
+    app.state.ui = ui
     app.include_router(router)
 
     @app.exception_handler(KeyError)

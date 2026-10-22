@@ -10,6 +10,7 @@ real container."""
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import auth, git
+from tests.harness import finish_session
 from tests.test_devimage import FakeDocker
 from vigild.api.app import create_app
 from vigild.budget import Budget
@@ -59,7 +61,7 @@ The feature map and the runbook both describe the rate limit.
 none
 
 ## Interfaces
-- None shared: each worker edits its own file.
+- None shared: each worker edits only its own file (`docs/feature-map.md` or `docs/runbook.md`).
 
 ## Risks
 - None.
@@ -113,13 +115,20 @@ EDITS = {
 }
 
 
+HARNESS_OK: dict[str, Any] = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}
+
+
 @dataclass
 class StandIn:
     """Does what the container's harness does: run the agent's work, write the
-    report and harness record, commit. Records concurrency."""
+    report, commit, then leave the harness record and the result bundle in the
+    session's out dir. Records concurrency."""
 
     coord_drafts: list[Callable[[str], tuple[str, str]]] = field(default_factory=list)
+    coord_extra: Callable[[Path, str], None] | None = None
     worker_edit: Callable[[SessionSpec, dict[str, Any]], None] | None = None
+    harness: dict[str, Any] | None = field(default_factory=lambda: dict(HARNESS_OK))
+    on_session: Callable[[SessionSpec], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     running: int = 0
     max_running: int = 0
@@ -130,6 +139,9 @@ class StandIn:
         assert gateway_token.startswith("vgw_")
         assert spec.packet.startswith("# 1. Role and rules")
         self.calls.append((spec.role.value, spec.task_id or spec.job_id))
+        if self.on_session:
+            self.on_session(spec)
+        task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
         with self.lock:
             self.running += 1
             self.max_running = max(self.max_running, self.running)
@@ -138,17 +150,24 @@ class StandIn:
                 draft = (
                     self.coord_drafts.pop(0) if self.coord_drafts else (lambda j: (SPEC, plan(j)))
                 )
-                s, p = draft(spec.job_id)
+                sp, pl = draft(spec.job_id)
                 d = spec.clone / ".vigil" / spec.job_id
                 d.mkdir(parents=True, exist_ok=True)
-                (d / "spec.md").write_text(s)
-                (d / "plan.md").write_text(p)
+                (d / "spec.md").write_text(sp)
+                (d / "plan.md").write_text(pl)
+                if self.coord_extra:
+                    self.coord_extra(spec.clone, spec.job_id)
                 git(spec.clone, "add", "-A")
                 git(spec.clone, "commit", "-q", "--allow-empty", "-m", "coord: spec and plan")
+                finish_session(
+                    spec.clone,
+                    spec.session_dir / "out",
+                    branch=task["branch"],
+                    base_sha=task["base_sha"],
+                )
                 return ExecOutcome("done", 0, {"status": "done", "plugins": ["guard"]})
             if self.barrier:
                 self.barrier.wait(timeout=10)  # both workers must be in flight at once
-            task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
             if self.worker_edit:
                 self.worker_edit(spec, task)
             else:
@@ -157,38 +176,21 @@ class StandIn:
             d = spec.clone / ".vigil" / spec.job_id / spec.task_id  # type: ignore[operator]
             d.mkdir(parents=True, exist_ok=True)
             if not (d / "ask_coord.json").exists():
-                (d / "worker_report.json").write_text(
-                    json.dumps(
-                        {
-                            "task_id": spec.task_id,
-                            "job_id": spec.job_id,
-                            "test_before": "fail",
-                            "test_after": "pass",
-                            "files_changed": task["spec"]["files_in_scope"],
-                            "summary": "documented it",
-                            "self_check": {
-                                "test_failed_first": True,
-                                "outside_scope": [],
-                                "not_done": "nothing",
-                                "reviewer_would_flag": "wording",
-                                "could_delete": "nothing",
-                            },
-                            "open_questions": [],
-                            "provenance": "claude",
-                        }
-                    )
-                )
-            (d / "harness_tests.json").write_text(
-                json.dumps(
-                    {
-                        "before": {"outcome": "fail"},
-                        "after": {"outcome": "pass"},
-                        "provenance": "human",
-                    }
-                )
+                (d / "worker_report.json").write_text(json.dumps({
+                    "task_id": spec.task_id, "job_id": spec.job_id, "test_before": "fail",
+                    "test_after": "pass", "files_changed": task["spec"]["files_in_scope"],
+                    "summary": "documented it",
+                    "self_check": {"test_failed_first": True, "outside_scope": [],
+                                   "not_done": "nothing", "reviewer_would_flag": "wording",
+                                   "could_delete": "nothing"},
+                    "open_questions": [], "provenance": "claude"}))  # fmt: skip
+            finish_session(
+                spec.clone,
+                spec.session_dir / "out",
+                branch=task["branch"],
+                base_sha=task["base_sha"],
+                harness=self.harness,
             )
-            git(spec.clone, "add", "-A")
-            git(spec.clone, "commit", "-qm", f"worker {spec.task_id}")
             return ExecOutcome("done", 0, {"status": "done", "plugins": ["guard"]})
         finally:
             with self.lock:
@@ -197,15 +199,17 @@ class StandIn:
 
 @dataclass
 class BarePublisher:
-    """GitHub stand-in: pushes to the local bare repo and records draft PRs."""
+    """GitHub stand-in: vigild's real publish, pushing to the local bare repo."""
 
+    ws: Workspace | None = None
     prs: list[dict[str, Any]] = field(default_factory=list)
 
     def publish(
         self,
-        clone: Path,
         *,
         repo: str,
+        head: str,
+        base_sha: str,
         branch: str,
         base: str,
         title: str,
@@ -214,25 +218,23 @@ class BarePublisher:
     ) -> str:
         from vigild.github.publish import publish
 
+        prs = self.prs
+
         class Pulls:
             def create_pull(
-                s,
-                repo: str,
-                *,
-                head: str,
-                base: str,
-                title: str,
-                body: str,
-                draft: bool,
+                self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
             ) -> str:
-                self.prs.append(
+                prs.append(
                     {"head": head, "base": base, "title": title, "draft": draft, "body": body}
                 )
-                return f"https://github.com/{repo}/pull/{len(self.prs)}"
+                return f"https://github.com/{repo}/pull/{len(prs)}"
 
+        assert self.ws is not None
         return publish(
-            clone,
+            self.ws,
             repo=repo,
+            head=head,
+            base_sha=base_sha,
             branch=branch,
             base=base,
             title=title,
@@ -265,6 +267,7 @@ def world(
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
         dev_image="vigil/claude-executor:2.1.306",
         dev_image_check="true",
+        dev_image_tools=["git", "grep"],
     )
     store = Store.open(":memory:")
     budget = Budget(store, cfg.budgets)
@@ -274,14 +277,15 @@ def world(
     gateway = Gateway(cfg, store, budget, Secrets({}))
     images = DevImages(cfg, store, FakeDocker())
     images.validate(REPO)
-    standin, publisher = StandIn(), BarePublisher()
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    standin, publisher = StandIn(), BarePublisher(ws)
     runner = JobRunner(
         cfg,
         store,
         budget,
         gateway,
         standin,
-        Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"])),
+        ws,
         publisher,
         Telemetry(),
         images,
@@ -466,3 +470,175 @@ def test_a_session_without_guard_fails_closed(world: World) -> None:
     job = _approve(w)
     assert w.publisher.prs == []
     assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+
+
+# --- review round 1 -----------------------------------------------------------------------
+
+
+def test_a_harness_record_missing_means_no_pr(world: World) -> None:  # blocker 4
+    w = world
+    w.standin.harness = None
+    job = _approve(w)
+    assert w.publisher.prs == []
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("harness record is missing" in json.dumps(p["body"]) for p in pages)
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+
+
+def test_a_coord_symlink_never_reads_a_host_file(world: World, tmp_path: Path) -> None:  # blocker 3
+    w = world
+    secret = tmp_path / "pretend-env"
+    secret.write_text("ANTHROPIC_API_KEY=must-not-leak")
+
+    def plant(clone: Path, job_id: str) -> None:
+        spec = clone / ".vigil" / job_id / "spec.md"
+        spec.unlink()
+        os.symlink(secret, spec)
+
+    w.standin.coord_extra = plant
+    job = _request(w)
+    for a in w.store.q("SELECT content FROM artifacts WHERE job_id=?", (job,)):
+        assert "must-not-leak" not in a["content"]
+
+
+def test_each_coord_draft_is_its_own_session_and_books_once(world: World) -> None:  # item 8
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    w = world
+    bad = SPEC.replace(" test: `grep -q 'RATE_LIMIT' docs/runbook.md`", "")
+    w.standin.coord_drafts = [lambda j: (bad, plan(j))]
+    prices = PriceTable(w.runner.cfg.prices)
+
+    def spend(spec: SessionSpec) -> None:  # $0.10 of Opus output per draft
+        record_call(
+            w.store,
+            prices,
+            session_id=spec.session_id,
+            task_id=None,
+            job_id=spec.job_id,
+            purpose="session",
+            provider="anthropic",
+            backend_preset="claude-opus",
+            model="claude-opus-5-5",
+            usage=CallUsage(tokens_out=5000),
+        )
+
+    w.standin.on_session = spend
+    job = _request(w)
+    coords = [s for s in w.store.list_sessions(job) if s.role is Role.COORD]
+    assert len(coords) == 2 and coords[0].id != coords[1].id
+    assert w.store.get_job(job).coord_session_id == coords[1].id
+    booked = w.store.q("SELECT SUM(amount_usd) a FROM ledger")[0]["a"]
+    metered = w.store.q("SELECT SUM(cost_usd) c FROM model_calls")[0]["c"]
+    assert booked == pytest.approx(metered) == pytest.approx(0.20)
+
+
+def test_dependents_of_a_failed_worker_page_and_block(world: World) -> None:  # item 17
+    w = world
+
+    def chained(j: str) -> tuple[str, str]:
+        p = plan(j).replace(
+            '"files_in_scope": [\n    "docs/runbook.md"\n   ],',
+            '"files_in_scope": [\n    "docs/runbook.md"\n   ],\n   "depends_on": ["' + j + '-w1"],',
+        )
+        assert "depends_on" in p
+        return SPEC, p
+
+    def fail_w1(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        (spec.clone / f).write_text(EDITS[f])
+        if spec.task_id and spec.task_id.endswith("w1"):
+            (spec.clone / "README.md").write_text("out of scope\n")
+
+    w.standin.coord_drafts = [chained]
+    w.standin.worker_edit = fail_w1
+    job = _approve(w)
+    assert [c[1] for c in w.standin.calls if c[0] == "worker"] == [f"{job}-w1"]
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("stuck" in p["title"] and p["body"]["resumable"] for p in pages)
+
+
+def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
+    w = world
+    job = _request(w)
+    held = [
+        w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
+        for i, a in enumerate((2.0, 2.0, 0.5))
+    ]
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(job).state.value == "blocked"
+    for rid in held:
+        w.budget.settle(rid, 0.0)  # the other work finished
+    page = next(
+        p
+        for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if "cap" in p["title"]
+    )
+    r = w.client.post(f"/api/inbox/{page['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "in_review"
+    assert len(w.publisher.prs) == 2
+
+
+def test_a_failure_before_the_session_never_leaks_the_reservation(  # item 7
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = world
+    job = _request(w)
+    real = w.runner.workspace.clone
+
+    def broken(repo: str, task_id: str, **kw: Any) -> Path:
+        if "-w" in task_id:
+            raise OSError("disk full")
+        return real(repo, task_id, **kw)
+
+    monkeypatch.setattr(w.runner.workspace, "clone", broken)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.budget.open_today() == 0
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+
+
+def test_reconcile_after_a_crash(world: World) -> None:  # item 7
+    from vigild.jobs.fsm import Actor, transition
+    from vigild.jobs.model import JobState
+
+    w = world
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.runner.background = True  # pretend the build is mid-flight when vigild dies
+    w.runner.build = lambda j: None  # type: ignore[method-assign]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    transition(w.store, job, JobState.PLANNING, Actor.VIGILD)
+    s = w.store.create_session(job, Role.WORKER, backend_preset="claude-sonnet")
+    w.store.update_session(s.id, status="running")
+    w.budget.reserve(session_id=s.id, task_id=f"{job}-w1", amount=1.0, purpose="worker")
+    tok = w.runner.gateway.issue_token(s.id, REPO, "claude-sonnet")
+
+    out = w.runner.reconcile()  # what vigild's startup runs
+    assert out["reservations"] == 1 and out["held"] == 1 and out["tokens"] >= 1
+    assert w.budget.open_today() == 0
+    assert w.store.get_session(s.id).status == "failed"
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("restarted" in p["title"] and p["body"]["resumable"] for p in pages)
+    from vigild.gateway.service import GatewayError
+
+    with pytest.raises(GatewayError):
+        w.runner.gateway.authorize(tok)
+
+
+def test_reconcile_restarts_an_approved_job_that_never_built(world: World) -> None:  # item 19
+    w = world
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    real_build = w.runner.build
+    w.runner.build = lambda j: None  # type: ignore[method-assign]  # vigild dies after the commit
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(job).state.value == "approved"
+    w.runner.build = real_build  # type: ignore[method-assign]
+    assert w.runner.reconcile()["rebuilt"] == 1
+    assert w.store.get_job(job).state.value == "in_review"

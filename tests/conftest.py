@@ -36,12 +36,16 @@ def store() -> Store:
 class RecordingRunner:
     created: list[str] = field(default_factory=list)
     approved: list[str] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         self.created.append(job_id)
 
     def on_approved(self, job_id: str) -> None:
         self.approved.append(job_id)
+
+    def on_resume(self, job_id: str) -> None:
+        self.resumed.append(job_id)
 
 
 @pytest.fixture
@@ -63,7 +67,15 @@ def services(cfg: Config, store: Store, tokens: Tokens, runner: RecordingRunner)
 
 @pytest.fixture
 def client(services: Services) -> Iterator[TestClient]:
+    """The loopback listener: bearer tokens only, no UI routes."""
     with TestClient(create_app(services)) as c:
+        yield c
+
+
+@pytest.fixture
+def ui_client(services: Services) -> Iterator[TestClient]:
+    """The Tailscale listener: the UI's cookie login as well (P7)."""
+    with TestClient(create_app(services, ui=True)) as c:
         yield c
 
 

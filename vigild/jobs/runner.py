@@ -1,38 +1,49 @@
 """The job runner: drives a job through stages 1-3 of the protocol.
 
 - on_job_created (a request with no spec): the coord drafts spec.md and
-  plan.md; vigild runs the spec gate; up to three drafts, then it pages you.
+  plan.md; vigild runs the spec gate; up to three drafts, each its own session,
+  then it pages you (resumable: resuming drafts again).
 - on_approved (only from the inbox): planning turns plan.md's contracts into
   routed tasks; building runs them in dependency waves, each wave's workers in
-  parallel, each in its own container, clone and branch. After a worker exits,
-  vigild checks acceptance on the host and, if it passes, pushes the branch and
-  opens the draft PR itself (P2): the worker never holds a GitHub token.
+  parallel, each in its own container, clone and branch.
+- After any session, the harness has left a git bundle and its test record in
+  the session's out dir. vigild imports the bundle into its own vault and does
+  every read, check and push from there: host git never runs in a clone a
+  session has touched, and no file a session wrote is read except through
+  `safe_read_bytes` (review round 1, blockers 1-3). Acceptance then fails
+  closed (blocker 4), and vigild publishes the draft PR itself (P2).
+- on_resume (only from the inbox): a held job picks up its remaining work.
+- reconcile (at startup): nothing from before a restart keeps running or
+  keeps money held (review round 1, item 7).
 
 Every session reserves its budget before it starts, gets a gateway token that
-is revoked when it ends, runs in its repo's validated dev image, and writes its
-events. A budget refusal halts dispatch, blocks the job and pages you.
+expires and is revoked when it ends, runs in its repo's validated dev image,
+and writes its events (secrets redacted).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config
-from vigild.contract.models import Limits, Spec, Task, Verify, WorkerContract
+from vigild.contract.models import Limits, Spec, Task, Verify, WorkerContract, WorkerReport
 from vigild.db import Store, iso
-from vigild.devimage import DevImages, StaleDevImage
+from vigild.devimage import DevImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
-from vigild.gateway.service import Gateway
+from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
 from vigild.jobs.acceptance import check_worker
-from vigild.jobs.artifacts import ArtifactError, parse_plan, read_worker_report, render
+from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
@@ -40,19 +51,25 @@ from vigild.packets.assemble import assemble_coord, assemble_worker
 from vigild.provenance import Provenance
 from vigild.repos import RepoPolicyError, check_backend
 from vigild.router.rules import RoutingError, route
+from vigild.safefile import UnsafeFile, safe_read_bytes
 from vigild.telemetry.spans import Telemetry
-from vigild.workspace import Workspace
+from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
 COORD_DRAFTS = 3
+COORD_MINUTES = 30
+WORKER_MINUTES = 40
+SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
+LIVE_SESSION = ("created", "running")
 
 
 class Publisher(Protocol):
     def publish(
         self,
-        clone: Path,
         *,
         repo: str,
+        head: str,
+        base_sha: str,
         branch: str,
         base: str,
         title: str,
@@ -62,12 +79,25 @@ class Publisher(Protocol):
 
 
 class Pager(Protocol):
-    def page(self, job_id: str | None, title: str, body: dict[str, Any]) -> Any: ...
+    def page(
+        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+    ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
 
 
 class Refused(Exception):
     """A session could not start (budget, policy); dispatch halts."""
+
+
+def redact(value: Any) -> Any:
+    """Drop anything token-shaped from what an executor reports (item 13)."""
+    if isinstance(value, str):
+        return SECRETISH.sub("[redacted]", value)
+    if isinstance(value, dict):
+        return {k: redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
 
 
 class JobRunner:
@@ -84,6 +114,7 @@ class JobRunner:
         dev_images: DevImages,
         *,
         background: bool = True,
+        reaper: Callable[[], int] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -95,6 +126,7 @@ class JobRunner:
         self.telemetry = telemetry
         self.dev_images = dev_images
         self.background = background
+        self.reaper = reaper
         self.jobs: Pager | None = None
 
     # --- triggers ---------------------------------------------------------------------
@@ -103,9 +135,12 @@ class JobRunner:
         def safe(j: str) -> None:
             try:
                 fn(j)
-            except Exception as e:  # never die silently: page
+            except Exception as e:  # never die silently: page, and let the owner resume
                 log.exception("runner failed on %s", j)
-                self._page(j, f"vigild error on {j}", {"error": f"{type(e).__name__}: {e}"})
+                self._block(j, f"vigild error: {type(e).__name__}")
+                self._page(
+                    j, f"vigild error on {j}", {"error": f"{type(e).__name__}: {e}"}, resumable=True
+                )
 
         if self.background:
             threading.Thread(target=safe, args=(job_id,), daemon=True).start()
@@ -119,25 +154,84 @@ class JobRunner:
     def on_approved(self, job_id: str) -> None:
         self._spawn(self.build, job_id)
 
+    def on_resume(self, job_id: str) -> None:
+        state = self.store.get_job(job_id).state
+        if state is JobState.SPEC_PENDING:
+            self._spawn(self.run_coord, job_id)
+        elif state is JobState.APPROVED:
+            self._spawn(self.build, job_id)
+        elif state is JobState.PLANNING:
+            self._spawn(self._plan_and_dispatch, job_id)
+        elif state is JobState.BUILDING:
+            self._spawn(self.dispatch, job_id)
+
+    # --- startup reconcile (item 7) ------------------------------------------------------
+
+    def reconcile(self) -> dict[str, int]:
+        """After a restart: revoke every gateway token, remove leftover session
+        containers, fail sessions that were live, settle every open reservation,
+        hold jobs that were mid-flight (paged, resumable), and re-fire approved
+        jobs whose build never started."""
+        out = {
+            "tokens": self.gateway.revoke_all(),
+            "containers": 0,
+            "sessions": 0,
+            "reservations": 0,
+            "held": 0,
+            "rebuilt": 0,
+        }
+        if self.reaper is not None:
+            out["containers"] = self.reaper()
+        for s in self.store.list_sessions():
+            if s.status in LIVE_SESSION:
+                self.store.update_session(s.id, status="failed", ended_at=iso())
+                out["sessions"] += 1
+        for rid in self.budget.open_reservation_ids():
+            self.budget.settle(rid)
+            out["reservations"] += 1
+        for job in self.store.list_jobs():
+            if job.state in (JobState.PLANNING, JobState.BUILDING):
+                for t in self.store.list_tasks(job.id):
+                    if t.state == "running":
+                        self.store.update_task(t.id, state="failed")
+                self._block(job.id, "vigild restarted mid-flight")
+                self._page(
+                    job.id,
+                    f"{job.id}: vigild restarted while it was {job.state.value}",
+                    {"state": job.state.value},
+                    resumable=True,
+                )
+                out["held"] += 1
+            elif job.state is JobState.APPROVED:
+                self.on_approved(job.id)
+                out["rebuilt"] += 1
+        self.store.add_event("reconcile", out, Provenance.HUMAN)
+        return out
+
     # --- helpers ------------------------------------------------------------------------
 
-    def _page(self, job_id: str | None, title: str, body: dict[str, Any]) -> None:
+    def _page(
+        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+    ) -> None:
         assert self.jobs is not None
-        self.jobs.page(job_id, title, body)
+        self.jobs.page(job_id, title, body, resumable=resumable)
 
     def _block(self, job_id: str, reason: str) -> None:
         try:
+            job = self.store.get_job(job_id)
+            if job.state in (JobState.BLOCKED, JobState.ESCALATED, JobState.DONE):
+                return
             transition(
                 self.store, job_id, JobState.BLOCKED, Actor.VIGILD, evidence={"reason": reason}
             )
-        except TransitionError:
+        except TransitionError, KeyError:
             log.warning("could not block %s", job_id)
 
     def _event_sink(self, s: SessionRow) -> Callable[[dict[str, Any]], None]:
         def sink(e: dict[str, Any]) -> None:
             self.store.add_event(
                 str(e.get("type", "state")),
-                e.get("data") or {},
+                redact(e.get("data") or {}),
                 Provenance.CLAUDE,
                 job_id=s.job_id,
                 session_id=s.id,
@@ -146,14 +240,13 @@ class JobRunner:
 
         return sink
 
-    def _image(self, repo: str) -> str:
-        return self.dev_images.ensure_fresh(repo)
-
     def _run_session(
         self, s: SessionRow, spec: SessionSpec, reservation: int, attrs: dict[str, Any]
     ) -> ExecOutcome:
         """Token, telemetry, run, revoke, settle. The reservation is already made."""
-        token = self.gateway.issue_token(s.id, spec.repo, spec.preset)
+        token = self.gateway.issue_token(
+            s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
+        )
         self.store.update_session(
             s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
         )
@@ -170,8 +263,17 @@ class JobRunner:
             self.budget.settle(reservation)
             self.store.update_session(s.id, ended_at=iso())
 
-    def _spec(self, s: SessionSpec | None = None, **kw: Any) -> SessionSpec:
-        return SessionSpec(**kw)
+    def _session_dir(self, session_id: str) -> Path:
+        return self.cfg.vigild.data_path / "sessions" / session_id
+
+    def _harness(self, spec: SessionSpec) -> dict[str, Any] | None:
+        out = spec.session_dir / "out"
+        try:
+            data = safe_read_bytes(out, out / "harness_tests.json", 64 << 10)
+            record = json.loads(data)
+        except OSError, UnsafeFile, json.JSONDecodeError:
+            return None
+        return record if isinstance(record, dict) else None
 
     # --- stage 1: the coord drafts spec.md and plan.md ------------------------------------
 
@@ -179,36 +281,25 @@ class JobRunner:
         job = self.store.get_job(job_id)
         preset = self.cfg.routing.coord
         try:
-            image = self._image(job.repo)
+            image = self.dev_images.ensure_fresh(job.repo)
             check_backend(self.cfg, job.repo, preset)
-        except StaleDevImage as e:
+        except (StaleDevImage, RepoPolicyError) as e:
+            why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
             self._page(
-                job_id, f"{job_id}: dev image not fresh; coord not started", {"error": str(e)}
+                job_id, f"{job_id}: {why}; coord not started", {"error": str(e)}, resumable=True
             )
             return
-        except RepoPolicyError as e:
-            self._page(job_id, f"{job_id}: coord backend refused", {"error": str(e)})
-            return
-        branch = f"vigil/{job_id}-spec"
-        coord = self.store.create_session(job_id, Role.COORD, backend_preset=preset, branch=branch)
-        self.store.set_coord_session(job_id, coord.id)
-        clone = self.workspace.clone(job.repo, f"{job_id}-coord", branch=branch, base=job.base)
         intake = self.store.get_artifact(job_id, "intake.json")
         meta = json.loads(intake.content) if intake else {}
-        request = {
-            "job_id": job_id,
-            "repo": job.repo,
-            "base": job.base,
-            "title": job.title,
-            "request": job.request,
-            "notes": job.notes,
-            "why": meta.get("why"),
-            "value": meta.get("value"),
-            "risk": meta.get("risk"),
-        }
-        self.workspace.write_task(clone, request)
+        branch = f"vigil/{job_id}-spec"
         gate_errors: list[str] | None = None
+        previous: dict[str, str] = {}
         for attempt in range(1, COORD_DRAFTS + 1):
+            # One session per draft, so each draft's spend is booked once (item 8).
+            coord = self.store.create_session(
+                job_id, Role.COORD, backend_preset=preset, branch=branch
+            )
+            self.store.set_coord_session(job_id, coord.id)
             try:
                 rid = self.budget.reserve(
                     session_id=coord.id,
@@ -219,64 +310,27 @@ class JobRunner:
             except BudgetExceeded as e:
                 self.store.update_session(coord.id, status="refused")
                 self._page(
-                    job_id, f"{job_id}: {e.cap} cap reached; coord not started", {"error": str(e)}
-                )
-                return
-            packet = assemble_coord(clone, request, untrusted={}, gate_errors=gate_errors)
-            self.store.add_event(
-                "packet",
-                {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
-                Provenance.HUMAN,
-                job_id=job_id,
-                session_id=coord.id,
-            )
-            spec = SessionSpec(
-                session_id=coord.id,
-                role=Role.COORD,
-                job_id=job_id,
-                task_id=None,
-                repo=job.repo,
-                preset=preset,
-                model=self.cfg.preset(preset).model or "",
-                clone=clone,
-                session_dir=self.cfg.vigild.data_path / "sessions" / f"{coord.id}-{attempt}",
-                max_turns=40,
-                max_minutes=30,
-                max_budget_usd=self.cfg.budgets.coord_session_usd,
-                mounts=self.workspace.overlays(clone),
-                packet=packet.text,
-                image=image,
-            )
-            out = self._run_session(
-                coord,
-                spec,
-                rid,
-                {
-                    "vigil.job_id": job_id,
-                    "vigil.role": "coord",
-                    "vigil.repo": job.repo,
-                    "vigil.attempt": attempt,
-                },
-            )
-            if out.status != "done":
-                self.store.update_session(coord.id, status="failed")
-                self._page(
                     job_id,
-                    f"{job_id}: coord session {out.status}",
-                    {"error": out.error or "", "attempt": attempt},
+                    f"{job_id}: {e.cap} cap reached; coord not started",
+                    {"error": str(e)},
+                    resumable=True,
                 )
                 return
-            for name in ("spec.md", "plan.md"):
-                path = clone / ".vigil" / job_id / name
-                text = path.read_text() if path.is_file() else ""
-                self.store.add_artifact(
-                    job_id, name, render(name, text, Provenance.CLAUDE), Provenance.CLAUDE
+            try:
+                draft = self._coord_attempt(
+                    job, coord, rid, attempt, image, branch, meta, gate_errors, previous
                 )
-            assert self.jobs is not None
-            gate_errors = self.jobs.file_for_approval(job_id)
+            except Exception:
+                self.budget.settle(rid)
+                self.store.update_session(coord.id, status="failed")
+                raise
+            if draft is None:
+                return
+            gate_errors, previous = draft
             if not gate_errors:
                 self.store.update_session(coord.id, status="done")
                 return
+            self.store.update_session(coord.id, status="revise")
             self.store.add_event(
                 "spec_gate",
                 {"attempt": attempt, "errors": gate_errors},
@@ -284,12 +338,109 @@ class JobRunner:
                 job_id=job_id,
                 session_id=coord.id,
             )
-        self.store.update_session(coord.id, status="failed")
         self._page(
             job_id,
             f"{job_id}: the spec gate refused {COORD_DRAFTS} drafts",
             {"errors": gate_errors or []},
+            resumable=True,
         )
+
+    def _coord_attempt(
+        self,
+        job: Any,
+        coord: SessionRow,
+        rid: int,
+        attempt: int,
+        image: str,
+        branch: str,
+        meta: dict[str, Any],
+        gate_errors: list[str] | None,
+        previous: dict[str, str],
+    ) -> tuple[list[str], dict[str, str]] | None:
+        job_id = job.id
+        # A fresh clone per draft: vigild writes only into clones no session has touched.
+        clone_id = f"{job_id}-coord{attempt}"
+        clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
+        base_sha = self.workspace.base_sha(clone_id)
+        request = {
+            "job_id": job_id,
+            "repo": job.repo,
+            "base": job.base,
+            "base_sha": base_sha,
+            "branch": branch,
+            "title": job.title,
+            "request": job.request,
+            "notes": job.notes,
+            "why": meta.get("why"),
+            "value": meta.get("value"),
+            "risk": meta.get("risk"),
+            **{f"previous_{k}": v for k, v in previous.items()},
+        }
+        self.workspace.write_task(clone, request)
+        packet = assemble_coord(clone, request, untrusted={}, gate_errors=gate_errors)
+        self.store.add_event(
+            "packet",
+            {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
+            Provenance.HUMAN,
+            job_id=job_id,
+            session_id=coord.id,
+        )
+        spec = SessionSpec(
+            session_id=coord.id,
+            role=Role.COORD,
+            job_id=job_id,
+            task_id=None,
+            repo=job.repo,
+            preset=coord.backend_preset or "",
+            model=self.cfg.preset(coord.backend_preset or "").model or "",
+            clone=clone,
+            session_dir=self._session_dir(coord.id),
+            max_turns=40,
+            max_minutes=COORD_MINUTES,
+            max_budget_usd=self.cfg.budgets.coord_session_usd,
+            mounts=self.workspace.overlays(clone),
+            packet=packet.text,
+            image=image,
+        )
+        out = self._run_session(
+            coord,
+            spec,
+            rid,
+            {
+                "vigil.job_id": job_id,
+                "vigil.role": "coord",
+                "vigil.repo": job.repo,
+                "vigil.attempt": attempt,
+            },
+        )
+        if out.status != "done":
+            self.store.update_session(coord.id, status="failed")
+            self._page(
+                job_id,
+                f"{job_id}: coord session {out.status}",
+                {"error": out.error or "", "attempt": attempt},
+                resumable=True,
+            )
+            return None
+        try:
+            head = self.workspace.import_result(
+                job.repo, clone_id, spec.session_dir / "out", branch, base_sha
+            )
+        except WorkspaceError as e:
+            self.store.update_session(coord.id, status="failed")
+            self._page(
+                job_id, f"{job_id}: coord result unusable", {"error": str(e)}, resumable=True
+            )
+            return None
+        drafts: dict[str, str] = {}
+        for name in ("spec.md", "plan.md"):
+            text = self.workspace.read_blob(job.repo, head, f".vigil/{job_id}/{name}") or ""
+            drafts[name.removesuffix(".md")] = text
+            self.store.add_artifact(
+                job_id, name, render(name, text, Provenance.CLAUDE), Provenance.CLAUDE
+            )
+        assert self.jobs is not None
+        return self.jobs.file_for_approval(job_id), drafts
 
     # --- stages 2-3: planning and building -----------------------------------------------
 
@@ -321,23 +472,35 @@ class JobRunner:
         )
 
     def build(self, job_id: str) -> None:
-        job = transition(self.store, job_id, JobState.PLANNING, Actor.VIGILD)
+        transition(self.store, job_id, JobState.PLANNING, Actor.VIGILD)
+        self._plan_and_dispatch(job_id)
+
+    def _plan_and_dispatch(self, job_id: str) -> None:
+        job = self.store.get_job(job_id)
         art = self.store.get_artifact(job_id, "plan.md")
         assert art is not None
-        plan = parse_plan(art.content)
-        for w in plan.workers:
+        for w in parse_plan(art.content).workers:
+            if not w.task_id.startswith(f"{job_id}-w"):
+                raise RuntimeError(f"plan.md task id {w.task_id} isn't vigild's")  # item 16
             task = self._task(job_id, job.repo, job.base, job.source, w)
+            lacking = missing_tools(self.cfg, job.repo, w.test_cmd)
             try:
+                if lacking:
+                    raise RoutingError(f"the dev image lacks {lacking}")
                 r = route(task, self.cfg)
             except RoutingError as e:
-                self._page(job_id, f"{job_id}: {w.task_id} can't be routed", {"error": str(e)})
+                self._page(
+                    job_id, f"{job_id}: {w.task_id} can't run", {"error": str(e)}, resumable=True
+                )
                 self._block(job_id, f"routing: {e}")
                 return
             contract = task.model_copy(
                 update={"tier": r.tier, "tier_reason": r.tier_reason, "backend": r.preset}
             ).model_dump(mode="json")
             try:
-                self.store.get_task(w.task_id)
+                existing = self.store.get_task(w.task_id)
+                if existing.job_id != job_id:
+                    raise RuntimeError(f"task {w.task_id} belongs to {existing.job_id}")
                 self.store.update_task(w.task_id, contract=contract)
             except KeyError:
                 self.store.create_task(job_id, contract, Provenance.CLAUDE)
@@ -345,27 +508,36 @@ class JobRunner:
                 w.task_id, tier=r.tier, tier_reason=r.tier_reason, backend_preset=r.preset
             )
         transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD)
+        self.dispatch(job_id)
 
-        done: set[str] = set()
-        pending = list(plan.workers)
+    def dispatch(self, job_id: str) -> None:
+        """Run every task not yet published, in dependency waves."""
+        tasks = {t.id: t for t in self.store.list_tasks(job_id)}
+        done = {t for t, row in tasks.items() if row.state == "pr_open"}
+        pending = [t for t in tasks if t not in done]
         while pending:
-            wave = [w for w in pending if set(w.depends_on) <= done]
+            wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
             if not wave:
-                break  # the rest wait on a failed or waiting dependency
-            pending = [w for w in pending if w not in wave]
+                # Nothing can start: a dependency failed or is waiting (item 17).
+                stuck = {t: self.store.get_task(t).state for t in pending}
+                self._page(
+                    job_id,
+                    f"{job_id}: work is stuck behind unfinished dependencies",
+                    {"pending": stuck},
+                    resumable=True,
+                )
+                self._block(job_id, f"stuck: {sorted(stuck)}")
+                return
+            pending = [t for t in pending if t not in wave]
             try:
-                reservations = self._reserve_wave(job_id, [w.task_id for w in wave])
+                reservations = self._reserve_wave(job_id, wave)
             except Refused:
                 return
             with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = [
-                    pool.submit(self._run_worker, job_id, w.task_id, reservations[w.task_id])
-                    for w in wave
-                ]
+                futures = [pool.submit(self._run_worker, job_id, t, reservations[t]) for t in wave]
                 results = [f.result() for f in futures]
-            done |= {w.task_id for w, ok in zip(wave, results, strict=True) if ok}
-        tasks = self.store.list_tasks(job_id)
-        if tasks and all(t.state == "pr_open" for t in tasks):
+            done |= {t for t, ok in zip(wave, results, strict=True) if ok}
+        if all(t.state == "pr_open" for t in self.store.list_tasks(job_id)):
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
 
     def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, int]:
@@ -373,8 +545,7 @@ class JobRunner:
         release them, block the job and page: dispatch halts."""
         held: dict[str, int] = {}
         for tid in task_ids:
-            t = self.store.get_task(tid)
-            amount = float(t.contract["limits"]["max_cost_usd"])
+            amount = float(self.store.get_task(tid).contract["limits"]["max_cost_usd"])
             try:
                 held[tid] = self.budget.reserve(
                     session_id=None, task_id=tid, amount=amount, purpose="worker"
@@ -388,37 +559,45 @@ class JobRunner:
                     job_id,
                     f"{job_id}: {e.cap} cap reached; dispatch halted",
                     {"cap": e.cap, "detail": e.detail, "tasks": task_ids},
+                    resumable=True,
                 )
                 self._block(job_id, f"budget: {e}")
                 raise Refused(str(e)) from e
         return held
 
-    def _write_job_artifacts(self, job_id: str, clone: Path) -> None:
-        for name in ("spec.md", "plan.md", "approval.json"):
-            art = self.store.get_artifact(job_id, name)
-            if art is None:
-                continue
-            path = clone / ".vigil" / job_id / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(art.content)
-        self.workspace._git(clone, "add", ".vigil")
-        self.workspace._git(clone, "commit", "-q", "-m", f"vigil: {job_id} spec, plan, approval")
-
     def _fail(
         self,
         job_id: str,
-        s: SessionRow,
+        s: SessionRow | None,
         task_id: str,
         title: str,
         body: dict[str, Any],
         state: str = "failed",
     ) -> bool:
-        self.store.update_session(s.id, status=state)
+        if s is not None:
+            self.store.update_session(s.id, status=state)
         self.store.update_task(task_id, state=state)
         self._page(job_id, title, {"task_id": task_id, **body})
         return False
 
     def _run_worker(self, job_id: str, task_id: str, reservation: int) -> bool:
+        held: dict[str, SessionRow] = {}
+        try:
+            return self._worker(job_id, task_id, reservation, held)
+        except Exception as e:  # the reservation never leaks (item 7)
+            log.exception("worker %s failed", task_id)
+            self.budget.settle(reservation)
+            return self._fail(
+                job_id,
+                held.get("s"),
+                task_id,
+                f"{task_id}: vigild error",
+                {"error": f"{type(e).__name__}: {e}"},
+            )
+
+    def _worker(
+        self, job_id: str, task_id: str, reservation: int, held: dict[str, SessionRow]
+    ) -> bool:
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
         contract = t.contract
@@ -432,10 +611,11 @@ class JobRunner:
             backend_preset=preset,
             branch=branch,
         )
-        # attach the wave's reservation to this session, so the gateway sees its headroom
+        held["s"] = s
+        # the gateway sees this session's headroom through its reservation
         self.store.x("UPDATE reservations SET session_id=? WHERE id=?", (s.id, reservation))
         try:
-            image = self._image(job.repo)
+            image = self.dev_images.ensure_fresh(job.repo)
         except StaleDevImage as e:
             self.budget.settle(reservation, 0.0)
             return self._fail(
@@ -447,8 +627,18 @@ class JobRunner:
                 state="waiting",
             )
         clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
-        self._write_job_artifacts(job_id, clone)
-        self.workspace.write_task(clone, contract)
+        base_sha = self.workspace.base_sha(task_id)
+        paths = []
+        for name in ("spec.md", "plan.md", "approval.json"):
+            art = self.store.get_artifact(job_id, name)
+            if art is not None:
+                path = clone / ".vigil" / job_id / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(art.content)
+                paths.append(f".vigil/{job_id}/{name}")
+        if paths:
+            self.workspace.commit_before_session(clone, paths, f"vigil: {job_id} spec and plan")
+        self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
         packet = assemble_worker(clone, contract, untrusted={}, approval_edits=edits)
@@ -470,9 +660,9 @@ class JobRunner:
             preset=preset,
             model=self.cfg.preset(preset).model or "",
             clone=clone,
-            session_dir=self.cfg.vigild.data_path / "sessions" / s.id,
+            session_dir=self._session_dir(s.id),
             max_turns=60,
-            max_minutes=40,
+            max_minutes=WORKER_MINUTES,
             max_budget_usd=float(contract["limits"]["max_cost_usd"]),
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
@@ -497,11 +687,19 @@ class JobRunner:
                 f"{task_id}: worker session {out.status}",
                 {"error": out.error or ""},
             )
-
-        art_dir = clone / ".vigil" / job_id / task_id
-        ask = art_dir / "ask_coord.json"
-        if ask.is_file():
-            question = json.loads(ask.read_text()).get("question", "")
+        try:
+            head = self.workspace.import_result(
+                job.repo, task_id, spec.session_dir / "out", branch, base_sha
+            )
+        except WorkspaceError as e:
+            return self._fail(job_id, s, task_id, f"{task_id}: result unusable", {"error": str(e)})
+        art_dir = f".vigil/{job_id}/{task_id}"
+        ask = self.workspace.read_blob(job.repo, head, f"{art_dir}/ask_coord.json", 16 << 10)
+        if ask is not None:
+            try:
+                question = str(json.loads(ask).get("question", ""))[:4000]
+            except json.JSONDecodeError, AttributeError:
+                question = "(unreadable ask_coord.json)"
             self.store.create_inbox_item(
                 "questions",
                 "ask_coord",
@@ -511,17 +709,23 @@ class JobRunner:
                     "question": question,
                     "task_id": task_id,
                     "coord_session_id": job.coord_session_id,
+                    "resumable": False,
                 },
                 Provenance.CLAUDE,
             )
             self.store.update_session(s.id, status="waiting")
             self.store.update_task(task_id, state="waiting")
             return False
+        raw = self.workspace.read_blob(job.repo, head, f"{art_dir}/worker_report.json", 256 << 10)
         try:
-            report = read_worker_report(clone, job_id, task_id)
-        except ArtifactError as e:
+            report = WorkerReport.model_validate_json(raw or "")
+        except ValidationError as e:
             return self._fail(
-                job_id, s, task_id, f"{task_id}: no valid worker_report.json", {"error": str(e)}
+                job_id,
+                s,
+                task_id,
+                f"{task_id}: no valid worker_report.json",
+                {"error": str(e)[:1000]},
             )
         self.store.add_artifact(
             job_id,
@@ -530,10 +734,15 @@ class JobRunner:
             Provenance.CLAUDE,
             task_id=task_id,
         )
-        harness_path = art_dir / "harness_tests.json"
-        harness = json.loads(harness_path.read_text()) if harness_path.is_file() else {}
         errors = check_worker(
-            clone, job.base, contract, report, harness, cost=session_cost(self.store, s.id)
+            self.workspace,
+            job.repo,
+            base_sha,
+            head,
+            contract,
+            report,
+            self._harness(spec),
+            cost=session_cost(self.store, s.id),
         )
         if errors:
             return self._fail(
@@ -542,14 +751,15 @@ class JobRunner:
         body = (
             f"{report.summary}\n\nJob `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
-            f"{report.test_before.value} → {report.test_after.value}.\n\n"
-            f"Self-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
+            f"{report.test_before.value} → {report.test_after.value} (observed by the harness)."
+            f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
         try:
             url = self.publisher.publish(
-                clone,
                 repo=job.repo,
+                head=head,
+                base_sha=base_sha,
                 branch=branch,
                 base=job.base,
                 title=f"[vigil {job_id}] {contract['spec']['goal']}",
@@ -562,7 +772,7 @@ class JobRunner:
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
-            {"pr_url": url, "branch": branch},
+            {"pr_url": url, "branch": branch, "head": head},
             Provenance.HUMAN,
             job_id=job_id,
             session_id=s.id,
@@ -577,15 +787,17 @@ class JobRunner:
 class GitHubPublisher:
     """Mints a one-hour, one-repo token for each publish and revokes it after."""
 
-    def __init__(self, app: Any, http: Any) -> None:
+    def __init__(self, app: Any, http: Any, workspace: Workspace) -> None:
         self.app = app
         self.http = http
+        self.workspace = workspace
 
     def publish(
         self,
-        clone: Path,
         *,
         repo: str,
+        head: str,
+        base_sha: str,
         branch: str,
         base: str,
         title: str,
@@ -597,8 +809,10 @@ class GitHubPublisher:
 
         with self.app.lease(repo, WORKER_PERMISSIONS) as tok:
             return publish(
-                clone,
+                self.workspace,
                 repo=repo,
+                head=head,
+                base_sha=base_sha,
                 branch=branch,
                 base=base,
                 title=title,
@@ -612,9 +826,10 @@ class GitHubPublisher:
 class NoPublisher:
     def publish(
         self,
-        clone: Path,
         *,
         repo: str,
+        head: str,
+        base_sha: str,
         branch: str,
         base: str,
         title: str,
@@ -622,39 +837,3 @@ class NoPublisher:
         scope: list[str],
     ) -> str:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
-
-
-def build_runner(v: Any) -> JobRunner:
-    import docker
-    import httpx2
-
-    from vigild.devimage import DockerImages
-    from vigild.executors.runtime import DockerRuntime
-    from vigild.github.app import GitHubApp
-
-    client = docker.from_env()
-    publisher: Publisher = NoPublisher()
-    app_id, key_path = v.secrets.get("GITHUB_APP_ID"), v.secrets.get("GITHUB_APP_KEY_PATH")
-    if app_id and key_path:
-        http = httpx2.Client(timeout=30)
-        app = GitHubApp(
-            app_id,
-            Path(key_path).expanduser().read_bytes(),
-            http=http,
-            claude_mods=v.cfg.vigild.github.claude_mods,
-            allowed_repos=list(v.cfg.repos.repos),
-        )
-        publisher = GitHubPublisher(app, http)
-    runner = JobRunner(
-        v.cfg,
-        v.store,
-        v.budget,
-        v.gateway,
-        DockerRuntime(v.cfg, client),
-        Workspace(v.cfg.vigild.data_path),
-        publisher,
-        v.telemetry,
-        DevImages(v.cfg, v.store, DockerImages(client)),
-    )
-    runner.jobs = v.services.jobs
-    return runner

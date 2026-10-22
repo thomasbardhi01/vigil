@@ -25,11 +25,13 @@ def test_mirror_then_clone(ws: Workspace) -> None:
     assert (ws.data_dir / "mirrors" / "o" / "fixture.git").is_dir()
 
 
-def test_clone_origin_is_the_real_remote_not_the_mirror(
-    ws: Workspace, fixture_repo: dict[str, Path]
-) -> None:
+def test_clone_has_no_remote_and_copied_objects(ws: Workspace) -> None:
     clone = ws.clone("o/fixture", "fx-0001-w1", branch="vigil/fx-0001-w1-doc", base="main")
-    assert git(clone, "remote", "get-url", "origin") == str(fixture_repo["bare"])
+    assert git(clone, "remote") == ""  # the worker never pushes; vigild does, from the vault
+    mirror = ws.data_dir / "mirrors" / "o" / "fixture.git"
+    clone_objs = {p.stat().st_ino for p in (clone / ".git" / "objects").rglob("*") if p.is_file()}
+    mirror_objs = {p.stat().st_ino for p in (mirror / "objects").rglob("*") if p.is_file()}
+    assert not clone_objs & mirror_objs  # no hard links a worker could write through
 
 
 def test_two_clones_are_independent(ws: Workspace) -> None:
@@ -58,11 +60,56 @@ def test_task_json_is_written_and_ignored(ws: Workspace) -> None:
     assert git(clone, "status", "--porcelain") == ""
 
 
-def test_files_changed_against_base(ws: Workspace) -> None:
-    clone = ws.clone("o/fixture", "fx-0001-w1", branch="vigil/a", base="main")
-    (clone / "docs" / "runbook.md").write_text("changed\n")
-    git(clone, "commit", "-qam", "c")
-    assert ws.files_changed(clone, "main") == ["docs/runbook.md"]
+def test_mirror_ignores_ambient_git_config(
+    ws: Workspace, tmp_path: Path, monkeypatch: object
+) -> None:
+    """Item 22: a global credential helper or insteadOf rule never applies."""
+    marker = tmp_path / "HELPER-RAN"
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text(
+        f'[credential]\n\thelper = !touch {marker}\n[url "{tmp_path}/nowhere/"]\n\tinsteadOf = /\n'
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))  # type: ignore[attr-defined]
+    ws.clone("o/fixture", "fx-0001-w1", branch="vigil/a", base="main")
+    assert not marker.exists()
+
+
+def test_mirror_uses_a_read_token_when_configured(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    from contextlib import contextmanager
+
+    asked: list[str] = []
+
+    @contextmanager
+    def token_for(repo: str):  # type: ignore[no-untyped-def]
+        asked.append(repo)
+        yield None
+
+    w = Workspace(
+        tmp_path / "d", remote_url=lambda r: str(fixture_repo["bare"]), token_for=token_for
+    )
+    w.clone("o/fixture", "fx-0001-w1", branch="vigil/a", base="main")
+    assert asked == ["o/fixture"]
+
+
+def test_mirror_updates_are_serialized_per_repo(ws: Workspace) -> None:
+    import threading
+
+    errors: list[Exception] = []
+
+    def go(i: int) -> None:
+        try:
+            ws.clone("o/fixture", f"fx-0001-w{i}", branch=f"vigil/w{i}", base="main")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
 
 
 def test_read_only_overlays(ws: Workspace) -> None:

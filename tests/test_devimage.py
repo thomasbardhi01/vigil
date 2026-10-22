@@ -54,7 +54,7 @@ def test_never_validated_is_refused(parts: tuple[DevImages, FakeDocker, Clock]) 
 def test_validated_is_fresh(parts: tuple[DevImages, FakeDocker, Clock]) -> None:
     images, docker, _ = parts
     assert images.validate(PA).ok
-    assert docker.ran[0][1] == images.cfg.repo(PA).dev_image_check
+    assert docker.ran[0][1].startswith(f"({images.cfg.repo(PA).dev_image_check})")
     images.ensure_fresh(PA)
 
 
@@ -88,3 +88,51 @@ def test_a_missing_image_is_refused(parts: tuple[DevImages, FakeDocker, Clock]) 
     docker.image_id = None  # type: ignore[assignment]
     with pytest.raises(StaleDevImage, match="not present"):
         images.ensure_fresh(PA)
+
+
+# --- blocker 4: a test the dev image can't run is refused, not accepted -------------------
+
+from vigild.devimage import missing_tools, tools_in  # noqa: E402
+
+
+def test_validation_checks_each_declared_tool(parts: tuple[DevImages, FakeDocker, Clock]) -> None:
+    images, docker, _ = parts
+    images.validate(PA)
+    cmd = docker.ran[0][1]
+    for tool in images.cfg.repo(PA).dev_image_tools:
+        assert f"command -v {tool}" in cmd
+
+
+@pytest.mark.parametrize(
+    "cmd,tools",
+    [
+        ("pnpm test", ["pnpm"]),
+        ("grep -q x a.md && test -f b", ["grep", "test"]),
+        ("CI=1 pnpm -C server test | tail -3", ["pnpm", "tail"]),
+        ("cd docs; grep x a.md || true", ["cd", "grep", "true"]),
+    ],
+)
+def test_tools_in(cmd: str, tools: list[str]) -> None:
+    assert tools_in(cmd) == tools
+
+
+def test_parkagent_image_has_no_pnpm_so_pnpm_tests_are_refused(cfg: Config) -> None:
+    assert missing_tools(cfg, PA, "pnpm -C server test") == ["pnpm"]
+    assert missing_tools(cfg, PA, "grep -q 'rate limit' docs/feature-map.md") == []
+
+
+def test_validate_all_covers_every_repo(parts: tuple[DevImages, FakeDocker, Clock]) -> None:  # item 21
+    images, docker, _ = parts
+    out = images.validate_all()
+    assert sorted(v.repo for v in out) == sorted(images.cfg.repos.repos)
+    for repo in images.cfg.repos.repos:
+        images.ensure_fresh(repo)
+
+
+def test_validation_is_due_daily(parts: tuple[DevImages, FakeDocker, Clock]) -> None:  # item 21
+    images, _, clock = parts
+    assert images.due(PA)
+    images.validate(PA)
+    assert not images.due(PA)
+    clock.now += timedelta(hours=24, minutes=1)
+    assert images.due(PA)

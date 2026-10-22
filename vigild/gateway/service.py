@@ -20,23 +20,46 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx2
 
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config, Preset, Secrets
-from vigild.db import Store, iso
+from vigild.db import Store, iso, utcnow
 from vigild.metering.calls import CallUsage, SSEUsageTap, record_call, usage_from_anthropic
 from vigild.metering.prices import PriceTable
 from vigild.provenance import Provenance
 from vigild.repos import RepoPolicyError, check_backend
 
 FORWARD_HEADERS = ("anthropic-version", "anthropic-beta", "content-type", "accept")
+# Review round 1, item 5: only plain Messages requests pass. Server tools and
+# MCP connectors would let Anthropic fetch from or post to hosts the session's
+# proxy never allowed, and run up fees the gateway doesn't meter.
+ALLOWED_BODY_KEYS = frozenset({
+    "model", "messages", "system", "max_tokens", "metadata", "stop_sequences", "stream",
+    "temperature", "top_p", "top_k", "tools", "tool_choice", "thinking", "output_config",
+    "context_management",
+})  # fmt: skip
+CLIENT_TOOL_TYPES = re.compile(r"^(custom|bash_\d{8}|text_editor_\d{8}|memory_\d{8})$")
+# Betas Claude Code 2.1.306 sends (observed through the gateway, 2026-10-22),
+# plus the ones vigild's own calls use. Anything else is refused by name.
+ALLOWED_BETAS = frozenset({
+    "claude-code-20250219", "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14", "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05", "effort-2025-11-24",
+})  # fmt: skip
+# The CLI's own small-model side calls (titles, summaries) use this model; it is
+# the one model a session may call besides its routed one, where the repo allows it.
+SIDE_MODELS = frozenset({"claude-haiku-5-5"})
+TOKEN_TTL_MARGIN_MIN = 15
 METERED_PATHS = ("/v1/messages",)
 FREE_PATHS = ("/v1/messages/count_tokens",)
 CHARS_PER_TOKEN = 3  # deliberately low, so the input estimate errs high
@@ -65,6 +88,18 @@ class GatewaySession:
     preset: str
     task_id: str | None
     job_id: str | None
+    model: str = ""
+
+
+@dataclass
+class Hold:
+    """One in-flight call's worst case, held against its session until it settles."""
+
+    session_id: str
+    amount: float
+    preset: Preset
+    body: dict[str, Any]
+    released: bool = False
 
 
 def _hash(token: str) -> str:
@@ -89,18 +124,30 @@ class Gateway:
         self.prices = PriceTable(cfg.prices)
         self.sync_client = httpx2.Client(transport=transport, timeout=UPSTREAM_TIMEOUT)
         self.async_client = httpx2.AsyncClient(transport=async_transport, timeout=UPSTREAM_TIMEOUT)
+        self._inflight: dict[str, float] = {}
+        self._inflight_lock = threading.Lock()
 
     # --- tokens -------------------------------------------------------------------
 
-    def issue_token(self, session_id: str, repo: str, preset: str) -> str:
+    def issue_token(self, session_id: str, repo: str, preset: str, *, ttl_minutes: int = 60) -> str:
+        """A session's token: its repo, its preset's model, and a life of the
+        session's own limit plus a margin (review round 1, item 7)."""
         check_backend(self.cfg, repo, preset)
         token = "vgw_" + secrets.token_urlsafe(32)
+        expires = utcnow() + timedelta(minutes=ttl_minutes)
         self.store.x(
-            "INSERT INTO gateway_tokens (token_hash, session_id, repo, backend_preset, created_at)"
-            " VALUES (?,?,?,?,?)",
-            (_hash(token), session_id, repo, preset, iso()),
-        )
+            "INSERT INTO gateway_tokens (token_hash, session_id, repo, backend_preset, model,"
+            " created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+            (_hash(token), session_id, repo, preset, self.cfg.preset(preset).model or "", iso(),
+             iso(expires)),
+        )  # fmt: skip
         return token
+
+    def revoke_all(self) -> int:
+        """At startup: no token from before a restart survives it."""
+        rows = self.store.q("SELECT COUNT(*) n FROM gateway_tokens WHERE revoked_at IS NULL")
+        self.store.x("UPDATE gateway_tokens SET revoked_at=? WHERE revoked_at IS NULL", (iso(),))
+        return int(rows[0]["n"])
 
     def revoke(self, session_id: str) -> None:
         self.store.x(
@@ -112,7 +159,8 @@ class Gateway:
         if not token:
             raise GatewayError(401, "authentication_error", "missing session token")
         rows = self.store.q(
-            "SELECT g.session_id, g.repo, g.backend_preset, g.revoked_at, s.task_id, s.job_id"
+            "SELECT g.session_id, g.repo, g.backend_preset, g.revoked_at, g.model, g.expires_at,"
+            " s.task_id, s.job_id"
             " FROM gateway_tokens g LEFT JOIN sessions s ON s.id = g.session_id"
             " WHERE g.token_hash=?",
             (_hash(token),),
@@ -120,8 +168,10 @@ class Gateway:
         if not rows or rows[0]["revoked_at"]:
             raise GatewayError(401, "authentication_error", "invalid or revoked session token")
         r = rows[0]
+        if r["expires_at"] and datetime.fromisoformat(r["expires_at"]) <= utcnow():
+            raise GatewayError(401, "authentication_error", "session token expired")
         return GatewaySession(
-            r["session_id"], r["repo"], r["backend_preset"], r["task_id"], r["job_id"]
+            r["session_id"], r["repo"], r["backend_preset"], r["task_id"], r["job_id"], r["model"]
         )
 
     # --- checks ---------------------------------------------------------------------
@@ -146,9 +196,15 @@ class Gateway:
             if (p := self.cfg.backends.presets[name]).provider == provider and p.model
         }
 
-    def _check_model(self, repo: str, preset: Preset, model: str | None) -> str:
+    def _check_model(
+        self, repo: str, preset: Preset, model: str | None, bound: str | None = None
+    ) -> str:
         if not model:
             raise GatewayError(400, "invalid_request_error", "model is required")
+        if bound and model != bound and model not in SIDE_MODELS:
+            raise GatewayError(
+                403, "permission_error", f"this session may call {bound}, not {model}"
+            )
         if model not in self._allowed_models(repo, preset.provider):
             raise GatewayError(
                 403,
@@ -160,9 +216,50 @@ class Gateway:
         return model
 
     def worst_case(self, model: str, body: dict[str, Any], raw_len: int) -> float:
+        """The most a call could cost: every input token written to the 1-hour
+        cache (the dearest input rate), plus max_tokens of output."""
         est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
         max_out = int(body.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        return self.prices.cost(model, CallUsage(tokens_in=est_in, tokens_out=max_out))
+        return self.prices.cost(model, CallUsage(tokens_cache_write_1h=est_in, tokens_out=max_out))
+
+    def _check_body(self, body: dict[str, Any], headers: dict[str, str]) -> None:
+        extra = sorted(set(body) - ALLOWED_BODY_KEYS)
+        if extra:
+            raise GatewayError(403, "permission_error", f"request fields not allowed: {extra}")
+        for tool in body.get("tools") or []:
+            kind = tool.get("type") if isinstance(tool, dict) else None
+            if kind is not None and not CLIENT_TOOL_TYPES.match(str(kind)):
+                raise GatewayError(403, "permission_error", f"server tool {kind} is not allowed")
+        betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+        refused = [b for b in betas if b not in ALLOWED_BETAS]
+        if refused:
+            raise GatewayError(403, "permission_error", f"betas not allowed: {refused}")
+
+    def _hold(self, session_id: str, amount: float) -> float:
+        """Reserve `amount` of the session's headroom for one in-flight call."""
+        with self._inflight_lock:
+            held = self._inflight.get(session_id, 0.0)
+            headroom = self.budget.session_headroom(session_id) - held
+            if amount > headroom:
+                raise GatewayError(
+                    403,
+                    "permission_error",
+                    f"budget: this call could cost ${amount:.4f}; the session has "
+                    f"${headroom:.4f} of its reservation left after calls in flight",
+                )
+            self._inflight[session_id] = held + amount
+            return amount
+
+    def release(self, hold: Hold) -> None:
+        if hold.released:
+            return
+        hold.released = True
+        with self._inflight_lock:
+            left = self._inflight.get(hold.session_id, 0.0) - hold.amount
+            if left > 1e-12:
+                self._inflight[hold.session_id] = left
+            else:
+                self._inflight.pop(hold.session_id, None)
 
     def _key(self, preset: Preset) -> str:
         key = self.secrets.get(preset.key_ref)
@@ -181,7 +278,9 @@ class Gateway:
         )
         return err
 
-    def preflight(self, gs: GatewaySession, path: str, raw: bytes) -> tuple[Preset, dict[str, Any]]:
+    def preflight(
+        self, gs: GatewaySession, path: str, raw: bytes, headers: dict[str, str] | None = None
+    ) -> Hold:
         if path not in METERED_PATHS + FREE_PATHS:
             raise GatewayError(404, "not_found_error", f"{path} is not served")
         try:
@@ -190,20 +289,16 @@ class Gateway:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError as e:
                 raise GatewayError(400, "invalid_request_error", "body is not JSON") from e
-            model = self._check_model(gs.repo, preset, body.get("model"))
+            if not isinstance(body, dict):
+                raise GatewayError(400, "invalid_request_error", "body must be an object")
+            self._check_body(body, headers or {})
+            model = self._check_model(gs.repo, preset, body.get("model"), gs.model or None)
+            amount = 0.0
             if path in METERED_PATHS:
-                worst = self.worst_case(model, body, len(raw))
-                headroom = self.budget.session_headroom(gs.session_id)
-                if worst > headroom:
-                    raise GatewayError(
-                        403,
-                        "permission_error",
-                        f"budget: this call could cost ${worst:.4f}; the session has "
-                        f"${headroom:.4f} of its reservation left",
-                    )
+                amount = self._hold(gs.session_id, self.worst_case(model, body, len(raw)))
         except GatewayError as e:
             raise self._refuse(gs, e) from None
-        return preset, body
+        return Hold(gs.session_id, amount, preset, body)
 
     # --- forwarding ------------------------------------------------------------------
 
@@ -247,19 +342,25 @@ class Gateway:
     async def forward(
         self, gs: GatewaySession, path: str, headers: dict[str, str], raw: bytes
     ) -> tuple[int, dict[str, str], AsyncIterator[bytes] | bytes]:
-        preset, body = self.preflight(gs, path, raw)
-        key = self._key(preset)
-        url = preset.base_url.rstrip("/") + path
-        req = self.async_client.build_request(
-            "POST", url, headers=self._headers(headers, key), content=raw
-        )
-        started = time.monotonic()
-        resp = await self.async_client.send(req, stream=True)
+        hold = self.preflight(gs, path, raw, headers)
+        preset, body = hold.preset, hold.body
+        try:
+            key = self._key(preset)
+            url = preset.base_url.rstrip("/") + path
+            req = self.async_client.build_request(
+                "POST", url, headers=self._headers(headers, key), content=raw
+            )
+            started = time.monotonic()
+            resp = await self.async_client.send(req, stream=True)
+        except BaseException:
+            self.release(hold)
+            raise
         ctype = resp.headers.get("content-type", "")
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:
             data = await resp.aread()
             await resp.aclose()
+            self.release(hold)
             return resp.status_code, out_headers, data
         if "text/event-stream" in ctype and resp.status_code == 200:
             tap = SSEUsageTap()
@@ -273,6 +374,7 @@ class Gateway:
                         yield chunk
                 finally:
                     await resp.aclose()
+                    self.release(hold)
                     self._record(
                         gs=gs,
                         preset_name=gs.preset,
@@ -284,8 +386,11 @@ class Gateway:
                     )
 
             return resp.status_code, out_headers, gen()
-        data = await resp.aread()
-        await resp.aclose()
+        try:
+            data = await resp.aread()
+            await resp.aclose()
+        finally:
+            self.release(hold)
         if resp.status_code == 200:
             try:
                 payload = json.loads(data)

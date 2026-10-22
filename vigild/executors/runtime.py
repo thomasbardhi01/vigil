@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import socket
 import threading
 from collections.abc import Iterator
@@ -71,6 +72,9 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
     mounts = [
         _mount(str(spec.clone), "/work", read_only=False),
         _mount(str(spec.session_dir / "packet.md"), "/vigil/packet.md", read_only=True),
+        # The harness's result: the branch as a git bundle and its test record.
+        # vigild reads them with safe_read_bytes; host git never touches /work.
+        _mount(str(spec.session_dir / "out"), "/vigil/out", read_only=False),
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
     return {
@@ -105,6 +109,10 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
 def write_session_files(cfg: Config, spec: SessionSpec) -> None:
     sd = spec.session_dir
     (sd / "proxy").mkdir(parents=True, exist_ok=True)
+    if (sd / "out").exists():
+        shutil.rmtree(sd / "out")
+    (sd / "out").mkdir()
+    (sd / "out").chmod(0o777)
     (sd / "packet.md").write_text(spec.packet)
     (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role)))
     (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg))
@@ -201,6 +209,18 @@ class DockerRuntime:
             finally:
                 with suppress(docker.errors.APIError):
                     worker.remove(force=True)
+
+    def reap(self) -> int:
+        """At startup: remove every container and network a session left behind."""
+        n = 0
+        for c in self.client.containers.list(all=True, filters={"label": LABEL}):
+            with contextlib.suppress(Exception):
+                c.remove(force=True)
+                n += 1
+        for net in self.client.networks.list(filters={"label": LABEL}):
+            with contextlib.suppress(Exception):
+                net.remove()
+        return n
 
     def _follow(self, worker: Any, spec: SessionSpec, on_event: EventSink) -> ExecOutcome:
         timed_out = threading.Event()

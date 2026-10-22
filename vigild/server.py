@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,8 +22,10 @@ from vigild.api.app import create_app
 from vigild.budget import Budget
 from vigild.config import Config, Secrets
 from vigild.db import Store
+from vigild.devimage import DevImages
 from vigild.gateway.app import create_gateway_app
 from vigild.gateway.service import Gateway
+from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService, Runner
 from vigild.services import Services, Tokens
 from vigild.telemetry.spans import Telemetry
@@ -48,6 +53,9 @@ class NullRunner:
 
     def on_approved(self, job_id: str) -> None:
         log.info("job %s approved; no runner attached", job_id)
+
+    def on_resume(self, job_id: str) -> None:
+        log.info("job %s resumed; no runner attached", job_id)
 
 
 @dataclass
@@ -93,33 +101,100 @@ def build(
 
 
 async def serve(v: Vigild) -> None:
+    """Loopback: the bearer-only API and the gateway. The Tailscale address: the
+    API with the UI's cookie login (P7). No Tailscale address, no UI login."""
     api = v.cfg.vigild.api
     gw = v.cfg.vigild.gateway
-    servers = [
-        uvicorn.Server(
-            uvicorn.Config(create_app(v.services), host=api.host, port=api.port, log_level="info")
-        ),
-        uvicorn.Server(
-            uvicorn.Config(
-                create_gateway_app(v.gateway), host=gw.host, port=gw.port, log_level="info"
-            )
-        ),
-    ]
+    configs = [
+        uvicorn.Config(create_app(v.services), host=api.host, port=api.port, log_level="info"),
+        uvicorn.Config(create_gateway_app(v.gateway), host=gw.host, port=gw.port,
+                       log_level="info"),
+    ]  # fmt: skip
     if api.tailscale_host:
-        servers.append(
-            uvicorn.Server(
-                uvicorn.Config(
-                    create_app(v.services), host=api.tailscale_host, port=api.port, log_level="info"
-                )
+        configs.append(
+            uvicorn.Config(
+                create_app(v.services, ui=True), host=api.tailscale_host, port=api.port,
+                log_level="info",
             )
-        )
-    await asyncio.gather(*(s.serve() for s in servers))
+        )  # fmt: skip
+    else:
+        log.warning("config: web UI login is off (api.tailscale_host is not set)")
+    await asyncio.gather(*(uvicorn.Server(c).serve() for c in configs))
+
+
+def _github_app(v: Vigild) -> Any:
+    import httpx2
+
+    from vigild.github.app import GitHubApp
+
+    app_id, key_path = v.secrets.get("GITHUB_APP_ID"), v.secrets.get("GITHUB_APP_KEY_PATH")
+    if not (app_id and key_path):
+        return None
+    return GitHubApp(
+        app_id, Path(key_path).expanduser().read_bytes(), http=httpx2.Client(timeout=30),
+        claude_mods=v.cfg.vigild.github.claude_mods, allowed_repos=list(v.cfg.repos.repos),
+    )  # fmt: skip
+
+
+def build_runner(v: Vigild, app: Any) -> JobRunner:
+    """The real executor, workspace and publisher behind the job service."""
+    import docker
+
+    from vigild.devimage import DockerImages
+    from vigild.executors.runtime import DockerRuntime
+    from vigild.github.app import READ_ONLY
+    from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
+    from vigild.workspace import Workspace
+
+    client = docker.from_env()
+
+    @contextmanager
+    def read_token(repo: str) -> Iterator[str | None]:
+        """Mirror fetches use a read-scoped App token, never host credentials (item 22)."""
+        with app.lease(repo, dict(READ_ONLY)) as tok:
+            yield tok.token
+
+    ws = Workspace(v.cfg.vigild.data_path, token_for=read_token)
+    publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
+    runtime = DockerRuntime(v.cfg, client)
+    runner = JobRunner(
+        v.cfg, v.store, v.budget, v.gateway, runtime, ws, publisher, v.telemetry,
+        DevImages(v.cfg, v.store, DockerImages(client)), reaper=runtime.reap,
+    )  # fmt: skip
+    runner.jobs = v.services.jobs
+    return runner
+
+
+def validate_images_forever(images: DevImages, stop: threading.Event) -> None:
+    """Dev images are validated at start and every 24 hours by vigild itself
+    (item 21): one way to do it, no launchd job."""
+    while not stop.is_set():
+        for repo in images.cfg.repos.repos:
+            if images.due(repo):
+                v = images.validate(repo)
+                log.info("dev image %s for %s: %s", v.image, repo, "ok" if v.ok else "FAILED")
+        stop.wait(3600)
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    from vigild.jobs.runner import build_runner
+    from vigild.repos import RepoPolicyError, verify_visibility
 
     v = build()
-    v.services.jobs.runner = build_runner(v)
+    app = _github_app(v)
+    if app is None:
+        raise SystemExit(
+            "vigild: the GitHub App isn't configured, so repo visibility can't be "
+            "verified; refusing to start (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)"
+        )
+    try:
+        verify_visibility(v.cfg, app.is_private)
+    except RepoPolicyError as e:
+        raise SystemExit(f"vigild: {e}") from e
+    runner = build_runner(v, app)
+    v.services.jobs.runner = runner
+    log.info("reconcile: %s", runner.reconcile())
+    stop = threading.Event()
+    threading.Thread(target=validate_images_forever, args=(runner.dev_images, stop),
+                     daemon=True).start()  # fmt: skip
     asyncio.run(serve(v))

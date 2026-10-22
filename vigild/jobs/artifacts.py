@@ -216,3 +216,21 @@ def parse_plan(text: str) -> PlanDoc:
                 msgs = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
                 doc.errors.append(f"verify entry {i + 1} does not validate: {msgs}")
     return doc
+
+
+def canonicalize_plan(job_id: str, text: str) -> str:
+    """Give plan.md's workers vigild's own ids, `{job}-w1`, `{job}-w2`, … in
+    order, remapping depends_on. A coord can't name a task id that collides
+    with another job's task, clone or branch (review round 1, item 16)."""
+    blocks = list(re.finditer(r"```json\s*\n(.*?)```", text, flags=re.S))
+    for m in blocks:
+        if '"workers"' not in m.group(1):
+            continue
+        raw = json.loads(m.group(1))
+        mapping = {w["task_id"]: f"{job_id}-w{i}" for i, w in enumerate(raw["workers"], start=1)}
+        for w in raw["workers"]:
+            w["task_id"] = mapping[w["task_id"]]
+            w["depends_on"] = [mapping.get(d, d) for d in w.get("depends_on", [])]
+        block = "```json\n" + json.dumps(raw, indent=1) + "\n```"
+        return text[: m.start()] + block + text[m.end() :]
+    return text

@@ -10,17 +10,26 @@ Protocol with vigild:
 - stdout: event lines `{"vigil_event": {...}}` while running, and one final
   `{"vigil_result": {...}}` line.
 
-The worker harness runs test_cmd before and after the agent (recorded in
-harness_tests.json), commits whatever the agent left uncommitted, and stops.
-It never pushes: vigild checks the branch and publishes it from the host (P2).
+The worker harness runs test_cmd before and after the agent and writes what
+it saw to /vigil/out/harness_tests.json. Before each test run and before it
+writes anything, it kills every other process in the container, so nothing the
+agent left running can rewrite the record. It commits whatever the agent left
+uncommitted and writes the branch as /vigil/out/result.bundle (from the base
+commit vigild recorded). vigild imports that bundle into its own repo; host git
+never runs in /work (review round 1, blocker 1). The harness never pushes.
+Tool inputs and results are redacted of anything token-shaped before they are
+emitted (item 13).
 Exit codes: 0 done, 2 bad input, 3 guard not loaded, 4 agent error.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -29,11 +38,48 @@ from typing import Any
 
 WORK = Path("/work")
 PACKET = Path("/vigil/packet.md")
+OUT = Path("/vigil/out")
+SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
+
+
+def redact(value: Any, token: str = "") -> Any:
+    if isinstance(value, str):
+        if token:
+            value = value.replace(token, "[redacted]")
+        return SECRETISH.sub("[redacted]", value)
+    if isinstance(value, dict):
+        return {k: redact(v, token) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v, token) for v in value]
+    return value
+
+
+def kill_strays() -> None:
+    """As PID 1, signal every other process in the container."""
+    if os.getpid() == 1:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(-1, signal.SIGKILL)
+        time.sleep(0.2)
+
+
+def write_out(name: str, data: bytes) -> None:
+    path = OUT / name
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 def emit(kind: str, payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps({kind: payload}) + "\n")
     sys.stdout.flush()
+
+
+def emit_event(token: str, event: dict[str, Any]) -> None:
+    emit("vigil_event", redact(event, token))
 
 
 def sh(cmd: str, timeout: int = 900) -> tuple[int, str]:
@@ -61,7 +107,7 @@ def outcome(code: int) -> str:
     if code == 0:
         return "pass"
     if code in (126, 127):
-        return "unknown"  # the command couldn't run in this image
+        return "unknown"  # couldn't run in this image: vigild rejects it, never accepts
     return "fail"
 
 
@@ -120,8 +166,8 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
             for b in msg.content:
                 if isinstance(b, ToolUseBlock):
                     result["tool_calls"] += 1
-                    emit(
-                        "vigil_event",
+                    emit_event(
+                        token,
                         {
                             "type": "tool_call",
                             "data": {"id": b.id, "name": b.name, "input": b.input},
@@ -131,8 +177,8 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
             for b in msg.content:
                 if isinstance(b, ToolResultBlock):
                     text = b.content if isinstance(b.content, str) else json.dumps(b.content)
-                    emit(
-                        "vigil_event",
+                    emit_event(
+                        token,
                         {
                             "type": "tool_result",
                             "data": {
@@ -173,6 +219,7 @@ def main() -> int:
     test_cmd = (task.get("spec") or {}).get("test_cmd") if role == "worker" else None
     if test_cmd:
         code, out = sh(test_cmd)
+        kill_strays()
         harness["before"] = {"exit": code, "outcome": outcome(code), "tail": out[-1000:]}
 
     started = time.monotonic()
@@ -184,27 +231,40 @@ def main() -> int:
         emit("vigil_result", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500]})
         return 4
 
+    kill_strays()  # nothing the agent started survives to touch what follows
     if test_cmd:
         code, out = sh(test_cmd)
+        kill_strays()
         harness["after"] = {"exit": code, "outcome": outcome(code), "tail": out[-1000:]}
-        report_dir = WORK / ".vigil" / task["job_id"] / task["task_id"]
-        report_dir.mkdir(parents=True, exist_ok=True)
-        (report_dir / "harness_tests.json").write_text(
-            json.dumps({**harness, "provenance": "human"}, indent=2) + "\n"
-        )
+        write_out("harness_tests.json", json.dumps({**harness, "provenance": "human"}).encode())
     if git("status", "--porcelain"):
         git("add", "-A")
         git("commit", "-q", "-m", f"vigil: {role} {task.get('task_id') or task.get('job_id')}")
+    branch, base_sha = task.get("branch"), task.get("base_sha")
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(OUT / "result.bundle")
+    if branch and base_sha:
+        git(
+            "bundle",
+            "create",
+            "-q",
+            str(OUT / "result.bundle"),
+            f"refs/heads/{branch}",
+            f"^{base_sha}",
+        )
     emit(
         "vigil_result",
-        {
-            "status": "done",
-            "role": role,
-            "head": git("rev-parse", "HEAD"),
-            "harness": harness,
-            "seconds": round(time.monotonic() - started, 1),
-            **agent,
-        },
+        redact(
+            {
+                "status": "done",
+                "role": role,
+                "head": git("rev-parse", "HEAD"),
+                "harness": harness,
+                "seconds": round(time.monotonic() - started, 1),
+                **agent,
+            },
+            token,
+        ),
     )
     return 0
 

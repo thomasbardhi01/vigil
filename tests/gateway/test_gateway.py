@@ -289,3 +289,107 @@ def test_internal_call_is_refused_when_the_day_is_spent(gw: Gateway, budget: Bud
             purpose="decider",
             job_id=None,
         )
+
+
+# --- review round 1 -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"mcp_servers": [{"type": "url", "url": "https://evil.example/mcp", "name": "x"}]},
+        {"tools": [{"type": "web_fetch_20260209", "name": "web_fetch"}]},
+        {"tools": [{"type": "web_search_20260209", "name": "web_search"}]},
+        {"tools": [{"type": "code_execution_20260521", "name": "code_execution"}]},
+        {"tools": [{"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-5-5"}]},
+        {"container": {"skills": []}},
+        {"surprise_key": 1},
+    ],
+)
+def test_server_tools_and_unknown_body_keys_are_refused(  # item 5
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    extra: dict[str, Any],
+) -> None:
+    _, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(**extra), headers={"x-api-key": tok})
+    assert r.status_code == 403, r.text
+    assert upstream.requests == []
+
+
+def test_client_tools_are_allowed(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway
+) -> None:  # item 5
+    _, tok = _session(store, budget, gw)
+    tools = [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}]
+    assert (
+        client.post("/v1/messages", json=_msg(tools=tools), headers={"x-api-key": tok}).status_code
+        == 200
+    )
+
+
+def test_unknown_betas_are_refused(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:  # item 5
+    _, tok = _session(store, budget, gw)
+    for beta in ("mcp-client-2025-11-20", "code-execution-2025-08-25", "made-up-beta-2030-01-01"):
+        r = client.post(
+            "/v1/messages",
+            json=_msg(),
+            headers={"x-api-key": tok, "anthropic-beta": f"claude-code-20250219,{beta}"},
+        )
+        assert r.status_code == 403 and beta in r.text
+    assert upstream.requests == []
+    ok = client.post(
+        "/v1/messages",
+        json=_msg(),
+        headers={"x-api-key": tok, "anthropic-beta": "claude-code-20250219"},
+    )
+    assert ok.status_code == 200
+
+
+def test_in_flight_calls_hold_their_worst_case(
+    gw: Gateway, store: Store, budget: Budget
+) -> None:  # item 6
+    _sid, tok = _session(store, budget, gw, amount=0.03)
+    gs = gw.authorize(tok)
+    body = json.dumps(_msg(max_tokens=2000)).encode()  # worst case ~ $0.02 on Sonnet
+    hold = gw.preflight(gs, "/v1/messages", body)
+    with pytest.raises(GatewayError, match="budget"):
+        gw.preflight(gs, "/v1/messages", body)  # the first is still in flight
+    gw.release(hold)
+    gw.release(gw.preflight(gs, "/v1/messages", body))
+
+
+def test_worst_case_prices_input_at_the_cache_write_rate(gw: Gateway) -> None:  # item 6
+    raw = b"x" * 300_000  # ~100k tokens estimated
+    worst = gw.worst_case("claude-sonnet-5-5", {"max_tokens": 1}, len(raw))
+    assert worst == pytest.approx(100_000 * 4.00 / 1e6 + 10 / 1e6)  # 1-hour cache write rate
+
+
+def test_tokens_expire(store: Store, budget: Budget, gw: Gateway) -> None:  # item 7
+    s = store.create_session(None, Role.WORKER, backend_preset="claude-sonnet")
+    tok = gw.issue_token(s.id, PA, "claude-sonnet", ttl_minutes=0)
+    with pytest.raises(GatewayError, match="expired"):
+        gw.authorize(tok)
+
+
+def test_revoke_all_on_restart(store: Store, budget: Budget, gw: Gateway) -> None:  # item 7
+    _, tok = _session(store, budget, gw)
+    assert gw.revoke_all() == 1
+    with pytest.raises(GatewayError):
+        gw.authorize(tok)
+
+
+def test_token_is_bound_to_the_sessions_model(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:  # item 9
+    _, tok = _session(store, budget, gw)  # a claude-sonnet session
+    r = client.post("/v1/messages", json=_msg(model="claude-opus-5-5"), headers={"x-api-key": tok})
+    assert r.status_code == 403 and upstream.requests == []
+    # the CLI's own small-model side calls (titles, summaries) are the one exception
+    r = client.post("/v1/messages", json=_msg(model="claude-haiku-5-5"), headers={"x-api-key": tok})
+    assert r.status_code == 200

@@ -5,17 +5,21 @@ a spec-writing job (routing rule 1).
 
 Per job (stage 1 acceptance): spec.md has every section, every acceptance
 criterion has a test command, every worker contract in plan.md validates,
-worker scopes sit inside the spec's scope, dependencies name real workers,
-and the money paths the spec flags are exactly the ones the path rules find.
+worker scopes sit inside the spec's scope (strict globs, no `..` or absolute
+paths), dependencies name real workers and form no cycle, parallel workers'
+scopes are provably disjoint and their interfaces pinned, every test_cmd can
+run in the repo's dev image, and the money paths the spec flags are exactly
+the ones the path rules find.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
-from vigild.intake.paths import matches, matches_any
+from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
 
 
@@ -35,12 +39,39 @@ def check_task(task: Task) -> GateResult:
     return GateResult(ok=not errors, needs_spec=bool(errors), errors=errors)
 
 
-def _in_scope(path: str, scope: Sequence[str]) -> bool:
-    return any(path == s or matches(path, s) for s in scope)
+TICKED = re.compile(r"`[^`]+`")
 
 
-def _overlap(a: str, b: str) -> bool:
-    return a == b or matches(a, b) or matches(b, a)
+def _scope_within(entry: str, spec_scope: Sequence[str]) -> bool:
+    """A worker's entry sits inside the spec's scope: a literal path must be in
+    scope; a glob must equal a spec entry or be covered by a `**` entry."""
+    if entry in spec_scope or (not set("*?[") & set(entry) and in_scope(entry, spec_scope)):
+        return True
+    return any(s.endswith("/**") and entry.startswith(s[:-2]) for s in spec_scope)
+
+
+def cycles(workers: list[WorkerContract]) -> list[str]:
+    deps = {w.task_id: [d for d in w.depends_on] for w in workers}
+    found: list[str] = []
+    state: dict[str, int] = {}
+
+    def visit(n: str, path: list[str]) -> None:
+        state[n] = 1
+        for d in deps.get(n, []):
+            if d not in deps:
+                continue
+            if state.get(d) == 1:
+                found.append(
+                    " -> ".join([*path[path.index(d) :], d]) if d in path else f"{n} -> {d}"
+                )
+            elif state.get(d) is None:
+                visit(d, [*path, d])
+        state[n] = 2
+
+    for n in deps:
+        if state.get(n) is None:
+            visit(n, [n])
+    return found
 
 
 def _ordered(workers: list[WorkerContract]) -> set[tuple[str, str]]:
@@ -69,8 +100,17 @@ def parallel_pairs(workers: list[WorkerContract]) -> list[tuple[WorkerContract, 
     ]
 
 
-def check_job_spec(spec: SpecDoc, plan: PlanDoc, money_globs: Sequence[str]) -> list[str]:
+def check_job_spec(
+    spec: SpecDoc,
+    plan: PlanDoc,
+    money_globs: Sequence[str],
+    *,
+    missing_tools: Callable[[str], list[str]] | None = None,
+) -> list[str]:
     errors: list[str] = []
+    for entry in spec.files_in_scope:
+        if err := scope_entry_error(entry):
+            errors.append(f"spec.md files in scope: {err}")
     for sec in SPEC_SECTIONS:
         if sec not in spec.sections:
             errors.append(f"spec.md is missing the '## {sec}' section")
@@ -90,22 +130,50 @@ def check_job_spec(spec: SpecDoc, plan: PlanDoc, money_globs: Sequence[str]) -> 
         for dep in w.depends_on:
             if dep not in ids:
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")
+        for f in w.files_in_scope + w.out_of_scope:
+            if err := scope_entry_error(f):
+                errors.append(f"worker {w.task_id}: {err}")
         for f in w.files_in_scope:
-            if not _in_scope(f, spec.files_in_scope):
+            if not scope_entry_error(f) and not _scope_within(f, spec.files_in_scope):
                 errors.append(f"worker {w.task_id} scope {f} is outside spec.md's files in scope")
+        if missing_tools is not None:
+            lacking = missing_tools(w.test_cmd)
+            if lacking:
+                errors.append(
+                    f"worker {w.task_id} test_cmd needs {lacking}, which the repo's dev image "
+                    "doesn't have; use a check the image can run"
+                )
+    for loop in cycles(plan.workers):
+        errors.append(f"plan.md has a dependency cycle: {loop}")
+    for c in spec.criteria:
+        if c.test_cmd and missing_tools is not None and missing_tools(c.test_cmd):
+            errors.append(
+                f"spec.md {c.ident} test needs {missing_tools(c.test_cmd)}, which the repo's "
+                "dev image doesn't have"
+            )
 
     # Single writer by default; parallel writers only with disjoint files and
     # interfaces pinned in spec.md (owner decisions 2026-10-22).
     pairs = parallel_pairs(plan.workers)
     for a, b in pairs:
-        shared = sorted({f for f in a.files_in_scope for g in b.files_in_scope if _overlap(f, g)})
+        shared = sorted(
+            {
+                f"{f} / {g}"
+                for f in a.files_in_scope
+                for g in b.files_in_scope
+                if globs_overlap(f, g)
+            }
+        )
         if shared:
             errors.append(
                 f"workers {a.task_id} and {b.task_id} run in parallel but their files are not "
                 f"disjoint: {shared}; order them with depends_on or split the files"
             )
-    if pairs and not spec.interfaces:
-        errors.append("parallel workers need their shared interfaces pinned in '## Interfaces'")
+    if pairs and not any(TICKED.search(i) for i in spec.interfaces):
+        errors.append(
+            "parallel workers need their shared interfaces pinned in '## Interfaces': "
+            "name the files, signatures or formats in backticks"
+        )
 
     # The verification ladder: every criterion's level, and why not higher at 0.
     levels = {v.criterion: v for v in plan.verify}

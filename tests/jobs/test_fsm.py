@@ -241,3 +241,13 @@ def test_force_never_skips_approval(store: Store) -> None:
     jid = _job(store)
     with pytest.raises(TransitionError):
         transition(store, jid, S.APPROVED, Actor.OWNER, channel="inbox", force=True)
+
+
+def test_in_review_reads_the_newest_session_by_sequence(store: Store) -> None:
+    """Nit (review r1): sessions made in the same second sort by insertion."""
+    jid = _job(store, S.BUILDING)
+    tid = _worker(store, jid, pr=True, report=True)
+    later = store.create_session(jid, Role.WORKER, task_id=tid, backend_preset="claude-sonnet")
+    store.update_session(later.id, status="failed")
+    with pytest.raises(TransitionError, match="PR"):
+        transition(store, jid, S.IN_REVIEW, Actor.VIGILD)

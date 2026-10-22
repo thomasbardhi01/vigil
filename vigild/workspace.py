@@ -1,31 +1,45 @@
-"""Per-task clones from a local mirror (B3).
+"""Mirrors, per-task clones, and the vault (B3, B25).
 
-Each repo has a bare mirror under <data>/mirrors; each task gets
-`git clone --local` of it under <data>/clones/<task_id> (objects are hard
-links, so it's nearly free), with origin pointed at the real remote. A clone
-is self-contained, unlike a `git worktree`, whose .git file points outside
-the container mount.
+- **Mirror:** a bare mirror per repo under <data>/mirrors, fetched with a
+  read-scoped App token when one is configured, never with ambient host
+  credentials, and updated by one fetch at a time per repo.
+- **Clone:** each session gets `git clone --no-hardlinks` of the mirror under
+  <data>/clones/<task_id> (copied objects, so a worker can't corrupt the
+  mirror through a shared inode). vigild records the base commit it cloned
+  at, outside the clone.
+- **Vault:** a bare repo per repo under <data>/vault that only vigild writes.
+  After a session the worker's result comes back as a git bundle written by
+  the harness. vigild copies it out with `safe_read_bytes`, fetches only the
+  session's branch into `refs/vigil/<task_id>`, checks the base it recorded
+  is an ancestor, and does every diff, artifact read and push from the vault.
+  Host git never runs in the worker's clone after the session starts.
 """
 
 from __future__ import annotations
 
-import base64
 import json
-import os
 import re
 import shutil
-import subprocess
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from vigild.gitsafe import GitError, git
+from vigild.safefile import UnsafeFile, safe_read_bytes
+
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 BRANCH = re.compile(r"^vigil/[A-Za-z0-9._/-]+$")
+SHA = re.compile(r"^[0-9a-f]{40}$")
 RO_DIRS = (".github", ".claude", ".opencode", ".git/hooks")
 RO_FILES = (".git/config",)
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
+MAX_BUNDLE = 512 << 20
+MAX_BLOB = 1 << 20
+TokenFor = Callable[[str], AbstractContextManager[str | None]]
 
 
 class WorkspaceError(RuntimeError):
@@ -43,93 +57,101 @@ def github_url(repo: str) -> str:
     return f"https://github.com/{repo}.git"
 
 
+def _no_token(repo: str) -> AbstractContextManager[str | None]:
+    return nullcontext(None)
+
+
 class Workspace:
-    def __init__(self, data_dir: Path, remote_url: Callable[[str], str] = github_url) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        remote_url: Callable[[str], str] = github_url,
+        token_for: TokenFor = _no_token,
+    ) -> None:
         self.data_dir = data_dir
         self.remote_url = remote_url
+        self.token_for = token_for
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    @contextmanager
+    def _repo_lock(self, repo: str) -> Iterator[None]:
+        with self._locks_guard:
+            lock = self._locks.setdefault(repo, threading.Lock())
+        with lock:
+            yield
 
     def _git(self, cwd: Path, *args: str, token: str | None = None) -> str:
-        env = dict(os.environ)
-        if token:
-            # The header goes through the environment of this one git process,
-            # never onto a command line (ps) or into a config file.
-            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-            env.update(
-                {
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "http.extraHeader",
-                    "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
-                }
-            )
-        out = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
-        if out.returncode != 0:
-            raise WorkspaceError(f"git {args[0]} failed: {out.stderr.strip()[:300]}")
-        return out.stdout.strip()
+        try:
+            return git(cwd, *args, token=token)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
 
-    def mirror(self, repo: str, token: str | None = None) -> Path:
+    # --- mirrors and clones ----------------------------------------------------------
+
+    def _mirror_path(self, repo: str) -> Path:
         owner, name = repo.split("/")
-        path = self.data_dir / "mirrors" / owner / f"{name}.git"
-        if path.exists():
-            self._git(path, "remote", "update", "--prune", token=token)
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._git(
-                path.parent,
-                "clone",
-                "--mirror",
-                "--quiet",
-                self.remote_url(repo),
-                str(path),
-                token=token,
-            )
+        return self.data_dir / "mirrors" / owner / f"{name}.git"
+
+    def mirror(self, repo: str) -> Path:
+        path = self._mirror_path(repo)
+        with self._repo_lock(repo), self.token_for(repo) as token:
+            if path.exists():
+                self._git(path, "remote", "update", "--prune", token=token)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._git(
+                    path.parent, "clone", "--mirror", "--quiet", self.remote_url(repo), str(path),
+                    token=token,
+                )  # fmt: skip
         return path
 
-    def clone(
-        self, repo: str, task_id: str, *, branch: str, base: str, token: str | None = None
-    ) -> Path:
+    def clone(self, repo: str, task_id: str, *, branch: str, base: str) -> Path:
         if not ID.match(task_id):
             raise WorkspaceError(f"bad task id {task_id!r}")
         if not BRANCH.match(branch) or ".." in branch:
             raise WorkspaceError(f"branch {branch!r} must be vigil/*")
-        mirror = self.mirror(repo, token)
+        mirror = self.mirror(repo)
+        base_sha = self._git(mirror, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
         dest = self.data_dir / "clones" / task_id
         if dest.exists():
             shutil.rmtree(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         self._git(
-            dest.parent, "clone", "--local", "--quiet", "--branch", base, str(mirror), str(dest)
-        )
-        self._git(dest, "remote", "set-url", "origin", self.remote_url(repo))
-        self._git(dest, "update-ref", f"refs/remotes/origin/{base}", "HEAD")
+            dest.parent, "clone", "--no-hardlinks", "--quiet", "--branch", base, str(mirror),
+            str(dest),
+        )  # fmt: skip
+        self._git(dest, "checkout", "--quiet", "--detach", base_sha)
         self._git(dest, "checkout", "--quiet", "-b", branch)
+        self._git(dest, "remote", "remove", "origin")
         self._git(dest, "config", "user.name", BOT_NAME)
         self._git(dest, "config", "user.email", BOT_EMAIL)
         exclude = dest / ".git" / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         with exclude.open("a") as f:
             f.write("\n/.vigil/task.json\n")
+        rec = self.data_dir / "clones" / f"{task_id}.base"
+        rec.write_text(json.dumps({"repo": repo, "base": base, "base_sha": base_sha}))
         return dest
+
+    def base_sha(self, task_id: str) -> str:
+        """The base commit vigild cloned at, read from vigild's own record."""
+        rec = self.data_dir / "clones" / f"{task_id}.base"
+        sha = str(json.loads(rec.read_text())["base_sha"])
+        if not SHA.match(sha):
+            raise WorkspaceError(f"bad base record for {task_id}")
+        return sha
+
+    def commit_before_session(self, clone: Path, paths: list[str], message: str) -> None:
+        """vigild's own commit in a clone, before any session has touched it."""
+        self._git(clone, "add", "--", *paths)
+        self._git(clone, "commit", "-q", "--no-verify", "-m", message)
 
     def write_task(self, clone: Path, contract: dict[str, Any]) -> Path:
         path = clone / ".vigil" / "task.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
         return path
-
-    def files_changed(self, clone: Path, base: str) -> list[str]:
-        out = self._git(clone, "diff", "--name-only", f"origin/{base}...HEAD")
-        return [line for line in out.splitlines() if line]
-
-    def diff(self, clone: Path, base: str, paths: list[str] | None = None) -> str:
-        return self._git(clone, "diff", f"origin/{base}...HEAD", "--", *(paths or []))
 
     def overlays(self, clone: Path) -> list[Mount]:
         """Read-only mounts over /work (B18). Missing dirs are created empty so
@@ -148,3 +170,88 @@ class Workspace:
         if clone.resolve().parent != root:
             raise WorkspaceError(f"{clone} is not a task clone")
         shutil.rmtree(clone)
+
+    # --- the vault ---------------------------------------------------------------------
+
+    def vault(self, repo: str) -> Path:
+        owner, name = repo.split("/")
+        path = self.data_dir / "vault" / owner / f"{name}.git"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._git(path.parent, "init", "--quiet", "--bare", str(path))
+        return path
+
+    def import_result(
+        self, repo: str, task_id: str, out_dir: Path, branch: str, base_sha: str
+    ) -> str:
+        """Take the session's branch from the bundle the harness wrote; return its head."""
+        if not SHA.match(base_sha):
+            raise WorkspaceError("bad base sha")
+        try:
+            data = safe_read_bytes(out_dir, out_dir / "result.bundle", MAX_BUNDLE)
+        except (OSError, UnsafeFile) as e:
+            raise WorkspaceError(f"no usable result bundle: {e}") from e
+        vault = self.vault(repo)
+        with self._repo_lock(f"vault:{repo}"):
+            mirror = self._mirror_path(repo)
+            self._git(
+                vault, "fetch", "--quiet", "--no-tags", str(mirror), "+refs/heads/*:refs/mirror/*"
+            )
+            tmp = self.data_dir / "vault" / "incoming" / f"{task_id}.bundle"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            try:
+                self._git(vault, "bundle", "verify", "--quiet", str(tmp))
+                ref = f"refs/vigil/{task_id}"
+                self._git(
+                    vault, "fetch", "--quiet", "--no-tags", str(tmp), f"+refs/heads/{branch}:{ref}"
+                )
+            finally:
+                tmp.unlink(missing_ok=True)
+            head = self._git(vault, "rev-parse", "--verify", f"{ref}^{{commit}}")
+            try:
+                self._git(vault, "merge-base", "--is-ancestor", base_sha, head)
+            except WorkspaceError as e:
+                raise WorkspaceError(
+                    f"{branch} does not descend from the base vigild recorded"
+                ) from e
+        return head
+
+    def changed(self, repo: str, base_sha: str, head: str) -> list[tuple[str, str]]:
+        """(status, path) for every file changed; renames show as delete + add."""
+        out = self._git(
+            self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            "--name-status", "-z", base_sha, head,
+        )  # fmt: skip
+        parts = out.split("\0")
+        return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2) if parts[i]]
+
+    def diff(self, repo: str, base_sha: str, head: str, path: str) -> str:
+        return self._git(
+            self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            base_sha, head, "--", path,
+        )  # fmt: skip
+
+    def read_blob(self, repo: str, head: str, path: str, max_bytes: int = MAX_BLOB) -> str | None:
+        """A regular file's content at `head`; None for a symlink, a submodule,
+        a missing path or one over the cap."""
+        vault = self.vault(repo)
+        entry = self._git(vault, "ls-tree", "-z", "--long", head, "--", path).rstrip("\0")
+        if not entry:
+            return None
+        meta, _, name = entry.partition("\t")
+        mode, kind, sha, size = meta.split()
+        if name != path or kind != "blob" or mode not in ("100644", "100755"):
+            return None
+        if int(size) > max_bytes:
+            return None
+        try:
+            return git(vault, "cat-file", "blob", sha, raw=True)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+
+    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+        self._git(
+            self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
+            f"{head}:refs/heads/{branch}", token=token,
+        )  # fmt: skip

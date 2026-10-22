@@ -1,25 +1,26 @@
 """Publish a worker's branch: push it and open its draft PR, from the host.
 
 P2 (owner, 2026-10-22): workers never hold a GitHub token. After a worker
-session ends, vigild checks the branch is `vigil/*` and that every file it
-changed is in the contract's scope (or the job's own `.vigil/` artifacts),
-then pushes with a one-hour installation token and opens a draft PR. A
-draft or nothing: there is no fallback to a ready-for-review PR.
+session ends, vigild has imported its branch into the vault
+(`Workspace.import_result`). Here it checks the branch is `vigil/*` and that
+every file changed since the base commit vigild recorded (renames counted as
+delete + add) is in the contract's scope or the job's own `.vigil/`
+artifacts, then pushes the commit from the vault with a one-hour
+installation token and opens a draft PR. A draft or nothing.
 """
 
 from __future__ import annotations
 
-import base64
-import os
 import re
-import subprocess
 from collections.abc import Sequence
-from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx2
 
-from vigild.intake.paths import matches
+from vigild.intake.paths import in_scope
+
+if TYPE_CHECKING:
+    from vigild.workspace import Workspace
 
 BRANCH = re.compile(r"^vigil/[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)*$")
 PROTECTED = {"main", "master"}
@@ -66,40 +67,17 @@ class RestPulls:
         return url
 
 
-def _git(cwd: Path, *args: str, token: str | None = None) -> str:
-    env = dict(os.environ)
-    if token:
-        # The header reaches only this git process: never argv, never a file.
-        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        env.update(
-            {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "http.extraHeader",
-                "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
-                "GIT_TERMINAL_PROMPT": "0",
-            }
-        )
-    out = subprocess.run(
-        ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=300, check=False
-    )
-    if out.returncode != 0:
-        raise PublishError(f"git {args[0]} failed: {out.stderr.strip()[:300]}")
-    return out.stdout.strip()
-
-
 def out_of_scope(changed: Sequence[str], scope: Sequence[str]) -> list[str]:
     """Changed files that are neither in scope nor vigil's own artifacts."""
-    return [
-        f
-        for f in changed
-        if not f.startswith(".vigil/") and not any(f == s or matches(f, s) for s in scope)
-    ]
+    return [f for f in changed if not f.startswith(".vigil/") and not in_scope(f, scope)]
 
 
 def publish(
-    clone: Path,
+    ws: Workspace,
     *,
     repo: str,
+    head: str,
+    base_sha: str,
     branch: str,
     base: str,
     title: str,
@@ -108,20 +86,22 @@ def publish(
     scope: Sequence[str],
     token: str | None = None,
 ) -> str:
-    """Check, push `branch` to origin, and open a draft PR into `base`."""
+    """Check, push `head` to `branch`, and open a draft PR into `base`."""
+    from vigild.workspace import WorkspaceError
+
     if branch in PROTECTED or branch == base or not BRANCH.match(branch) or ".." in branch:
         raise PublishError(f"refusing to publish branch {branch!r}: only vigil/* branches")
-    head = _git(clone, "rev-parse", "--abbrev-ref", "HEAD")
-    if head != branch:
-        raise PublishError(f"{branch} is not checked out (HEAD is {head})")
-    ahead = _git(clone, "rev-list", "--count", f"origin/{base}..HEAD")
-    if int(ahead or 0) == 0:
-        raise PublishError(f"{branch} has no commits ahead of {base}")
-    changed = [
-        f for f in _git(clone, "diff", "--name-only", f"origin/{base}...HEAD").splitlines() if f
-    ]
+    try:
+        changed = [path for _, path in ws.changed(repo, base_sha, head)]
+    except WorkspaceError as e:
+        raise PublishError(str(e)) from e
+    if not changed:
+        raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
     outside = out_of_scope(changed, scope)
     if outside:
         raise PublishError(f"files changed outside the contract's scope: {outside}")
-    _git(clone, "push", "origin", f"HEAD:refs/heads/{branch}", token=token)
+    try:
+        ws.push(repo, head, branch, token)
+    except WorkspaceError as e:
+        raise PublishError(str(e)) from e
     return pulls.create_pull(repo, head=branch, base=base, title=title, body=body, draft=True)

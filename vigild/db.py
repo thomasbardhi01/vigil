@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS decisions (
   model_version TEXT, action TEXT NOT NULL, ts TEXT NOT NULL, {PROV});
 CREATE TABLE IF NOT EXISTS gateway_tokens (
   token_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL, repo TEXT NOT NULL,
-  backend_preset TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT);
+  backend_preset TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  expires_at TEXT, revoked_at TEXT);
 CREATE TABLE IF NOT EXISTS dev_images (
   id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, image TEXT NOT NULL,
   image_id TEXT, ok INTEGER NOT NULL, output TEXT NOT NULL, validated_at TEXT NOT NULL);
@@ -341,11 +342,9 @@ class Store:
 
     def list_sessions(self, job_id: str | None = None) -> list[SessionRow]:
         if job_id is None:
-            rows = self.q("SELECT id FROM sessions ORDER BY created_at, id")
+            rows = self.q("SELECT id FROM sessions ORDER BY rowid")
         else:
-            rows = self.q(
-                "SELECT id FROM sessions WHERE job_id=? ORDER BY created_at, id", (job_id,)
-            )
+            rows = self.q("SELECT id FROM sessions WHERE job_id=? ORDER BY rowid", (job_id,))
         return [self.get_session(r["id"]) for r in rows]
 
     SESSION_FIELDS = frozenset(

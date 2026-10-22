@@ -13,6 +13,7 @@ gateway (`check_backend` again, per call).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -70,3 +71,21 @@ def check_backend(cfg: Config, repo: str, preset_name: str) -> None:
 def check_decider_route(cfg: Config, repo: str, route: str) -> None:
     if route not in cfg.repo(repo).decider:
         raise RepoPolicyError(f"{repo} does not list decider route {route}")
+
+
+def verify_visibility(cfg: Config, is_private: Callable[[str], bool]) -> None:
+    """Review round 1, item 10: the YAML's `visibility` is checked against the
+    repo itself (through the App) before vigild starts. A mismatch, or a check
+    that can't be made, stops vigild: a private repo must never be treated as
+    public by mistake."""
+    for repo, pol in cfg.repos.repos.items():
+        try:
+            private = is_private(repo)
+        except Exception as e:
+            raise RepoPolicyError(f"{repo}: can't check its visibility ({type(e).__name__})") from e
+        want = pol.visibility == "private"
+        if private != want:
+            actual = "private" if private else "public"
+            raise RepoPolicyError(
+                f"{repo} is {actual} on GitHub but configs/repos.yaml says {pol.visibility}"
+            )

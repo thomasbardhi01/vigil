@@ -96,7 +96,8 @@ def require(needed: Scope) -> Callable[[Request], Scope]:
     def dep(request: Request) -> Scope:
         services: Services = request.app.state.services
         scope = identify(services.tokens, request.headers.get("authorization"))
-        if scope is None and "authorization" not in request.headers:
+        ui = bool(getattr(request.app.state, "ui", False))
+        if ui and scope is None and "authorization" not in request.headers:
             scope = ui_session_scope(services.store, request.cookies.get(COOKIE))
             unsafe = scope is not None and request.method not in SAFE
             if unsafe and request.headers.get(UI_HEADER) != "1":

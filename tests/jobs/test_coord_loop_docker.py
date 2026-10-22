@@ -57,6 +57,7 @@ def live(
         backends=["claude-haiku"],
         dev_image=cfg.vigild.images.claude_executor,
         dev_image_check="git --version",
+        dev_image_tools=["git", "grep"],
     )
     client = docker.from_env()
     images = DevImages(cfg, v.store, DockerImages(client))

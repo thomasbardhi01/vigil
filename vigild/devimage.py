@@ -10,6 +10,8 @@ rebuilt since (a different image id).
 
 from __future__ import annotations
 
+import re
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +25,37 @@ STALE_AFTER = timedelta(hours=26)  # nightly, plus slack
 
 class StaleDevImage(RuntimeError):
     pass
+
+
+SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
+SHELL_BUILTINS = {"cd", "true", "false", "test", "[", "echo", "exit", "export", "set"}
+
+
+def tools_in(test_cmd: str) -> list[str]:
+    """The command each segment of a shell line starts with, env assignments skipped."""
+    tools: list[str] = []
+    for seg in SEPARATORS.split(test_cmd):
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            words = seg.split()
+        words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+        if words and words[0] not in tools:
+            tools.append(words[0])
+    return tools
+
+
+def missing_tools(cfg: Config, repo: str, test_cmd: str | None) -> list[str]:
+    """Tools a test_cmd needs that the repo's dev image doesn't declare."""
+    have = set(cfg.repo(repo).dev_image_tools) | SHELL_BUILTINS
+    return [t for t in tools_in(test_cmd or "") if t not in have]
+
+
+def check_command(cfg: Config, repo: str) -> str:
+    """The validation: the repo's smoke command, and every declared tool present."""
+    pol = cfg.repo(repo)
+    presence = " && ".join(f"command -v {t} >/dev/null" for t in pol.dev_image_tools)
+    return f"({pol.dev_image_check}) && {presence}" if presence else pol.dev_image_check
 
 
 class DockerLike(Protocol):
@@ -55,7 +88,7 @@ class DevImages:
         if image_id is None:
             code, out = 127, f"{pol.dev_image} is not present"
         else:
-            code, out = self.docker.run_check(pol.dev_image, pol.dev_image_check)
+            code, out = self.docker.run_check(pol.dev_image, check_command(self.cfg, repo))
         v = Validation(repo, pol.dev_image, image_id, code == 0, out[-2000:], iso(self.clock()))
         self.store.x(
             "INSERT INTO dev_images (repo, image, image_id, ok, output, validated_at)"
@@ -63,6 +96,15 @@ class DevImages:
             (v.repo, v.image, v.image_id, int(v.ok), v.output, v.validated_at),
         )
         return v
+
+    def validate_all(self) -> list[Validation]:
+        return [self.validate(repo) for repo in self.cfg.repos.repos]
+
+    def due(self, repo: str, every: timedelta = timedelta(hours=24)) -> bool:
+        last = self.latest(repo)
+        if last is None:
+            return True
+        return self.clock() - datetime.fromisoformat(last["validated_at"]) >= every
 
     def latest(self, repo: str) -> dict[str, Any] | None:
         rows = self.store.q(

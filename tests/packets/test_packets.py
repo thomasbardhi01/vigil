@@ -240,3 +240,16 @@ def test_each_layer_has_its_own_budget(clone: Path) -> None:
 def test_worker_packet_explains_ask_coord(clone: Path) -> None:
     p = assemble_worker(clone, _contract(), untrusted={})
     assert ".vigil/fx-0001/fx-0001-w1/ask_coord.json" in p.parts["output_schema"]
+
+
+def test_the_assembler_never_reads_outside_the_repo(clone: Path, tmp_path: Path) -> None:  # item 14
+    import os
+
+    secret = tmp_path / "outside.env"
+    secret.write_text("SECRET=must-not-appear")
+    os.symlink(secret, clone / "docs" / "linked.md")
+    c = _contract()
+    c["spec"]["files_in_scope"] = ["docs/linked.md", "../outside.env", "/etc/hosts"]
+    p = assemble_worker(clone, c, untrusted={})
+    assert "must-not-appear" not in p.text
+    assert "localhost" not in p.parts["context_pack"]

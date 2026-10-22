@@ -25,6 +25,7 @@ def _private(**kw: Any) -> dict[str, Any]:
         "backends": [],
         "dev_image": "img",
         "dev_image_check": "true",
+        "dev_image_tools": [],
     }
     base.update(kw)
     return base
@@ -82,6 +83,7 @@ def test_public_repo_may_list_any_hosted_entry() -> None:
                 "backends": ["openrouter", "claude-opus"],
                 "dev_image": "img",
                 "dev_image_check": "true",
+                "dev_image_tools": [],
             }
         }
     )

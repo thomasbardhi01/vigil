@@ -69,12 +69,15 @@ def test_only_the_clone_packet_and_read_only_overlays_are_mounted(
     assert set(binds) == {
         "/work",
         "/vigil/packet.md",
+        "/vigil/out",
         "/work/.github",
         "/work/.claude",
         "/work/.opencode",
         "/work/.git/hooks",
         "/work/.git/config",
     }
+    assert binds["/vigil/out"]["Source"] == str(spec.session_dir / "out")
+    assert not binds["/vigil/out"]["ReadOnly"]  # the harness writes its bundle there
     assert not any(
         "docker.sock" in m["Source"] or ".config/vigil" in m["Source"] for m in kw["mounts"]
     )

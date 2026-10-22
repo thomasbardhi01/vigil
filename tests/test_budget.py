@@ -115,3 +115,13 @@ def test_the_overshoot_bound_is_one_call_per_session(budget: Budget) -> None:
     for any call whose worst case it can price."""
     assert budget.cfg.daily_usd == 5.0 and budget.cfg.per_task_usd == 2.0
     assert budget.cfg.monthly_usd == 100.0
+
+
+def test_open_reservations_count_against_their_own_day_only(budget: Budget, clock: Clock) -> None:
+    """Review r1, item 7: a reservation left open yesterday (vigild died) no
+    longer blocks today; the startup reconcile settles it."""
+    for i in range(2):
+        budget.reserve(session_id=f"s{i}", task_id=f"t{i}", amount=2.0, purpose="worker")
+    clock.now += timedelta(days=1)
+    assert budget.open_today() == 0
+    budget.reserve(session_id="x", task_id="tx", amount=2.0, purpose="worker")

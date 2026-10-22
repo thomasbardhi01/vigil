@@ -4,8 +4,10 @@
 # `anthropic` for thomasbardhi01/vigil (owner, 2026-10-22, Q2), is hard-coded
 # in vigild/repos.py and can't be extended from this file.
 #
-# dev_image: the pinned image a repo's sessions run in, validated nightly by
-# `vigil validate-images`; dispatch is refused when it is stale (vigild/devimage.py).
+# dev_image: the pinned image a repo's sessions run in. vigild validates it at
+# start and every 24 h (the smoke command, plus `command -v` for each of
+# dev_image_tools); dispatch is refused when it is stale, and a test_cmd that
+# needs a tool not in dev_image_tools is refused at the spec gate.
 repos:
   thomasbardhi01/parkagent:
     visibility: public
@@ -13,13 +15,22 @@ repos:
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
+    # The executor image: no pnpm and none of ParkAgent's dependencies, so only
+    # tasks whose test_cmd uses these tools can be dispatched (doc and grep-style
+    # checks). A ParkAgent dev image with node 24, pnpm and its lockfile's deps
+    # waits on reading ParkAgent's lockfile, which needs the owner's go-ahead.
     dev_image: vigil/claude-executor:2.1.306
-    dev_image_check: "git --version && python --version && node --version && claude --version"
+    dev_image_check: "git --version && python --version && node --version"
+    dev_image_tools: [git, grep, sh, cat, head, tail, wc, diff, python, node]
   thomasbardhi01/vigil:
     visibility: private
     decider: [haiku, jev-cloudflare]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
+    # The executor image: vigil's own tests need uv and its locked deps, which it
+    # lacks, so pytest-based tasks are refused until a vigil dev image exists
+    # (self-maintenance is phase 2).
     dev_image: vigil/claude-executor:2.1.306
-    dev_image_check: "git --version && python --version && claude --version"
+    dev_image_check: "git --version && python --version"
+    dev_image_tools: [git, grep, sh, cat, head, tail, wc, diff, python]

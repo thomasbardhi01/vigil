@@ -11,6 +11,7 @@ Every piece of work runs inside a job, and every job waits in
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -19,10 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from vigild.config import Config, ConfigError
 from vigild.contract.models import Score, Source, Task
 from vigild.db import Store
+from vigild.devimage import missing_tools
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task
-from vigild.jobs.artifacts import parse_plan, parse_spec
+from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.provenance import Provenance
@@ -32,6 +34,7 @@ from vigild.router.rules import RoutingError, route
 class Runner(Protocol):
     def on_job_created(self, job_id: str, needs_spec: bool) -> None: ...
     def on_approved(self, job_id: str) -> None: ...
+    def on_resume(self, job_id: str) -> None: ...
 
 
 class SubmitError(ValueError):
@@ -159,10 +162,18 @@ class JobService:
             raise SubmitError(r.reasons)
         return r.reasons if r.outcome is IntakeOutcome.PROPOSE else []
 
+    def _gate(self, repo: str, spec_text: str, plan_text: str) -> list[str]:
+        return check_job_spec(
+            parse_spec(spec_text),
+            parse_plan(plan_text),
+            self.cfg.routing.money_paths,
+            missing_tools=lambda cmd: missing_tools(self.cfg, repo, cmd),
+        )
+
     def submit_task(self, raw: dict[str, Any]) -> SubmitOutcome:
         raw = dict(raw)
-        provisional = "task_id" not in raw
-        raw.setdefault("task_id", "pending")
+        # vigild assigns task ids (review r1, item 16); a caller's id is ignored.
+        raw["task_id"] = "pending-w1"
         try:
             task = Task.model_validate(raw)
             self.cfg.repo(task.repo)
@@ -179,16 +190,26 @@ class JobService:
         intake = {"why": task.why, "value": task.value, "risk": task.risk, "source": task.source}
         proposed = self._intake(intake, task.spec.files_in_scope)
         if proposed:
-            tid = (
-                task.task_id if not provisional else f"proposal-{len(self.store.list_tasks()) + 1}"
-            )
-            self.store.create_task(
-                None, {**task.model_dump(mode="json"), "task_id": tid}, Provenance.HUMAN
-            )
+            tid = f"proposal-{len(self.store.list_tasks()) + 1}"
+            try:
+                self.store.create_task(
+                    None, {**task.model_dump(mode="json"), "task_id": tid}, Provenance.HUMAN
+                )
+            except sqlite3.IntegrityError as e:
+                raise SubmitError([f"task {tid} already exists"]) from e
             self.store.update_task(tid, state="proposed")
             return SubmitOutcome("proposed", tid, reasons=proposed)
 
         gate = check_task(task)
+        if not gate.needs_spec:
+            # Run the job spec gate before any job exists, so a refusal leaves no orphan.
+            errors = self._gate(
+                task.repo,
+                render_spec(task, self.cfg.routing.money_paths),
+                render_plan(task),
+            )
+            if errors:
+                raise SubmitError(errors)
         job = self.store.create_job(
             repo=task.repo,
             base=task.base,
@@ -205,9 +226,7 @@ class JobService:
             self.runner.on_job_created(job.id, True)
             return SubmitOutcome("spec_pending", None, job.id, needs_spec=True, reasons=gate.errors)
 
-        if provisional:
-            task = task.model_copy(update={"task_id": f"{job.id}-w1"})
-        task = task.model_copy(update={"job_id": job.id})
+        task = task.model_copy(update={"task_id": f"{job.id}-w1", "job_id": job.id})
         self.store.add_artifact(
             job.id, "spec.md", render_spec(task, self.cfg.routing.money_paths), Provenance.HUMAN
         )
@@ -248,7 +267,8 @@ class JobService:
             errors = ["spec.md and plan.md are both required"]
         else:
             pdoc = parse_plan(plan.content)
-            errors = check_job_spec(parse_spec(spec.content), pdoc, self.cfg.routing.money_paths)
+            job0 = self.store.get_job(job_id)
+            errors = self._gate(job0.repo, spec.content, plan.content)
         self.store.add_artifact(
             job_id,
             "spec_gate.json",
@@ -257,6 +277,11 @@ class JobService:
         )
         if errors:
             return errors
+        # vigild assigns task ids: {job}-w1, {job}-w2, ... (review r1, item 16)
+        canonical = canonicalize_plan(job_id, plan.content)  # type: ignore[union-attr]
+        if canonical != plan.content:  # type: ignore[union-attr]
+            self.store.add_artifact(job_id, "plan.md", canonical, plan.provenance)  # type: ignore[union-attr]
+            pdoc = parse_plan(canonical)
         job = self.store.get_job(job_id)
         intake_art = self.store.get_artifact(job_id, "intake.json")
         intake = json.loads(intake_art.content) if intake_art else {}
@@ -287,8 +312,12 @@ class JobService:
         )
         return []
 
-    def page(self, job_id: str | None, title: str, body: dict[str, Any]) -> InboxItem:
-        """A question or page for the owner: the third inbox queue."""
+    def page(
+        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+    ) -> InboxItem:
+        """A question or page for the owner: the third inbox queue. A resumable
+        page carries the job back to work when the owner resumes it."""
+        body = {**body, "resumable": resumable}
         item = self.store.create_inbox_item("questions", "page", job_id, title, body)
         self.store.add_event(
             "page", {"item": item.id, "title": title, **body}, Provenance.HUMAN, job_id=job_id
@@ -296,7 +325,9 @@ class JobService:
         return item
 
     def approve(self, item_id: int, edits: str | None = None) -> Job:
-        with self.store.lock:
+        # One transaction: state, approval row, artifact, event and the inbox
+        # item commit together or not at all; the build starts after the commit.
+        with self.store.tx():
             try:
                 item = self.store.get_inbox_item(item_id)
             except KeyError as e:
@@ -330,3 +361,46 @@ class JobService:
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
         self.runner.on_approved(job.id)
         return job
+
+    def _question(self, item_id: int) -> InboxItem:
+        try:
+            item = self.store.get_inbox_item(item_id)
+        except KeyError as e:
+            raise NotFound(item_id) from e
+        if item.queue != "questions" or item.status != "open":
+            raise Conflict(f"inbox item {item_id} is not an open question or page")
+        return item
+
+    def resume(self, item_id: int) -> Job:
+        """The owner resumes the job a page is about: a held job returns to the
+        state it left, and the runner picks up its remaining work."""
+        with self.store.tx():
+            item = self._question(item_id)
+            if not item.body.get("resumable") or item.job_id is None:
+                raise Conflict(f"inbox item {item_id} has nothing to resume")
+            job = self.store.get_job(item.job_id)
+            if job.state in (JobState.BLOCKED, JobState.ESCALATED):
+                assert job.blocked_from is not None
+                try:
+                    job = transition(
+                        self.store, job.id, job.blocked_from, Actor.OWNER, channel="inbox",
+                        evidence={"inbox_item_id": item_id, "action": "resume"},
+                    )  # fmt: skip
+                except TransitionError as e:
+                    raise Conflict(str(e)) from e
+            elif job.state is not JobState.SPEC_PENDING:
+                raise Conflict(f"{job.id} is {job.state.value}; nothing to resume")
+            self.store.add_event(
+                "resume", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
+            )
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        self.runner.on_resume(job.id)
+        return job
+
+    def dismiss(self, item_id: int) -> None:
+        with self.store.tx():
+            item = self._question(item_id)
+            self.store.add_event(
+                "dismiss", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=item.job_id
+            )
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
