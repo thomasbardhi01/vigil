@@ -182,11 +182,18 @@ class Workspace:
         return path
 
     def import_result(
-        self, repo: str, task_id: str, out_dir: Path, branch: str, base_sha: str
+        self, repo: str, task_id: str, out_dir: Path, branch: str, base_sha: str, *, head: str
     ) -> str:
-        """Take the session's branch from the bundle the harness wrote; return its head."""
+        """Take the session's branch from the bundle the harness wrote; return its head.
+
+        `head` is the commit the harness named on its result line (PID 1's
+        stdout, out of the agent's reach). The bundle sits in a directory the
+        agent uid can write, so a tip that isn't `head` is refused (review round 2, N1).
+        """
         if not SHA.match(base_sha):
             raise WorkspaceError("bad base sha")
+        if not SHA.match(head or ""):
+            raise WorkspaceError("the harness named no head commit")
         try:
             data = safe_read_bytes(out_dir, out_dir / "result.bundle", MAX_BUNDLE)
         except (OSError, UnsafeFile) as e:
@@ -208,7 +215,10 @@ class Workspace:
                 )
             finally:
                 tmp.unlink(missing_ok=True)
-            head = self._git(vault, "rev-parse", "--verify", f"{ref}^{{commit}}")
+            tip = self._git(vault, "rev-parse", "--verify", f"{ref}^{{commit}}")
+            if tip != head:
+                self._git(vault, "update-ref", "-d", ref)
+                raise WorkspaceError(f"the bundle's {branch} is not the head the harness named")
             try:
                 self._git(vault, "merge-base", "--is-ancestor", base_sha, head)
             except WorkspaceError as e:
@@ -216,6 +226,42 @@ class Workspace:
                     f"{branch} does not descend from the base vigild recorded"
                 ) from e
         return head
+
+    def verify_checkout(
+        self,
+        repo: str,
+        name: str,
+        sha: str,
+        *,
+        overlay_from: str | None = None,
+        paths: list[str] | tuple[str, ...] = (),
+    ) -> Path:
+        """A fresh checkout of `sha` from the vault for the verifier, under
+        <data>/verify/<name>/src: a new .git with hooks off, nothing from the
+        worker's clone. With `overlay_from`, `paths` are taken from that commit."""
+        if not ID.match(name) or not SHA.match(sha):
+            raise WorkspaceError(f"bad verify checkout {name!r} {sha!r}")
+        if overlay_from is not None and not SHA.match(overlay_from):
+            raise WorkspaceError("bad overlay sha")
+        vault = self.vault(repo)
+        root = self.data_dir / "verify" / name
+        if root.exists():
+            shutil.rmtree(root)
+        src = root / "src"
+        src.parent.mkdir(parents=True)
+        self._git(src.parent, "init", "--quiet", str(src))
+        self._git(src, "config", "core.hooksPath", "/dev/null")
+        self._git(src, "config", "core.fsmonitor", "false")
+        wants = [sha] + ([overlay_from] if overlay_from else [])
+        with self._repo_lock(f"vault:{repo}"):
+            self._git(
+                src, "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--quiet",
+                "--no-tags", str(vault), *wants,
+            )  # fmt: skip
+        self._git(src, "checkout", "--quiet", "--detach", sha)
+        if overlay_from and paths:
+            self._git(src, "checkout", "--quiet", overlay_from, "--", *paths)
+        return src
 
     def changed(self, repo: str, base_sha: str, head: str) -> list[tuple[str, str]]:
         """(status, path) for every file changed; renames show as delete + add."""

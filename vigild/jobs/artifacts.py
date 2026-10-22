@@ -34,7 +34,7 @@ TASK_ARTIFACTS = {
     "worker_report.json",
     "review.json",
     "audit.json",
-    "harness_tests.json",
+    "tests.json",
     "ask_coord.json",
 }
 NAMES = JOB_ARTIFACTS | TASK_ARTIFACTS

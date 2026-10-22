@@ -145,7 +145,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     import docker
 
     from vigild.devimage import DockerImages
-    from vigild.executors.runtime import DockerRuntime
+    from vigild.executors.runtime import DockerRuntime, DockerTestRunner
+    from vigild.verifier import Verifier
     from vigild.github.app import READ_ONLY
     from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
     from vigild.workspace import Workspace
@@ -170,7 +171,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         ws,
         publisher,
         v.telemetry,
-        DevImages(v.cfg, v.store, DockerImages(client)),
+        DevImages(v.cfg, v.store, DockerImages(client, v.cfg.vigild.container.uid)),
+        Verifier(ws, DockerTestRunner(v.cfg, client)),
         reaper=runtime.reap,
     )
     runner.jobs = v.services.jobs

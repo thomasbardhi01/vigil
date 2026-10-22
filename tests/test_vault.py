@@ -58,9 +58,14 @@ def _session(ws: Workspace, tmp_path: Path, edit: object = None) -> tuple[Path, 
         out,
         branch=BRANCH,
         base_sha=base,
-        harness={"before": {"outcome": "fail"}, "after": {"outcome": "pass"}},
     )
     return clone, out, base
+
+
+def _tip(out: Path) -> str:
+    """The branch tip in the bundle: what the harness names on its result line."""
+    heads = git(out, "bundle", "list-heads", str(out / "result.bundle"), f"refs/heads/{BRANCH}")
+    return heads.split()[0] if heads else "0" * 40
 
 
 def _plant_everything(clone: Path, tmp_path: Path) -> Path:
@@ -101,7 +106,7 @@ def test_planted_git_state_never_runs_on_the_host(
 ) -> None:
     clone, out, base = _session(ws, tmp_path)
     marker = _plant_everything(clone, tmp_path)
-    head = ws.import_result(REPO, TID, out, BRANCH, base)
+    head = ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     assert ws.changed(REPO, base, head) == [("M", "docs/feature-map.md")]
     ws.diff(REPO, base, head, "docs/feature-map.md")
     url = publish(
@@ -141,7 +146,7 @@ def test_only_the_sessions_branch_is_imported(ws: Workspace, tmp_path: Path) -> 
 
     clone, out, base = _session(ws, tmp_path, edit)
     git(clone, "bundle", "create", "-q", str(out / "result.bundle"), "--all")
-    ws.import_result(REPO, TID, out, BRANCH, base)
+    ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     refs = git(ws.vault(REPO), "for-each-ref", "--format=%(refname)", "refs/vigil", "refs/heads")
     assert refs.splitlines() == [f"refs/vigil/{TID}"]
 
@@ -161,7 +166,7 @@ def test_a_branch_that_does_not_descend_from_the_base_is_refused(
     clone, out, base = _session(ws, tmp_path, edit)
     git(clone, "bundle", "create", "-q", str(out / "result.bundle"), f"refs/heads/{BRANCH}")
     with pytest.raises(WorkspaceError, match="descend"):
-        ws.import_result(REPO, TID, out, BRANCH, base)
+        ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
 
 
 # --- blocker 2 ----------------------------------------------------------------------------
@@ -186,7 +191,7 @@ def test_rename_out_of_scope_is_caught(ws: Workspace, tmp_path: Path) -> None:
     _clone, out, base = _session(
         ws, tmp_path, lambda c: git(c, "mv", "money/critical.py", "docs/x.py")
     )
-    head = ws.import_result(REPO, TID, out, BRANCH, base)
+    head = ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     assert ("D", "money/critical.py") in ws.changed(REPO, base, head)
     with pytest.raises(PublishError, match=r"money/critical\.py"):
         _publish(ws, head, base, ["docs/x.py"])
@@ -198,7 +203,7 @@ def test_renamed_away_test_counts_as_deleted(ws: Workspace, tmp_path: Path) -> N
     _clone, out, base = _session(
         ws, tmp_path, lambda c: git(c, "mv", "tests/test_a.py", "docs/test_a.txt")
     )
-    head = ws.import_result(REPO, TID, out, BRANCH, base)
+    head = ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     assert weakened_tests(ws, REPO, base, head) == ["tests/test_a.py was deleted"]
 
 
@@ -210,7 +215,7 @@ def test_a_forged_origin_ref_does_not_hide_changes(ws: Workspace, tmp_path: Path
         git(c, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     _clone, out, base = _session(ws, tmp_path, edit)
-    head = ws.import_result(REPO, TID, out, BRANCH, base)
+    head = ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     with pytest.raises(PublishError, match=r"money/critical\.py"):
         _publish(ws, head, base, ["docs/feature-map.md"])
 
@@ -256,7 +261,7 @@ def test_a_committed_symlink_is_never_read_as_an_artifact(ws: Workspace, tmp_pat
         os.symlink(secret, d / "spec.md")
 
     _clone, out, base = _session(ws, tmp_path, edit)
-    head = ws.import_result(REPO, TID, out, BRANCH, base)
+    head = ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
     assert ws.read_blob(REPO, head, ".vigil/fx-0001/spec.md") is None
     assert ws.read_blob(REPO, head, "docs/feature-map.md") == "# Feature map\nrate limit\n"
 
@@ -267,4 +272,54 @@ def test_a_symlinked_bundle_is_refused(ws: Workspace, tmp_path: Path) -> None:
     (out / "result.bundle").rename(real)
     os.symlink(real, out / "result.bundle")
     with pytest.raises(WorkspaceError, match="bundle"):
-        ws.import_result(REPO, TID, out, BRANCH, base)
+        ws.import_result(REPO, TID, out, BRANCH, base, head=_tip(out))
+
+
+# --- review round 2, N1: the bundle is bound to the head on PID 1's result line --------
+
+
+def test_a_bundle_swapped_after_the_harness_named_its_head_is_refused(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """The after-test runs repo code after the bundle is written; if that code
+    swaps the bundle for another branch tip, vigild refuses it."""
+    clone, out, base = _session(ws, tmp_path)
+    named = _tip(out)
+    (clone / "docs" / "runbook.md").write_text("swapped\n")
+    git(clone, "commit", "-qam", "swap")
+    git(clone, "bundle", "create", "-q", str(out / "result.bundle"), f"refs/heads/{BRANCH}",
+        f"^{base}")  # fmt: skip
+    with pytest.raises(WorkspaceError, match="head"):
+        ws.import_result(REPO, TID, out, BRANCH, base, head=named)
+    refs = git(ws.vault(REPO), "for-each-ref", "--format=%(refname)", "refs/vigil")
+    assert refs == ""
+
+
+def test_a_malformed_head_is_refused(ws: Workspace, tmp_path: Path) -> None:
+    _clone, out, base = _session(ws, tmp_path)
+    with pytest.raises(WorkspaceError, match="head"):
+        ws.import_result(REPO, TID, out, BRANCH, base, head="HEAD")
+
+
+# --- review round 2, N3: a FIFO can't hang vigild ------------------------------------------
+
+
+def test_safe_read_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
+    import threading
+
+    root = tmp_path / "out"
+    root.mkdir()
+    os.mkfifo(root / "result.bundle")
+    errors: list[BaseException] = []
+
+    def read() -> None:
+        try:
+            safe_read_bytes(root, root / "result.bundle")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    t = threading.Thread(target=read, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "opening the FIFO blocked"
+    assert errors and isinstance(errors[0], UnsafeFile)

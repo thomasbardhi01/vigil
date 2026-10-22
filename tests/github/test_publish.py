@@ -41,8 +41,8 @@ def setup(tmp_path: Path, fixture_repo: dict[str, Path]) -> tuple[Workspace, str
     clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
     base = ws.base_sha(TID)
     (clone / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
-    finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
-    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base)
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
     return ws, base, head, fixture_repo["bare"]
 
 
@@ -103,8 +103,8 @@ def test_publish_refuses_files_outside_the_scope(
     base = ws.base_sha(TID)
     (clone / "docs" / "feature-map.md").write_text("ok\n")
     (clone / "README.md").write_text("sneaky\n")
-    finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
-    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base)
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
     pulls = FakePulls(fixture_repo["bare"])
     with pytest.raises(PublishError, match=r"README\.md"):
         _pub(ws, base, head, pulls)
@@ -120,6 +120,6 @@ def test_vigil_artifacts_are_always_in_scope(tmp_path: Path, fixture_repo: dict[
     (clone / ".vigil" / "fx-0001" / TID).mkdir(parents=True)
     (clone / ".vigil" / "fx-0001" / TID / "worker_report.json").write_text("{}")
     (clone / "docs" / "feature-map.md").write_text("ok\n")
-    finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
-    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base)
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
     assert _pub(ws, base, head, FakePulls(fixture_repo["bare"])).endswith("/pull/1")

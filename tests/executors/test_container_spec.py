@@ -40,9 +40,13 @@ def spec(tmp_path: Path, fixture_repo: dict[str, Path], cfg: Config) -> SessionS
 
 def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
     kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
-    assert kw["user"] == "10001:10001"
+    # PID 1 is the root harness with only setuid/setgid/kill; everything else
+    # runs as the agent uid (review round 2, N1 and N11)
+    assert kw["user"] == "0:0"
+    assert kw["environment"]["VIGIL_AGENT_UID"] == "10001"
     assert kw["read_only"] is True
     assert kw["cap_drop"] == ["ALL"]
+    assert sorted(kw["cap_add"]) == ["KILL", "SETGID", "SETUID"]
     assert "no-new-privileges" in kw["security_opt"]
     assert kw["pids_limit"] == 512
     assert kw["mem_limit"] == "4g"

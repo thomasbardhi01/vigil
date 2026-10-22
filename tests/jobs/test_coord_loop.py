@@ -21,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import auth, git
-from tests.harness import finish_session
+from tests.harness import LocalTestRunner, finish_session
 from tests.test_devimage import FakeDocker
 from vigild.api.app import create_app
 from vigild.budget import Budget
@@ -34,6 +34,7 @@ from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService
 from vigild.services import Services, Tokens
 from vigild.telemetry.spans import Telemetry
+from vigild.verifier import Verifier
 from vigild.workspace import Workspace
 
 REPO = "o/fixture"
@@ -115,19 +116,15 @@ EDITS = {
 }
 
 
-HARNESS_OK: dict[str, Any] = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}
-
-
 @dataclass
 class StandIn:
     """Does what the container's harness does: run the agent's work, write the
-    report, commit, then leave the harness record and the result bundle in the
-    session's out dir. Records concurrency."""
+    report, commit, leave the result bundle in the session's out dir, and put
+    the head and the test record on the result line. Records concurrency."""
 
     coord_drafts: list[Callable[[str], tuple[str, str]]] = field(default_factory=list)
     coord_extra: Callable[[Path, str], None] | None = None
     worker_edit: Callable[[SessionSpec, dict[str, Any]], None] | None = None
-    harness: dict[str, Any] | None = field(default_factory=lambda: dict(HARNESS_OK))
     on_session: Callable[[SessionSpec], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     running: int = 0
@@ -159,13 +156,13 @@ class StandIn:
                     self.coord_extra(spec.clone, spec.job_id)
                 git(spec.clone, "add", "-A")
                 git(spec.clone, "commit", "-q", "--allow-empty", "-m", "coord: spec and plan")
-                finish_session(
+                result = finish_session(
                     spec.clone,
                     spec.session_dir / "out",
                     branch=task["branch"],
                     base_sha=task["base_sha"],
                 )
-                return ExecOutcome("done", 0, {"status": "done", "plugins": ["guard"]})
+                return ExecOutcome("done", 0, result)
             if self.barrier:
                 self.barrier.wait(timeout=10)  # both workers must be in flight at once
             if self.worker_edit:
@@ -184,14 +181,13 @@ class StandIn:
                                    "not_done": "nothing", "reviewer_would_flag": "wording",
                                    "could_delete": "nothing"},
                     "open_questions": [], "provenance": "claude"}))  # fmt: skip
-            finish_session(
+            result = finish_session(
                 spec.clone,
                 spec.session_dir / "out",
                 branch=task["branch"],
                 base_sha=task["base_sha"],
-                harness=self.harness,
             )
-            return ExecOutcome("done", 0, {"status": "done", "plugins": ["guard"]})
+            return ExecOutcome("done", 0, result)
         finally:
             with self.lock:
                 self.running -= 1
@@ -255,6 +251,7 @@ class World:
     tokens: Tokens
     images: DevImages
     runner: JobRunner
+    tests: LocalTestRunner
 
 
 @pytest.fixture
@@ -278,7 +275,7 @@ def world(
     images = DevImages(cfg, store, FakeDocker())
     images.validate(REPO)
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
-    standin, publisher = StandIn(), BarePublisher(ws)
+    standin, publisher, tests = StandIn(), BarePublisher(ws), LocalTestRunner()
     runner = JobRunner(
         cfg,
         store,
@@ -289,6 +286,7 @@ def world(
         publisher,
         Telemetry(),
         images,
+        Verifier(ws, tests),
         background=False,
     )
     jobs = JobService(cfg, store, runner)
@@ -296,7 +294,16 @@ def world(
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)
     with TestClient(create_app(services)) as c:
         yield World(
-            c, store, budget, standin, publisher, fixture_repo["bare"], tokens, images, runner
+            c,
+            store,
+            budget,
+            standin,
+            publisher,
+            fixture_repo["bare"],
+            tokens,
+            images,
+            runner,
+            tests,
         )
 
 
@@ -475,14 +482,78 @@ def test_a_session_without_guard_fails_closed(world: World) -> None:
 # --- review round 1 -----------------------------------------------------------------------
 
 
-def test_a_harness_record_missing_means_no_pr(world: World) -> None:  # blocker 4
+def test_the_reports_test_claims_are_ignored(world: World) -> None:  # round 2, N1
+    """A worker whose report says pass, but whose change doesn't pass test_cmd
+    in the verifier, gets no PR."""
     w = world
-    w.standin.harness = None
+
+    def lie(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        (spec.clone / f).write_text("nothing relevant\n")
+
+    w.standin.worker_edit = lie
     job = _approve(w)
     assert w.publisher.prs == []
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert any("harness record is missing" in json.dumps(p["body"]) for p in pages)
+    assert any("verifier saw it fail after" in json.dumps(p["body"]) for p in pages)
     assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+    record = w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1")
+    assert record is not None and record.provenance == "human"
+
+
+def test_hook_forgery_and_a_fifo_record_change_no_verdict(
+    world: World, tmp_path: Path
+) -> None:  # round 2, N1 + N3, the reviewer's replay
+    """Both workers plant commondir -> a copy with core.fsmonitor and
+    hooks/post-commit that write a passing record, and a FIFO at the old record
+    path. w1 does the work, w2 doesn't: w1 gets its PR, w2 doesn't, nothing
+    planted runs, and the FIFO never blocks vigild."""
+    w = world
+    marker = tmp_path / "PWNED"
+
+    def hostile(spec: SessionSpec, task: dict[str, Any]) -> None:
+        out = spec.session_dir / "out"
+        evil = tmp_path / f"evil-{spec.task_id}"
+        (evil / "hooks").mkdir(parents=True)
+        forge = (
+            f"#!/bin/sh\necho ran >> {marker}\n"
+            f"echo '{{\"before\":{{\"outcome\":\"fail\"}},\"after\":{{\"outcome\":\"pass\"}}}}'"
+            f" > {out}/harness_tests.json\n"
+        )
+        for name in ("post-commit", "pre-commit"):
+            (evil / "hooks" / name).write_text(forge)
+            (evil / "hooks" / name).chmod(0o755)
+        (evil / "fsmonitor").write_text(forge)
+        (evil / "fsmonitor").chmod(0o755)
+        (evil / "config").write_text(
+            f"[core]\n\thooksPath = {evil / 'hooks'}\n\tfsmonitor = {evil / 'fsmonitor'}\n"
+        )
+        for d in ("objects", "refs"):
+            os.symlink(spec.clone / ".git" / d, evil / d)
+        (spec.clone / ".git" / "commondir").write_text(str(evil) + "\n")
+        out.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(out / "harness_tests.json")
+        f = task["spec"]["files_in_scope"][0]
+        honest = bool(spec.task_id and spec.task_id.endswith("w1"))
+        (spec.clone / f).write_text(EDITS[f] if honest else "nothing relevant\n")
+
+    w.standin.worker_edit = hostile
+    done = threading.Event()
+    job_box: list[str] = []
+
+    def go() -> None:
+        job_box.append(_approve(w))
+        done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert done.wait(60), "vigild blocked"
+    job = job_box[0]
+    assert [p["head"] for p in w.publisher.prs] == [f"vigil/{job}-w1"]
+    assert w.store.get_task(f"{job}-w1").state == "pr_open"
+    assert w.store.get_task(f"{job}-w2").state == "failed"
+    assert not marker.exists()
+    for call in w.tests.calls:
+        assert call["hooksPath"] == "/dev/null" and not call["worker_files"]
 
 
 def test_a_coord_symlink_never_reads_a_host_file(world: World, tmp_path: Path) -> None:  # blocker 3

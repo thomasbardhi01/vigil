@@ -215,7 +215,7 @@ def run_checks(
         from vigild.db import Store
 
         store = Store.open(cfg.vigild.data_path / "vigil.db")
-        images = DevImages(cfg, store, DockerImages(docker))
+        images = DevImages(cfg, store, DockerImages(docker, cfg.vigild.container.uid))
         for repo in cfg.repos.repos:
 
             def fresh(r: str = repo) -> tuple[bool, str]:

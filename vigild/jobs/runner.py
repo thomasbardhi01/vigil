@@ -6,11 +6,14 @@
 - on_approved (only from the inbox): planning turns plan.md's contracts into
   routed tasks; building runs them in dependency waves, each wave's workers in
   parallel, each in its own container, clone and branch.
-- After any session, the harness has left a git bundle and its test record in
-  the session's out dir. vigild imports the bundle into its own vault and does
-  every read, check and push from there: host git never runs in a clone a
-  session has touched, and no file a session wrote is read except through
-  `safe_read_bytes` (review round 1, blockers 1-3). Acceptance then fails
+- After any session, the harness has left a git bundle in the session's out
+  dir and named its head on its result line. vigild imports the bundle into
+  its own vault (refusing a tip that isn't that head) and does every read,
+  check and push from there: host git never runs in a clone a session has
+  touched, and no file a session wrote is read except through
+  `safe_read_bytes` (review round 1, blockers 1-3). For a worker, the verifier
+  then runs test_cmd on fresh vault checkouts in containers vigild owns; its
+  record is the only test result (owner direction, round 2). Acceptance fails
   closed (blocker 4), and vigild publishes the draft PR itself (P2).
 - on_resume (only from the inbox): a held job picks up its remaining work.
 - reconcile (at startup): nothing from before a restart keeps running or
@@ -36,7 +39,15 @@ from pydantic import ValidationError
 
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config
-from vigild.contract.models import Limits, Spec, Task, Verify, WorkerContract, WorkerReport
+from vigild.contract.models import (
+    Limits,
+    Spec,
+    Task,
+    TestOutcome,
+    Verify,
+    WorkerContract,
+    WorkerReport,
+)
 from vigild.db import Store, iso
 from vigild.devimage import DevImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
@@ -51,8 +62,8 @@ from vigild.packets.assemble import assemble_coord, assemble_worker
 from vigild.provenance import Provenance
 from vigild.repos import RepoPolicyError, check_backend
 from vigild.router.rules import RoutingError, route
-from vigild.safefile import UnsafeFile, safe_read_bytes
 from vigild.telemetry.spans import Telemetry
+from vigild.verifier import Verifier
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -89,6 +100,16 @@ class Refused(Exception):
     """A session could not start (budget, policy); dispatch halts."""
 
 
+def as_outcome(run: dict[str, Any] | None) -> TestOutcome:
+    """A verifier run as the report's outcome; a timeout is a failure."""
+    got = (run or {}).get("outcome")
+    if got == "pass":
+        return TestOutcome.PASS
+    if got in ("fail", "timeout"):
+        return TestOutcome.FAIL
+    return TestOutcome.UNKNOWN
+
+
 def redact(value: Any) -> Any:
     """Drop anything token-shaped from what an executor reports (item 13)."""
     if isinstance(value, str):
@@ -112,6 +133,7 @@ class JobRunner:
         publisher: Publisher,
         telemetry: Telemetry,
         dev_images: DevImages,
+        verifier: Verifier,
         *,
         background: bool = True,
         reaper: Callable[[], int] | None = None,
@@ -125,6 +147,7 @@ class JobRunner:
         self.publisher = publisher
         self.telemetry = telemetry
         self.dev_images = dev_images
+        self.verifier = verifier
         self.background = background
         self.reaper = reaper
         self.jobs: Pager | None = None
@@ -265,15 +288,6 @@ class JobRunner:
 
     def _session_dir(self, session_id: str) -> Path:
         return self.cfg.vigild.data_path / "sessions" / session_id
-
-    def _harness(self, spec: SessionSpec) -> dict[str, Any] | None:
-        out = spec.session_dir / "out"
-        try:
-            data = safe_read_bytes(out, out / "harness_tests.json", 64 << 10)
-            record = json.loads(data)
-        except OSError, UnsafeFile, json.JSONDecodeError:
-            return None
-        return record if isinstance(record, dict) else None
 
     # --- stage 1: the coord drafts spec.md and plan.md ------------------------------------
 
@@ -424,7 +438,12 @@ class JobRunner:
             return None
         try:
             head = self.workspace.import_result(
-                job.repo, clone_id, spec.session_dir / "out", branch, base_sha
+                job.repo,
+                clone_id,
+                spec.session_dir / "out",
+                branch,
+                base_sha,
+                head=str(out.result.get("head") or ""),
             )
         except WorkspaceError as e:
             self.store.update_session(coord.id, status="failed")
@@ -689,7 +708,12 @@ class JobRunner:
             )
         try:
             head = self.workspace.import_result(
-                job.repo, task_id, spec.session_dir / "out", branch, base_sha
+                job.repo,
+                task_id,
+                spec.session_dir / "out",
+                branch,
+                base_sha,
+                head=str(out.result.get("head") or ""),
             )
         except WorkspaceError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: result unusable", {"error": str(e)})
@@ -727,6 +751,34 @@ class JobRunner:
                 f"{task_id}: no valid worker_report.json",
                 {"error": str(e)[:1000]},
             )
+        tests = None
+        test_cmd = str(contract["spec"].get("test_cmd") or "")
+        if test_cmd.strip():
+            try:
+                tests = self.verifier.verify(
+                    repo=job.repo,
+                    image=image,
+                    task_id=task_id,
+                    base_sha=base_sha,
+                    head=head,
+                    test_cmd=test_cmd,
+                    must_fail_first=bool(contract["spec"].get("must_fail_first", True)),
+                )
+            except Exception as e:  # docker or git trouble: no verdict, nothing accepted
+                log.exception("verifier failed on %s", task_id)
+                return self._fail(
+                    job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
+                )
+            self.store.add_artifact(
+                job_id, "tests.json", json.dumps(tests), Provenance.HUMAN, task_id=task_id
+            )
+        # the report keeps its narrative; its test fields are the verifier's
+        report = report.model_copy(
+            update={
+                "test_before": as_outcome((tests or {}).get("before")),
+                "test_after": as_outcome((tests or {}).get("after")),
+            }
+        )
         self.store.add_artifact(
             job_id,
             "worker_report.json",
@@ -741,7 +793,7 @@ class JobRunner:
             head,
             contract,
             report,
-            self._harness(spec),
+            tests,
             cost=session_cost(self.store, s.id),
         )
         if errors:
@@ -751,7 +803,7 @@ class JobRunner:
         body = (
             f"{report.summary}\n\nJob `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
-            f"{report.test_before.value} → {report.test_after.value} (observed by the harness)."
+            f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )

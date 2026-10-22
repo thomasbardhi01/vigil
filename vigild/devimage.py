@@ -135,8 +135,9 @@ class DevImages:
 class DockerImages:
     """The real DockerLike, over docker-py."""
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, uid: int = 10001) -> None:
         self.client = client
+        self.uid = uid  # checks run as the agent uid, as test_cmd does in a session
 
     def image_id_of(self, image: str) -> str | None:
         import docker.errors
@@ -151,6 +152,7 @@ class DockerImages:
             image,
             entrypoint=["sh", "-c"],
             command=[command],
+            user=f"{self.uid}:{self.uid}",
             detach=True,
             network_mode="none",
             read_only=True,

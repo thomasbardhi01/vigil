@@ -1,5 +1,5 @@
 """Stage 3 acceptance, machine-checked on the host, in the vault, after the
-worker exits. It fails closed when the harness couldn't observe the test."""
+worker exits. Test results come only from the verifier; it fails closed."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ CONTRACT: dict[str, Any] = {
     },
     "limits": {"max_cost_usd": 1.0},
 }
-HARNESS_OK = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}
+TESTS_OK = {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}, "source": "verifier"}
 
 
 def _report(**kw: object) -> WorkerReport:
@@ -53,8 +53,8 @@ def _result(ws: Workspace, tmp_path: Path, extra: object = None) -> tuple[str, s
     (c / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
     if callable(extra):
         extra(c)
-    finish_session(c, tmp_path / "out", branch=BRANCH, base_sha=base)
-    return base, ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base)
+    r = finish_session(c, tmp_path / "out", branch=BRANCH, base_sha=base)
+    return base, ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
 
 
 def _check(
@@ -64,10 +64,10 @@ def _check(
     *,
     contract: dict[str, Any] = CONTRACT,
     report: WorkerReport | None = None,
-    harness: Any = HARNESS_OK,
+    tests: Any = TESTS_OK,
     cost: float = 0.2,
 ) -> list[str]:
-    return check_worker(ws, REPO, base, head, contract, report or _report(), harness, cost=cost)
+    return check_worker(ws, REPO, base, head, contract, report or _report(), tests, cost=cost)
 
 
 def test_clean_worker_passes(ws: Workspace, tmp_path: Path) -> None:
@@ -76,42 +76,51 @@ def test_clean_worker_passes(ws: Workspace, tmp_path: Path) -> None:
 
 def test_test_must_fail_first(ws: Workspace, tmp_path: Path) -> None:
     base, head = _result(ws, tmp_path)
-    assert any(
-        "fail first" in e for e in _check(ws, base, head, report=_report(test_before="pass"))
-    )
-    passed_before = {"before": {"outcome": "pass"}, "after": {"outcome": "pass"}}
-    assert any("harness" in e for e in _check(ws, base, head, harness=passed_before))
+    passed_before = {**TESTS_OK, "before": {"outcome": "pass"}}
+    assert any("verifier saw" in e for e in _check(ws, base, head, tests=passed_before))
 
 
 def test_test_must_pass_after(ws: Workspace, tmp_path: Path) -> None:
     base, head = _result(ws, tmp_path)
-    failed = {"before": {"outcome": "fail"}, "after": {"outcome": "fail"}}
-    assert any("must pass" in e for e in _check(ws, base, head, harness=failed))
+    failed = {**TESTS_OK, "after": {"outcome": "fail"}}
+    assert any("must pass" in e for e in _check(ws, base, head, tests=failed))
 
 
-# blocker 4: the harness record is required, and "unknown" is not a pass
-@pytest.mark.parametrize("harness", [None, {}])
-def test_a_missing_harness_record_is_a_rejection(
-    ws: Workspace, tmp_path: Path, harness: Any
+def test_the_reports_test_fields_are_ignored(ws: Workspace, tmp_path: Path) -> None:
+    """The verifier decides; what the worker says about its tests doesn't."""
+    base, head = _result(ws, tmp_path)
+    liar = _report(test_before="pass", test_after="fail")
+    assert _check(ws, base, head, report=liar) == []
+    failed = {**TESTS_OK, "after": {"outcome": "fail"}}
+    assert _check(ws, base, head, report=_report(), tests=failed)
+
+
+# blocker 4: the record is required, comes from the verifier, and "unknown" is no pass
+@pytest.mark.parametrize(
+    "tests", [None, {}, {"before": {"outcome": "fail"}, "after": {"outcome": "pass"}}]
+)
+def test_a_missing_verifier_record_is_a_rejection(
+    ws: Workspace, tmp_path: Path, tests: Any
 ) -> None:
     base, head = _result(ws, tmp_path)
-    assert any("harness record is missing" in e for e in _check(ws, base, head, harness=harness))
+    assert any("record is missing" in e for e in _check(ws, base, head, tests=tests))
 
 
 @pytest.mark.parametrize("which", ["before", "after"])
-def test_unknown_outcome_is_a_rejection(ws: Workspace, tmp_path: Path, which: str) -> None:
+@pytest.mark.parametrize("what", ["unknown", "timeout"])
+def test_unknown_or_timeout_is_a_rejection(
+    ws: Workspace, tmp_path: Path, which: str, what: str
+) -> None:
     base, head = _result(ws, tmp_path)
-    harness = {**HARNESS_OK, which: {"outcome": "unknown"}}
-    assert _check(ws, base, head, harness=harness)
+    assert _check(ws, base, head, tests={**TESTS_OK, which: {"outcome": what}})
 
 
-def test_no_test_cmd_needs_no_harness(ws: Workspace, tmp_path: Path) -> None:
+@pytest.mark.parametrize("cmd", [None, "", "   "])
+def test_no_test_cmd_is_a_rejection(ws: Workspace, tmp_path: Path, cmd: str | None) -> None:
+    """Review round 2, N2: an empty test_cmd used to accept with no record."""
     base, head = _result(ws, tmp_path)
-    contract = {
-        **CONTRACT,
-        "spec": {**CONTRACT["spec"], "test_cmd": None, "must_fail_first": False},
-    }
-    assert _check(ws, base, head, contract=contract, harness=None) == []
+    contract = {**CONTRACT, "spec": {**CONTRACT["spec"], "test_cmd": cmd}}
+    assert any("no test_cmd" in e for e in _check(ws, base, head, contract=contract, tests=None))
 
 
 def test_files_outside_scope_fail(ws: Workspace, tmp_path: Path) -> None:

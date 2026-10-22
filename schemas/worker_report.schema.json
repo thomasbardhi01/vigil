@@ -93,17 +93,17 @@
       "type": "string"
     },
     "test_after": {
-      "$ref": "#/$defs/TestOutcome"
+      "$ref": "#/$defs/TestOutcome",
+      "default": "unknown"
     },
     "test_before": {
-      "$ref": "#/$defs/TestOutcome"
+      "$ref": "#/$defs/TestOutcome",
+      "default": "unknown"
     }
   },
   "required": [
     "task_id",
     "job_id",
-    "test_before",
-    "test_after",
     "files_changed",
     "summary",
     "self_check",

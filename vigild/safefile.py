@@ -34,7 +34,9 @@ def safe_read_bytes(root: Path, path: Path, max_bytes: int = DEFAULT_MAX) -> byt
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
             raise UnsafeFile(f"{cur} is not a plain directory")
     try:
-        fd = os.open(cur / rel.parts[-1], os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: opening a FIFO doesn't wait for a writer (review round 2, N3);
+        # fstat below refuses anything but a regular file before any read.
+        fd = os.open(cur / rel.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
         if e.errno == errno.ELOOP:
             raise UnsafeFile(f"{path} is a symlink") from e

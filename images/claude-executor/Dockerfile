@@ -33,7 +33,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
-# The non-root user (bypassPermissions refuses root).
+# The agent uid (bypassPermissions refuses root).
 RUN groupadd -g 10001 vigil && useradd -u 10001 -g 10001 -m -d /home/vigil -s /bin/bash vigil
 
 # guard@claude-mods, seeded at build time from the pinned SHA (B16).
@@ -59,8 +59,13 @@ RUN chmod 0555 /opt/vigil/hooks/pre-push \
  && git config --system user.email "vigil-worker[bot]@users.noreply.github.com"
 
 COPY entrypoint.py /opt/vigil/entrypoint.py
+COPY agent-cli /opt/vigil/agent-cli
+RUN chmod 0555 /opt/vigil/agent-cli && command -v setpriv
 
-USER 10001:10001
+# The harness is PID 1 as root (runtime.py adds only SETUID, SETGID and KILL);
+# it runs the CLI, test_cmd and git as uid 10001 with no capabilities, so the
+# agent can't reach its stdout or signal it (review round 2, N1 and N11).
+USER 0:0
 ENV HOME=/tmp/home \
     CLAUDE_CONFIG_DIR=/tmp/home/.claude \
     CLAUDE_CODE_ENABLE_TELEMETRY=1 \

@@ -3,18 +3,17 @@ the host, in the vault, after the worker container exits and before anything
 is pushed: must_fail_first observed, test_cmd passes, files changed inside
 scope, no test weakened, cost under the limit. Lint and types run in CI.
 
-It fails closed (review round 1, blocker 4): when a task has a `test_cmd`,
-the harness record is required, and its before/after outcomes must be
-`fail`/`pass` as observed by the harness. A missing record, or an `unknown`
-outcome (the command couldn't run in the dev image), is a rejection, never
-the worker's word."""
+Test results come only from vigild's verifier (owner direction, review round
+2; `vigild/verifier.py`): the worker report's test fields are ignored. It
+fails closed: a task with no test_cmd, a missing verifier record, or any
+outcome other than `fail` before and `pass` after is a rejection."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from vigild.contract.models import TestOutcome, WorkerReport
+from vigild.contract.models import WorkerReport
 from vigild.github.publish import out_of_scope
 from vigild.workspace import Workspace
 
@@ -39,18 +38,18 @@ def weakened_tests(ws: Workspace, repo: str, base_sha: str, head: str) -> list[s
     return out
 
 
-def check_harness(spec: dict[str, Any], harness: dict[str, Any] | None) -> list[str]:
-    if not spec.get("test_cmd"):
-        return []
-    if not harness:
-        return ["the harness record is missing: test_cmd was not observed, so nothing is accepted"]
+def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]:
+    if not str(spec.get("test_cmd") or "").strip():
+        return ["the contract has no test_cmd, so nothing can be accepted"]
+    if not tests or tests.get("source") != "verifier":
+        return ["the verifier's record is missing: test_cmd was not observed, so nothing is accepted"]
     errors: list[str] = []
-    before = (harness.get("before") or {}).get("outcome")
-    after = (harness.get("after") or {}).get("outcome")
+    before = (tests.get("before") or {}).get("outcome")
+    after = (tests.get("after") or {}).get("outcome")
     if spec.get("must_fail_first", True) and before != "fail":
-        errors.append(f"must_fail_first: the harness saw the test {before or 'not run'} before")
+        errors.append(f"must_fail_first: the verifier saw the test {before or 'not run'} before")
     if after != "pass":
-        errors.append(f"test_cmd must pass; the harness saw it {after or 'not run'} after")
+        errors.append(f"test_cmd must pass; the verifier saw it {after or 'not run'} after")
     return errors
 
 
@@ -61,7 +60,7 @@ def check_worker(
     head: str,
     contract: dict[str, Any],
     report: WorkerReport,
-    harness: dict[str, Any] | None,
+    tests: dict[str, Any] | None,
     *,
     cost: float,
 ) -> list[str]:
@@ -69,11 +68,7 @@ def check_worker(
     errors: list[str] = []
     if report.task_id != contract["task_id"]:
         errors.append(f"report task_id {report.task_id} is not {contract['task_id']}")
-    if spec.get("must_fail_first", True) and report.test_before is not TestOutcome.FAIL:
-        errors.append("must_fail_first: the report says the test did not fail first")
-    if report.test_after is not TestOutcome.PASS:
-        errors.append("the report says test_cmd does not pass")
-    errors += check_harness(spec, harness)
+    errors += check_tests(spec, tests)
     changed = [path for _, path in ws.changed(repo, base_sha, head)]
     outside = out_of_scope(changed, spec.get("files_in_scope") or [])
     if outside:

@@ -1,29 +1,78 @@
-"""What the executor harness does at the end of a session, for tests that
-stand in for the container: commit leftovers, write the harness record and
-the result bundle into the session's out dir."""
+"""Stand-ins for the container pieces, for tests that run without Docker.
+
+- `finish_session` does what the executor harness does at the end of a
+  session: commit leftovers with git pinned against the clone's own .git,
+  write the result bundle into the session's out dir, and return what the
+  harness puts on its result line (the head commit; review round 2, N1).
+- `LocalTestRunner` stands in for the verifier's container."""
 
 from __future__ import annotations
 
-import json
+import os
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tests.conftest import git
+from vigild.verifier import RunResult
+
+PINS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        "-c", "user.name=vigil-worker[bot]", "-c", "user.email=w@vigil.invalid")  # fmt: skip
 
 
-def finish_session(
-    clone: Path,
-    out_dir: Path,
-    *,
-    branch: str,
-    base_sha: str,
-    harness: dict[str, Any] | None = None,
-) -> None:
+def _pinned(clone: Path, *args: str) -> str:
+    gd = str(clone / ".git")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update({"GIT_DIR": gd, "GIT_COMMON_DIR": gd, "GIT_WORK_TREE": str(clone),
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})  # fmt: skip
+    p = subprocess.run(
+        ["git", *PINS, *args], cwd=clone, env=env, capture_output=True, text=True, check=True
+    )
+    return p.stdout.strip()
+
+
+def finish_session(clone: Path, out_dir: Path, *, branch: str, base_sha: str) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    if git(clone, "status", "--porcelain"):
-        git(clone, "add", "-A")
-        git(clone, "commit", "-q", "-m", "harness: leftovers")
-    if harness is not None:
-        (out_dir / "harness_tests.json").write_text(json.dumps({**harness, "provenance": "human"}))
-    git(clone, "bundle", "create", "-q", str(out_dir / "result.bundle"), f"refs/heads/{branch}",
-        f"^{base_sha}")  # fmt: skip
+    if _pinned(clone, "status", "--porcelain"):
+        _pinned(clone, "add", "-A")
+        _pinned(clone, "commit", "-q", "--no-verify", "-m", "harness: leftovers")
+    bundle = out_dir / "result.bundle"
+    if bundle.is_symlink() or bundle.exists():
+        bundle.unlink()
+    _pinned(clone, "bundle", "create", "-q", str(bundle), f"refs/heads/{branch}", f"^{base_sha}")
+    return {
+        "status": "done",
+        "plugins": ["guard"],
+        "head": _pinned(clone, "rev-parse", f"refs/heads/{branch}"),
+    }
+
+
+@dataclass
+class LocalTestRunner:
+    """Stands in for the verifier's container: runs the command in the checkout
+    vigild made, and records what that checkout looked like."""
+
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def run(
+        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+    ) -> RunResult:
+        hooks = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"], cwd=source, capture_output=True, text=True
+        ).stdout.strip()
+        planted = [p for p in (".git/commondir", ".vigil/task.json") if (source / p).exists()]
+        self.calls.append(
+            {"source": str(source), "command": command, "hooksPath": hooks, "worker_files": planted}
+        )
+        try:
+            p = subprocess.run(
+                ["sh", "-c", command],
+                cwd=source,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return RunResult(None, "", timed_out=True)
+        return RunResult(p.returncode, (p.stdout + p.stderr)[-max_output:])

@@ -175,8 +175,9 @@ class SelfCheck(Strict):
 class WorkerReport(Strict):
     task_id: str
     job_id: str
-    test_before: TestOutcome
-    test_after: TestOutcome
+    # Ignored: vigild overwrites both with what its verifier saw (round 2).
+    test_before: TestOutcome = TestOutcome.UNKNOWN
+    test_after: TestOutcome = TestOutcome.UNKNOWN
     files_changed: list[str]
     summary: str
     self_check: SelfCheck

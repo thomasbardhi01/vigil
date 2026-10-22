@@ -1,12 +1,17 @@
-"""The executor harness's own pieces that run without a container (item 13,
-blocker 3): redaction, and writing its record past a planted symlink."""
+"""The executor harness's own pieces that run without a container: redaction
+(item 13), and committing with git pinned against a hostile .git (round 2, N1)."""
 
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -43,20 +48,140 @@ def test_tokens_are_redacted_from_events(redact: object) -> None:
     assert "ok" in flat and "[redacted]" in flat
 
 
-def test_the_harness_record_replaces_a_planted_symlink(tmp_path: Path) -> None:
-    ep = _entrypoint()
+def test_the_bundle_replaces_a_planted_symlink(tmp_path: Path) -> None:
+    work, base = _work(tmp_path)
+    (work / "b.txt").write_text("b\n")
+    ep = _harness(tmp_path, work)
     target = tmp_path / "elsewhere.txt"
     target.write_text("untouched")
-    out = tmp_path / "out"
-    out.mkdir()
-    os.symlink(target, out / "harness_tests.json")
-    ep.OUT = out
-    ep.write_out("harness_tests.json", b"{}")
+    os.symlink(target, ep.OUT / "result.bundle")
+    ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
     assert target.read_text() == "untouched"
-    assert not (out / "harness_tests.json").is_symlink()
-    assert (out / "harness_tests.json").read_text() == "{}"
+    assert not (ep.OUT / "result.bundle").is_symlink()
 
 
-def test_unknown_outcome_is_named_for_vigild_to_reject() -> None:
+# --- Review round 2, N1: the record can't be forged through git --------------------------
+
+BRANCH = "vigil/fx-0001-w1"
+
+
+def _run(work: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=work, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _work(tmp_path: Path) -> tuple[Path, str]:
+    """A clone the way vigild leaves it: base commit, task branch, task.json excluded."""
+    work = tmp_path / "work"
+    work.mkdir()
+    _run(work, "init", "-q", "-b", "main")
+    _run(work, "config", "user.email", "t@vigil.invalid")
+    _run(work, "config", "user.name", "t")
+    (work / "a.txt").write_text("a\n")
+    _run(work, "add", "-A")
+    _run(work, "commit", "-q", "-m", "base")
+    _run(work, "checkout", "-q", "-b", BRANCH)
+    base = _run(work, "rev-parse", "HEAD")
+    (work / ".git" / "info").mkdir(exist_ok=True)
+    (work / ".git" / "info" / "exclude").write_text("/.vigil/task.json\n")
+    (work / ".vigil").mkdir()
+    return work, base
+
+
+def _hostile_git(work: Path, marker: Path) -> None:
+    """What the reviewer reproduced: code git runs on status, add and commit."""
+    script = work.parent / "evil.sh"
+    script.write_text(f"#!/bin/sh\necho ran >> {marker}\n")
+    script.chmod(0o755)
+    _run(work, "config", "core.fsmonitor", str(script))
+    hook = work / ".git" / "hooks" / "post-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text(f"#!/bin/sh\necho ran >> {marker}\n")
+    hook.chmod(0o755)
+
+
+def _harness(tmp_path: Path, work: Path) -> ModuleType:
     ep = _entrypoint()
-    assert ep.outcome(127) == "unknown" and ep.outcome(0) == "pass" and ep.outcome(1) == "fail"
+    ep.WORK = work
+    ep.OUT = tmp_path / "out"
+    ep.OUT.mkdir()
+    ep.PACKET = tmp_path / "packet.md"
+    ep.PACKET.write_text("(packet)")
+    return ep
+
+
+def test_harness_git_runs_no_repo_hook_or_fsmonitor(tmp_path: Path) -> None:
+    work, base = _work(tmp_path)
+    marker = tmp_path / "marker"
+    _hostile_git(work, marker)
+    (work / "b.txt").write_text("b\n")
+    ep = _harness(tmp_path, work)
+    head = ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+    assert not marker.exists(), "git ran the repo's fsmonitor or hook"
+    assert len(head) == 40 and head != base
+    assert (ep.OUT / "result.bundle").is_file()
+
+
+@pytest.mark.parametrize("plant", ["commondir", "objects/info/alternates"])
+def test_harness_refuses_a_git_dir_that_points_elsewhere(tmp_path: Path, plant: str) -> None:
+    work, base = _work(tmp_path)
+    (work / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (work / ".git" / plant).write_text(str(tmp_path / "elsewhere") + "\n")
+    ep = _harness(tmp_path, work)
+    with pytest.raises(ep.HarnessRefused):
+        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+    assert not (ep.OUT / "result.bundle").exists()
+
+
+def test_harness_refuses_a_git_file_in_place_of_the_dir(tmp_path: Path) -> None:
+    work, base = _work(tmp_path)
+    os.rename(work / ".git", tmp_path / "moved.git")
+    (work / ".git").write_text(f"gitdir: {tmp_path / 'moved.git'}\n")
+    ep = _harness(tmp_path, work)
+    with pytest.raises(ep.HarnessRefused):
+        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+
+
+def test_harness_refuses_a_head_off_the_task_branch(tmp_path: Path) -> None:
+    work, base = _work(tmp_path)
+    _run(work, "checkout", "-q", "-b", "other")
+    ep = _harness(tmp_path, work)
+    with pytest.raises(ep.HarnessRefused):
+        ep.snapshot({"branch": BRANCH, "base_sha": base, "task_id": "fx-0001-w1"}, "worker")
+
+
+def test_the_harness_runs_no_test_and_names_the_head_on_its_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tests run only in vigild's verifier (owner direction, round 2): the
+    harness never runs test_cmd and writes no record; it commits with pinned
+    git and names the head on PID 1's stdout."""
+    work, base = _work(tmp_path)
+    marker = tmp_path / "marker"
+    task = {
+        "task_id": "fx-0001-w1",
+        "job_id": "fx-0001",
+        "branch": BRANCH,
+        "base_sha": base,
+        "spec": {"test_cmd": f"echo ran >> {marker}"},
+    }
+    (work / ".vigil" / "task.json").write_text(json.dumps(task))
+    ep = _harness(tmp_path, work)
+
+    async def agent(packet: str, role: str, token: str) -> dict[str, Any]:
+        (work / "b.txt").write_text("b\n")
+        _hostile_git(work, marker)
+        return {"plugins": ["guard"], "head": "0" * 40}  # can't override the harness's own
+
+    monkeypatch.setattr(ep, "run_agent", agent)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"gateway_token": TOKEN}) + "\n"))
+    assert ep.main() == 0
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    result = lines[-1]["vigil_result"]
+    assert "harness" not in result
+    assert not (ep.OUT / "harness_tests.json").exists()
+    assert not marker.exists(), "test_cmd, a hook or fsmonitor ran"
+    assert result["head"] == _run(work, "rev-parse", BRANCH) != "0" * 40
+    files = _run(work, "ls-tree", "-r", "--name-only", result["head"]).split()
+    assert "b.txt" in files

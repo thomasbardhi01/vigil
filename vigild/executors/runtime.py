@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shlex
 import shutil
 import socket
 import threading
@@ -21,8 +22,10 @@ from typing import Any
 from vigild.config import Config
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
+from vigild.verifier import RunResult
 
 LABEL = "dev.vigil.session"
+HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
 def _hardening(cfg: Config) -> dict[str, Any]:
@@ -60,6 +63,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "VIGIL_MAX_TURNS": str(spec.max_turns),
         "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
+        "VIGIL_AGENT_UID": str(uid),
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
         "NO_PROXY": f"{col.host},localhost,127.0.0.1",
@@ -72,15 +76,17 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
     mounts = [
         _mount(str(spec.clone), "/work", read_only=False),
         _mount(str(spec.session_dir / "packet.md"), "/vigil/packet.md", read_only=True),
-        # The harness's result: the branch as a git bundle and its test record.
-        # vigild reads them with safe_read_bytes; host git never touches /work.
+        # The harness's result bundle (untrusted: vigild reads it with
+        # safe_read_bytes and checks its tip against the head on the result line).
         _mount(str(spec.session_dir / "out"), "/vigil/out", read_only=False),
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
     return {
         "image": spec.image or cfg.vigild.images.claude_executor,
         "name": f"vigil-{spec.session_id}",
-        "user": f"{uid}:{uid}",
+        # PID 1 is the harness, as root with only these capabilities; the CLI,
+        # test_cmd and git run as `uid` with none (review round 2, N1 and N11).
+        "user": "0:0",
         "network": network,
         "environment": env,
         "mounts": mounts,
@@ -89,7 +95,16 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "labels": {LABEL: spec.session_id, "dev.vigil.role": spec.role.value},
         "working_dir": "/work",
         **_hardening(cfg),
+        "cap_add": list(HARNESS_CAPS),
     }
+
+
+def as_agent(cfg: Config, command: str) -> str:
+    """A shell line that runs `command` as the agent uid under a root PID 1,
+    the way the harness runs the agent (`exit` keeps sh from exec'ing)."""
+    uid = cfg.vigild.container.uid
+    drop = f"setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all"
+    return f"{drop} -- sh -c {shlex.quote(command)}; exit $?"
 
 
 def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
@@ -104,6 +119,78 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
         "mem_limit": "128m",
         "pids_limit": 64,
     }
+
+
+def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
+    """The verifier's container (owner direction, round 2): the repo's dev
+    image, the vault checkout read-only at /work, no network at all, the agent
+    uid with no capabilities, and nothing else mounted."""
+    uid = cfg.vigild.container.uid
+    return {
+        "image": image,
+        "entrypoint": ["sh", "-c"],
+        "command": [command],
+        "user": f"{uid}:{uid}",
+        "network_mode": "none",
+        "mounts": [_mount(str(source), "/work", read_only=True)],
+        "tmpfs": {"/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "working_dir": "/work",
+        "environment": {
+            "HOME": "/tmp/home",
+            "XDG_CACHE_HOME": "/tmp/cache",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "/tmp/pycache",
+        },
+        "stdin_open": False,
+        "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
+        **_hardening(cfg),
+    }
+
+
+class DockerTestRunner:
+    """Runs one test_cmd in a fresh verifier container and reads its output
+    stream itself: at most `max_output` bytes are kept, and the container is
+    killed at `timeout_s`. The verdict is the exit code docker reports."""
+
+    def __init__(self, cfg: Config, client: Any) -> None:
+        self.cfg = cfg
+        self.client = client
+
+    def run(
+        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+    ) -> RunResult:
+        import docker.errors
+
+        kw = verifier_kwargs(self.cfg, image, source, command)
+        kw["mounts"] = _docker_mounts(kw["mounts"])
+        c = self.client.containers.create(**kw)
+        timed_out = threading.Event()
+
+        def _kill() -> None:
+            timed_out.set()
+            with contextlib.suppress(Exception):
+                c.kill()
+
+        timer = threading.Timer(timeout_s, _kill)
+        buf = bytearray()
+        seen = 0
+        try:
+            c.start()
+            timer.start()
+            for chunk in c.logs(stream=True, follow=True, stdout=True, stderr=True):
+                seen += len(chunk)
+                buf += chunk
+                if len(buf) > max_output:
+                    del buf[: len(buf) - max_output]  # keep the tail
+            code = int(c.wait().get("StatusCode", -1))
+        finally:
+            timer.cancel()
+            with suppress(docker.errors.APIError):
+                c.remove(force=True)
+        text = bytes(buf).decode(errors="replace")
+        if timed_out.is_set():
+            return RunResult(None, text, timed_out=True, truncated=seen > max_output)
+        return RunResult(code, text, truncated=seen > max_output)
 
 
 def write_session_files(cfg: Config, spec: SessionSpec) -> None:
@@ -192,14 +279,19 @@ class DockerRuntime:
                     worker.remove(force=True)
 
     def probe(self, spec: SessionSpec, command: str, timeout: int = 120) -> tuple[int, str]:
-        """Run `command` in the session's exact container, network and proxy,
-        instead of the harness. The security tests and `vigil doctor` use it."""
+        """Run `command` as the agent uid in the session's exact container,
+        network and proxy, under a root PID 1 standing in for the harness. The
+        security tests and `vigil doctor` use it."""
         import docker.errors
 
         with self._network(spec, lambda e: None) as net_name:
             wk = worker_kwargs(self.cfg, spec, network=net_name)
             wk["mounts"] = _docker_mounts(wk["mounts"])
-            wk.update(entrypoint=["sh", "-c"], command=[command], stdin_open=False)
+            wk.update(
+                entrypoint=["sh", "-c"],
+                command=[as_agent(self.cfg, command)],
+                stdin_open=False,
+            )
             worker = self.client.containers.create(**wk)
             try:
                 worker.start()
