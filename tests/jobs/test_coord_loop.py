@@ -1178,3 +1178,22 @@ def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  #
     job = _approve(w)
     assert w.store.get_job(job).state.value == "in_review"
     assert len(w.publisher.prs) == 2
+
+
+def test_a_scripts_edit_is_runner_config_not_needs_deps(world: World) -> None:  # round 4, item 8
+    w = world
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["package.json"]
+    w.runner.cfg.repos.repos[REPO].runner_config = ["package.json"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            (spec.clone / "package.json").write_text('{"scripts": {"test": "vitest run x"}}\n')
+            git(spec.clone, "add", "package.json")
+            git(spec.clone, "commit", "-qm", "narrow the test script")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_task(f"{job}-w1").state == "failed"  # not needs_deps
+    item = _failure_item(w, job)
+    assert "changes how tests run" in json.dumps(item["body"])

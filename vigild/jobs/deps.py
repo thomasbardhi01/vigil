@@ -61,6 +61,12 @@ def _pypi(text: str) -> dict[str, str]:
     return out
 
 
+def is_lockfile(path: str) -> bool:
+    """A lockfile proper (not a manifest, a workspace file or a version pin)."""
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith((".lock", "-lock.yaml", "-lock.json")) or name in ("yarn.lock",)
+
+
 def infer_deps(path: str, base_text: str | None, head_text: str | None) -> list[DepRequest]:
     """New or changed dependencies in one manifest, base against head."""
     name = path.rsplit("/", 1)[-1]

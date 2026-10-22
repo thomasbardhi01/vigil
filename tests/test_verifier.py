@@ -546,3 +546,15 @@ def test_the_gate_uses_the_same_resolver() -> None:
     assert test_cmd_problem("pnpm -C server run lint", PKG.get)
     assert test_cmd_problem("pnpm --filter server test", PKG.get)
     assert test_cmd_problem("cd server && pnpm test", PKG.get) is None
+
+
+@pytest.mark.parametrize(
+    "classname",
+    ["tests.test_a", "tests.test_a.TestX", "tests.test_a.TestX.TestNested", "test/a.test.ts"],
+)
+def test_a_case_belongs_to_its_file_class_based_or_not(classname: str) -> None:  # round 4, item 9
+    from vigild.verifier import Case, belongs
+
+    files = ["tests/test_a.py", "server/test/a.test.ts"]
+    assert belongs(Case(f"{classname}::t", classname, "pass"), files)
+    assert not belongs(Case("tests.test_b.TestX::t", "tests.test_b.TestX", "pass"), files)

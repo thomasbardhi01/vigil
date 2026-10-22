@@ -42,16 +42,24 @@ LAYERED = ("parkagent", "vigil")
 
 
 def _latest_session_image(name: str) -> str:
-    """The newest `vigil-session/<name>:*` image vigild (or `vigil dev-image`) built."""
+    """The `vigil-session/<name>` image built from the executor layer as it is
+    now (round 4, item 11): its layer label is today's `layer_digest()`."""
+    from vigild.devimage import LAYER_LABEL, layer_digest
+
     client = _docker()
+    want = layer_digest()
     tags = [
-        (img.attrs.get("Created", ""), t)
+        t
         for img in client.images.list(name=f"vigil-session/{name}")  # type: ignore[attr-defined]
+        if (img.labels or {}).get(LAYER_LABEL) == want
         for t in img.tags
     ]
     if not tags:
-        pytest.fail(f"no vigil-session/{name} image: run `vigil dev-image --repo .../{name}`")
-    return sorted(tags)[-1][1]
+        pytest.fail(
+            f"no vigil-session/{name} image from the current executor layer: run "
+            f"`vigil dev-image --repo .../{name}`"
+        )
+    return sorted(tags)[-1]
 
 
 @pytest.fixture(params=["generic", *LAYERED])

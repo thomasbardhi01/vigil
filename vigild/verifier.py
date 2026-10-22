@@ -10,11 +10,12 @@ After a worker exits and its branch is in the vault, vigild runs the task's
   and changed test files (paths `TEST_FILE` matches, taken from the head) laid
   over it, so a new test exists but the code it tests doesn't. Deleted test
   files aren't restored; `weakened_tests` rejects those anyway.
-- **One runner config for both** (round 3, F1): files that decide how tests
-  run (the repo's `runner_config` globs, plus any script `test_cmd` itself
-  invokes) are the base's in both runs, except files the approved spec names
-  by path; those are the head's in both runs. A worker can't make "after"
-  pass by rewriting the runner, and acceptance rejects the attempt.
+- **The base's runner files in every run** (rounds 3 and 4): files that
+  decide how tests run (the repo's `runner_config` globs, plus a script
+  `test_cmd` runs as its program) are the base's copies in every run, even
+  when the approved spec names them. A worker can't make "after" pass by
+  rewriting the runner, and acceptance rejects the attempt unless the spec
+  names the path.
 - **What a result means** (round 3, F3): `judge` maps runner exits that aren't
   test results (pytest 2-5, vitest's "no test files", a signal) to `unknown`.
   pytest and a directly invoked vitest are asked for a JUnit report, written
@@ -302,7 +303,9 @@ def parse_junit(data: bytes) -> list[Case]:
 def belongs(case: Case, files: Iterable[str]) -> bool:
     """Is a report's test case in one of these repo files? pytest names a
     module (`tests.test_a`); vitest a path relative to its project dir."""
-    guesses = {case.file, case.file.replace(".", "/") + ".py"}
+    parts = case.file.split(".")
+    # pytest: a module, or module.Class(.Nested): try each prefix as a .py path
+    guesses = {case.file} | {"/".join(parts[:k]) + ".py" for k in range(1, len(parts) + 1)}
     for f in files:
         for g in guesses:
             if g and (f == g or f.endswith("/" + g)):

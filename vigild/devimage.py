@@ -77,6 +77,7 @@ class DockerLike(Protocol):
         timeout_s: int,
         build_args: dict[str, str] | None = None,
         contexts: dict[str, Path] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> tuple[bool, str]: ...
     def run_check(self, image: str, command: str) -> tuple[int, str]: ...
 
@@ -284,6 +285,8 @@ class DevImages:
 
 
 EXECUTOR_LAYER = ROOT / "images" / "claude-executor"
+LAYER_LABEL = "dev.vigil.layer-digest"
+SESSION_KEY_LABEL = "dev.vigil.session-key"
 MANAGED_SETTINGS = ROOT / "configs" / "managed-settings.json"
 # What a session image must have: the CLI at its pin, the harness's Python
 # with the SDK, setpriv for the agent uid, and guard seeded.
@@ -375,6 +378,7 @@ class SessionImages:
             timeout_s=BUILD_SECONDS,
             build_args={"BASE": dev_tag},
             contexts={"claude_mods": self.claude_mods(), "vigil_configs": ROOT / "configs"},
+            labels={LAYER_LABEL: layer_digest(), SESSION_KEY_LABEL: key},
         )
         image_id = self.dev.docker.image_id_of(tag) if ok else None
         if not ok or image_id is None:
@@ -414,6 +418,7 @@ class DockerImages:
         timeout_s: int,
         build_args: dict[str, str] | None = None,
         contexts: dict[str, Path] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         cmd = [self.cli, "build", "--progress=plain", "-f", str(dockerfile), "-t", tag,
                "--label", f"dev.vigil.devimage={tag}"]  # fmt: skip
@@ -421,6 +426,8 @@ class DockerImages:
             cmd += ["--build-arg", f"{k}={v}"]
         for k, path in (contexts or {}).items():
             cmd += ["--build-context", f"{k}={path}"]
+        for k, v in (labels or {}).items():
+            cmd += ["--label", f"{k}={v}"]
         cmd.append(str(context))
         try:
             p = subprocess.run(

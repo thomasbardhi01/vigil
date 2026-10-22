@@ -51,10 +51,8 @@ from typing import Any
 WORK = Path("/work")
 PACKET = Path("/vigil/packet.md")
 OUT = Path("/vigil/out")
-AGENT_CLI = "/opt/vigil/agent-cli"
-SESSION_PREPARE = (
-    "/usr/local/bin/vigil-session-prepare"  # setpriv down to the agent uid, then the CLI
-)
+AGENT_CLI = "/opt/vigil/agent-cli"  # setpriv down to the agent uid, then the CLI
+SESSION_PREPARE = "/usr/local/bin/vigil-session-prepare"  # a dev image's hook, if it has one
 PLAIN_CLI = "/usr/local/bin/claude"
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"

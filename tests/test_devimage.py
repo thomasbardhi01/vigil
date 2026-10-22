@@ -41,6 +41,7 @@ class FakeDocker:
         timeout_s: int,
         build_args: dict[str, str] | None = None,
         contexts: dict[str, Path] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         files = sorted(str(p.relative_to(context)) for p in context.rglob("*") if p.is_file())
         self.builds.append((tag, files))
@@ -220,9 +221,10 @@ class LayerDocker(FakeDocker):
         timeout_s: int,
         build_args: dict[str, str] | None = None,
         contexts: dict[str, Path] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         self.args.append({"tag": tag, "dockerfile": dockerfile, "build_args": build_args or {},
-                          "contexts": sorted(contexts or {})})  # fmt: skip
+                          "contexts": sorted(contexts or {}), "labels": labels or {}})  # fmt: skip
         if "claude-executor" in str(dockerfile):
             self.ids[tag] = f"sha256:layer{len(self.args):04d}"
             return True, "built"
@@ -256,6 +258,10 @@ def test_a_session_image_is_the_executor_layer_over_the_dev_image(layered: Any) 
     assert layer_build["dockerfile"].parent.name == "claude-executor"  # one layer definition
     assert layer_build["build_args"] == {"BASE": dev_tag}
     assert layer_build["contexts"] == ["claude_mods", "vigil_configs"]
+    # the image says which layer built it (the threat-row fixture picks by it)
+    from vigild.devimage import LAYER_LABEL, layer_digest
+
+    assert layer_build["labels"][LAYER_LABEL] == layer_digest()
     assert docker.checks and "2.1.306" in docker.checks[0][1]
     assert sessions.ensure_fresh(REPO, base) == tag and len(docker.args) == 2  # reused
 

@@ -60,7 +60,7 @@ from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
 from vigild.jobs.acceptance import check_worker, runner_config_changes
 from vigild.jobs.artifacts import parse_plan, render
-from vigild.jobs.deps import infer_deps
+from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
@@ -690,18 +690,23 @@ class JobRunner:
         locks = set(self.cfg.repo(repo).dev_lockfiles)
         touched = sorted({p for _, p in self.workspace.changed(repo, base_sha, head)} & locks)
         deps = [d.model_dump() for d in report.needs_deps]
-        if not deps:
-            for path in touched:
-                deps += [
-                    d.model_dump()
-                    for d in infer_deps(
-                        path,
-                        self.workspace.read_blob(repo, base_sha, path),
-                        self.workspace.read_blob(repo, head, path),
-                    )
-                ]
-        if not deps and not touched:
+        inferred: list[dict[str, Any]] = []
+        for path in touched:
+            inferred += [
+                d.model_dump()
+                for d in infer_deps(
+                    path,
+                    self.workspace.read_blob(repo, base_sha, path),
+                    self.workspace.read_blob(repo, head, path),
+                )
+            ]
+        # round 4, item 8: only dependency changes (a manifest's dependency
+        # fields, or a lockfile proper) are a deps request; a `scripts` edit
+        # goes the runner-config way (rejected unless the spec names the file)
+        dep_changes = bool(inferred) or any(is_lockfile(p) for p in touched)
+        if not deps and not dep_changes:
             return None
+        deps = deps or inferred
         diff = "\n".join(self.workspace.diff(repo, base_sha, head, p) for p in touched)
         return {
             "needs_deps": deps,
