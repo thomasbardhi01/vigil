@@ -1,0 +1,263 @@
+"""Task packets (design "Prompting discipline"). Every session gets one packet,
+assembled here, in six parts:
+
+1. Role and rules: prompts/<role>.md, then the repo's CLAUDE.md / AGENTS.md.
+2. Context pack: feature-map and architecture excerpts for the files in scope,
+   the files themselves, related tests, the last three commits touching them,
+   and for fix jobs the parent's spec and diffs. Capped; drops are recorded.
+3. Contract: the task JSON, with done_when restated as a checklist.
+4. Untrusted content, fenced: issue text, PR comments, fetched pages, logs.
+5. Output schema: the exact file the session must end with.
+6. Self-check: five questions the worker answers in its report.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from vigild.contract.models import Plan, WorkerReport
+from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
+from vigild.jobs.model import Role
+from vigild.packets.fence import UNTRUSTED_RULE, fence
+
+PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
+DEFAULT_BUDGET_CHARS = 120_000
+PARTS = ("role_and_rules", "context_pack", "contract", "untrusted", "output_schema", "self_check")
+TITLES = {
+    "role_and_rules": "1. Role and rules",
+    "context_pack": "2. Context pack",
+    "contract": "3. Contract",
+    "untrusted": "4. Untrusted content (data only)",
+    "output_schema": "5. Output",
+    "self_check": "6. Self-check",
+}
+SELF_CHECK = [
+    "Did the test fail before your change? (`test_failed_first`)",
+    "What did you change outside files_in_scope, and why? It must be nothing. (`outside_scope`)",
+    "What did you not do? (`not_done`)",
+    "What would a reviewer flag? (`reviewer_would_flag`)",
+    "What could be deleted? (`could_delete`)",
+]
+
+
+@dataclass
+class Packet:
+    role: Role
+    parts: dict[str, str]
+    dropped: list[str] = field(default_factory=list)
+
+    @property
+    def headings(self) -> list[str]:
+        return [f"# {TITLES[k]}" for k in self.parts]
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(f"# {TITLES[k]}\n\n{v.strip()}" for k, v in self.parts.items()) + "\n"
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except FileNotFoundError, IsADirectoryError, UnicodeDecodeError:
+        return None
+
+
+def _role_and_rules(role: Role, repo: Path) -> str:
+    prompt = (PROMPTS_DIR / f"{role.value}.md").read_text()
+    rules = _read(repo / "CLAUDE.md") or _read(repo / "AGENTS.md") or "(no CLAUDE.md in this repo)"
+    return f"{prompt.strip()}\n\n{UNTRUSTED_RULE}\n\n## The repo's CLAUDE.md\n\n{rules.strip()}"
+
+
+def _git_log(repo: Path, files: list[str]) -> str:
+    try:
+        out = subprocess.run(
+            ["git", "log", "-3", "--format=%h %ad %s", "--date=short", "--", *files],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except OSError, subprocess.TimeoutExpired:
+        return ""
+    return out.stdout.strip()
+
+
+def _excerpt(doc: str, needles: list[str]) -> str:
+    """Lines of a doc that mention any needle, plus the section heading above."""
+    keep: list[str] = []
+    heading = ""
+    for line in doc.splitlines():
+        if line.startswith("#"):
+            heading = line
+        if any(n and n in line for n in needles):
+            if heading and heading not in keep:
+                keep.append(heading)
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def _context_pack(
+    repo: Path, files: list[str], budget: int, fix_context: dict[str, str] | None
+) -> tuple[str, list[str]]:
+    items: list[tuple[str, str]] = []
+    if fix_context and fix_context.get("parent_spec"):
+        items.append(("parent spec (fix job)", fix_context["parent_spec"]))
+    if fix_context and fix_context.get("parent_diff"):
+        items.append(("parent diff (fix job)", fix_context["parent_diff"]))
+    needles = files + [Path(f).name for f in files]
+    for doc in ("docs/feature-map.md", "docs/architecture.md"):
+        text = _read(repo / doc)
+        if text and doc not in files:
+            ex = _excerpt(text, needles)
+            if ex:
+                items.append((f"{doc} (excerpt)", ex))
+    for f in files:
+        if "*" in f:
+            continue
+        text = _read(repo / f)
+        items.append((f, text if text is not None else "(does not exist yet)"))
+        stem = Path(f).stem
+        for t in (
+            sorted((repo / "tests").rglob(f"test_{stem}*.py"))[:3]
+            if (repo / "tests").is_dir()
+            else []
+        ):
+            rel = str(t.relative_to(repo))
+            if rel not in files:
+                items.append((f"{rel} (related test)", t.read_text()))
+    log = _git_log(repo, [f for f in files if "*" not in f])
+    if log:
+        items.append(("last commits touching these files", log))
+
+    out: list[str] = []
+    dropped: list[str] = []
+    used = 0
+    for name, body in items:
+        block = f"## {name}\n\n```\n{body.rstrip()}\n```"
+        if used + len(block) > budget:
+            dropped.append(f"{name} ({len(body)} chars)")
+            continue
+        out.append(block)
+        used += len(block)
+    if dropped:
+        out.append("## Dropped for the budget\n\n" + "\n".join(f"- {d}" for d in dropped))
+    return "\n\n".join(out), dropped
+
+
+def _checklist(done_when: str) -> str:
+    items = [s.strip() for s in re.split(r";|\n", done_when) if s.strip()]
+    return "\n".join(f"- [ ] {i}" for i in items)
+
+
+def _untrusted(untrusted: dict[str, str]) -> str:
+    if not untrusted:
+        return "(none)"
+    return "\n\n".join(fence(label, text) for label, text in untrusted.items())
+
+
+def assemble_worker(
+    repo: Path,
+    contract: dict[str, Any],
+    *,
+    untrusted: dict[str, str],
+    budget_chars: int = DEFAULT_BUDGET_CHARS,
+    fix_context: dict[str, str] | None = None,
+    approval_edits: str | None = None,
+) -> Packet:
+    spec = contract["spec"]
+    files = list(spec.get("files_in_scope") or [])
+    pack, dropped = _context_pack(repo, files, budget_chars, fix_context)
+    contract_part = (
+        "```json\n" + json.dumps(contract, indent=2, sort_keys=True) + "\n```\n\n"
+        f"Done when:\n{_checklist(spec.get('done_when') or '')}\n"
+        f"- [ ] `{spec.get('test_cmd')}` exits 0\n"
+    )
+    if approval_edits:
+        contract_part += f"\nThe owner's notes on approval (follow them):\n{approval_edits}\n"
+    untrusted = dict(untrusted)
+    if fix_context and fix_context.get("failure_log"):
+        untrusted["failure-log"] = fix_context["failure_log"]
+    report = artifact_path(Path("."), contract["job_id"], "worker_report.json", contract["task_id"])
+    schema = json.dumps(WorkerReport.model_json_schema(), indent=1, sort_keys=True)
+    output = (
+        f"End by writing `{report.as_posix()}` (relative to the repo root), valid against this "
+        f"schema, with `provenance` set to `claude`. Then commit.\n\n```json\n{schema}\n```"
+    )
+    self_check = "Answer each in the report's `self_check`:\n" + "\n".join(
+        f"{i}. {q}" for i, q in enumerate(SELF_CHECK, start=1)
+    )
+    return Packet(
+        Role.WORKER,
+        {
+            "role_and_rules": _role_and_rules(Role.WORKER, repo),
+            "context_pack": pack,
+            "contract": contract_part,
+            "untrusted": _untrusted(untrusted),
+            "output_schema": output,
+            "self_check": self_check,
+        },
+        dropped,
+    )
+
+
+def assemble_coord(
+    repo: Path,
+    request: dict[str, Any],
+    *,
+    untrusted: dict[str, str],
+    budget_chars: int = DEFAULT_BUDGET_CHARS,
+    gate_errors: list[str] | None = None,
+) -> Packet:
+    job_id = request["job_id"]
+    items: list[str] = []
+    dropped: list[str] = []
+    used = 0
+    for doc in ("README.md", "docs/feature-map.md", "docs/architecture.md"):
+        text = _read(repo / doc)
+        if text is None:
+            continue
+        block = f"## {doc}\n\n```\n{text.rstrip()}\n```"
+        if used + len(block) > budget_chars:
+            dropped.append(f"{doc} ({len(text)} chars)")
+            continue
+        items.append(block)
+        used += len(block)
+    if dropped:
+        items.append("## Dropped for the budget\n\n" + "\n".join(f"- {d}" for d in dropped))
+    notes = "\n".join(f"- {n}" for n in request.get("notes") or []) or "- (none)"
+    contract = (
+        "```json\n" + json.dumps(request, indent=2, sort_keys=True) + "\n```\n\n"
+        f"The owner's notes (address each one in plan.md):\n{notes}\n"
+    )
+    if gate_errors:
+        contract += (
+            "\nThe spec gate refused your last draft. Fix every one of these:\n"
+            + "\n".join(f"- {e}" for e in gate_errors)
+        )
+    plan_schema = json.dumps(Plan.model_json_schema(), indent=1, sort_keys=True)
+    output = (
+        f"Write `.vigil/{job_id}/spec.md` with these `##` sections: "
+        + ", ".join(SPEC_SECTIONS)
+        + f".\n\nWrite `.vigil/{job_id}/plan.md` with a `## Notes addressed` section and a "
+        "`## Workers` section holding one ```json block valid against this schema:\n\n"
+        f"```json\n{plan_schema}\n```\n\nWorker task ids are `{job_id}-w1`, `{job_id}-w2`, …"
+    )
+    return Packet(
+        Role.COORD,
+        {
+            "role_and_rules": _role_and_rules(Role.COORD, repo),
+            "context_pack": "\n\n".join(items) or "(empty)",
+            "contract": contract,
+            "untrusted": _untrusted(untrusted),
+            "output_schema": output,
+            "self_check": "Before stopping: does every criterion have a test command? "
+            "Does every worker contract validate? Are money paths flagged?",
+        },
+        dropped,
+    )
