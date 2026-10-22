@@ -60,10 +60,12 @@ from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
 from vigild.jobs.acceptance import check_worker, runner_config_changes
 from vigild.jobs.artifacts import parse_plan, render
+from vigild.jobs.deps import infer_deps
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
 from vigild.packets.assemble import assemble_coord, assemble_worker
+from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend
@@ -647,6 +649,33 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def _needs_deps(
+        self, repo: str, base_sha: str, head: str, report: WorkerReport
+    ) -> dict[str, Any] | None:
+        """What the worker needs, from its report or from the manifests and
+        lockfiles it changed; None when it needs nothing."""
+        locks = set(self.cfg.repo(repo).dev_lockfiles)
+        touched = sorted({p for _, p in self.workspace.changed(repo, base_sha, head)} & locks)
+        deps = [d.model_dump() for d in report.needs_deps]
+        if not deps:
+            for path in touched:
+                deps += [
+                    d.model_dump()
+                    for d in infer_deps(
+                        path,
+                        self.workspace.read_blob(repo, base_sha, path),
+                        self.workspace.read_blob(repo, head, path),
+                    )
+                ]
+        if not deps and not touched:
+            return None
+        diff = "\n".join(self.workspace.diff(repo, base_sha, head, p) for p in touched)
+        return {
+            "needs_deps": deps,
+            "lockfiles_changed": touched,
+            "diff": fence("worker manifest and lockfile diff", diff[:20000] or "(no changes)"),
+        }
+
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
         left), re-plan, or abandon."""
@@ -664,6 +693,31 @@ class JobRunner:
                 **why,
             }
             can_retry = can_retry and left >= MIN_RETRY_USD
+        deps = any("needs_deps" in t for t in tasks.values())
+        if deps:
+            # retry once the deps PR has merged: the base moves, so the dev image
+            # key changes and vigild builds the new image first
+            actions = (["retry"] if can_retry else []) + ["abandon"]
+            self._block(job_id, "needs_deps")
+            self._page(
+                job_id,
+                f"{job_id}: needs dependencies: "
+                + ", ".join(
+                    f"{d['package']}@{d['version']}"
+                    for t in tasks.values()
+                    for d in t.get("needs_deps", [])
+                )[:250],
+                {
+                    "kind": "needs_deps",
+                    "tasks": tasks,
+                    "actions": actions,
+                    "next": "a deps job changes only the manifest and lockfile, rebuilds the dev "
+                    "image and lands as its own PR (phase 2 builds it; until then, by hand). "
+                    "Retry this job after that PR merges.",
+                },
+                resumable=can_retry,
+            )
+            return
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(job_id, f"workers failed: {sorted(task_ids)}")
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
@@ -893,6 +947,19 @@ class JobRunner:
                 f"{task_id}: no valid worker_report.json",
                 {"error": str(e)[:1000]},
             )
+        needs = self._needs_deps(job.repo, base_sha, head, report)
+        if needs is not None:
+            # owner direction, round 3: a dependency change is its own (deps) job;
+            # this task waits for it instead of being verified against the base
+            if s is not None:
+                self.store.update_session(s.id, status="waiting")
+            self.store.update_task(task_id, state="needs_deps")
+            with self._why_lock:
+                self._why[task_id] = {"title": f"{task_id} needs dependencies", **needs}
+            self.store.add_event(
+                "needs_deps", redact(needs), Provenance.HUMAN, job_id=job_id, task_id=task_id
+            )
+            return False
         tests = None
         test_cmd = str(contract["spec"].get("test_cmd") or "")
         if test_cmd.strip():

@@ -194,7 +194,7 @@ class StandIn:
                 _work(spec.clone, f)
             d = spec.clone / ".vigil" / spec.job_id / spec.task_id  # type: ignore[operator]
             d.mkdir(parents=True, exist_ok=True)
-            if not (d / "ask_coord.json").exists():
+            if not (d / "ask_coord.json").exists() and not (d / "worker_report.json").exists():
                 (d / "worker_report.json").write_text(json.dumps({
                     "task_id": spec.task_id, "job_id": spec.job_id, "test_before": "fail",
                     "test_after": "pass", "files_changed": task["spec"]["files_in_scope"],
@@ -285,7 +285,7 @@ def world(
         decider=["haiku"],
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
         dev_dockerfile="images/dev/vigil.Dockerfile",
-        dev_lockfiles=["README.md"],
+        dev_lockfiles=["uv.lock"],
         dev_suites={"smoke": "true"},
         dev_image_tools=["git", "grep", "pytest"],
     )
@@ -790,9 +790,9 @@ def _spend(w: World, amount_out_tokens: int) -> Callable[[SessionSpec], None]:
     return spend
 
 
-def _failure_item(w: World, job: str) -> dict[str, Any]:
+def _failure_item(w: World, job: str, kind: str = "worker_failed") -> dict[str, Any]:
     items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == "worker_failed"]
+    (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == kind]
     return item  # type: ignore[no-any-return]
 
 
@@ -1045,3 +1045,73 @@ def test_a_named_runner_config_change_is_flagged_and_still_runs_the_base_copy(
     record = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
     assert record["runner_config"]["pinned_to_base"] == ["conftest.py"]
     assert record["after"]["outcome"] == "pass" and record["ran"]["ok"]
+
+
+# --- owner direction, round 3: a task that needs a dependency blocks on it --------------------
+
+
+def test_a_worker_that_reports_needs_deps_blocks_its_job(world: World) -> None:
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "worker_report.json").write_text(json.dumps({
+                "task_id": spec.task_id, "job_id": spec.job_id, "files_changed": [],
+                "summary": "needs a parser", "provenance": "claude",
+                "self_check": {"test_failed_first": True, "outside_scope": [], "not_done": "all",
+                               "reviewer_would_flag": "-", "could_delete": "-"},
+                "needs_deps": [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
+                                "why": "round-trip TOML"}]}))  # fmt: skip
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    assert w.store.get_task(f"{job}-w1").state == "needs_deps"
+    item = _failure_item(w, job, kind="needs_deps")
+    deps = item["body"]["tasks"][f"{job}-w1"]["needs_deps"]
+    assert deps == [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
+                     "why": "round-trip TOML"}]  # fmt: skip
+    assert item["body"]["actions"] == ["retry", "abandon"]
+    assert w.tests.calls == [c for c in w.tests.calls if f"{job}-w1" not in c["source"]]
+
+
+def test_a_lockfile_change_is_read_as_needs_deps(world: World) -> None:
+    """The worker edits the manifest instead of asking: vigild reads what it
+    wanted from the diff, shows the diff fenced, and doesn't verify the task."""
+    w = world
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["package.json"]
+    w.runner.cfg.repos.repos[REPO].runner_config = ["package.json"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            (spec.clone / "package.json").write_text('{"dependencies": {"left-pad": "1.3.0"}}\n')
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    item = _failure_item(w, job, kind="needs_deps")
+    t = item["body"]["tasks"][f"{job}-w1"]
+    assert t["needs_deps"] == [
+        {"ecosystem": "npm", "package": "left-pad", "version": "1.3.0", "why": "read from the diff"}
+    ]
+    assert t["diff"].startswith("<<<UNTRUSTED") and '+{"dependencies"' in t["diff"]
+
+
+def test_needs_deps_is_inferred_from_manifests() -> None:
+    from vigild.jobs.deps import infer_deps
+
+    pkg_a = '{"dependencies": {"a": "1.0.0"}, "devDependencies": {"b": "2.0.0"}}'
+    pkg_b = '{"dependencies": {"a": "1.1.0", "c": "^3"}, "devDependencies": {"b": "2.0.0"}}'
+    got = infer_deps("server/package.json", pkg_a, pkg_b)
+    assert [(d.ecosystem, d.package, d.version) for d in got] == [
+        ("npm", "a", "1.1.0"),
+        ("npm", "c", "^3"),
+    ]
+    py_a = '[project]\nname = "x"\ndependencies = ["requests>=2.32"]\n'
+    py_b = '[project]\nname = "x"\ndependencies = ["requests>=2.32", "tomlkit==0.13.2"]\n'
+    got = infer_deps("data/pyproject.toml", py_a, py_b)
+    assert [(d.ecosystem, d.package, d.version) for d in got] == [("pypi", "tomlkit", "==0.13.2")]
+    assert infer_deps("uv.lock", "a", "b") == []

@@ -70,6 +70,19 @@
       "title": "Limits",
       "type": "object"
     },
+    "Shape": {
+      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1 and always\nneeds the owner's review (round 3).",
+      "enum": [
+        "docs",
+        "tests",
+        "feature",
+        "fix",
+        "refactor",
+        "deps"
+      ],
+      "title": "Shape",
+      "type": "string"
+    },
     "Size": {
       "enum": [
         "XS",
@@ -204,6 +217,18 @@
       "title": "Base",
       "type": "string"
     },
+    "blocked_on": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Blocked On"
+    },
     "branch": {
       "anyOf": [
         {
@@ -257,6 +282,18 @@
     "limits": {
       "$ref": "#/$defs/Limits"
     },
+    "parent_task": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Task"
+    },
     "repo": {
       "title": "Repo",
       "type": "string"
@@ -271,6 +308,17 @@
       "minimum": 1,
       "title": "Risk",
       "type": "integer"
+    },
+    "shape": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Shape"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "size": {
       "anyOf": [

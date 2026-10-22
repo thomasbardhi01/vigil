@@ -124,9 +124,15 @@ def _m2_dev_image_keys(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "dev_images", {"key": "TEXT", "stage": "TEXT", "base_sha": "TEXT"})
 
 
+def _m3_job_blocked_on(conn: sqlite3.Connection) -> None:
+    """Round 3: a job blocked on a dependency names the deps job it waits for."""
+    _add_columns(conn, "jobs", {"blocked_on": "TEXT"})
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
+    _m3_job_blocked_on,
 ]
 
 
@@ -218,7 +224,9 @@ class Store:
             n = c.execute("SELECT COUNT(*) FROM jobs WHERE id LIKE ?", (f"{prefix}-%",)).fetchone()
             job_id = f"{prefix}-{int(n[0]) + 1:04d}"
             c.execute(
-                "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, repo, base, title, request, notes, source, state,"
+                " blocked_from, parent_job_id, fix_depth, coord_session_id, created_at,"
+                " updated_at, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     repo,
@@ -260,6 +268,7 @@ class Store:
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             provenance=r["provenance"],
+            blocked_on=r["blocked_on"],
         )
 
     def list_jobs(self) -> list[Job]:
@@ -268,6 +277,10 @@ class Store:
     def child_jobs(self, job_id: str) -> list[str]:
         rows = self.q("SELECT id FROM jobs WHERE parent_job_id=? ORDER BY id", (job_id,))
         return [r["id"] for r in rows]
+
+    def _set_blocked_on(self, job_id: str, blocker: str | None) -> None:
+        """Only vigild.jobs.fsm calls this."""
+        self.x("UPDATE jobs SET blocked_on=? WHERE id=?", (blocker, job_id))
 
     def _write_state(self, job_id: str, state: JobState, blocked_from: JobState | None) -> None:
         """Only vigild.jobs.fsm calls this."""

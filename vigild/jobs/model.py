@@ -53,6 +53,7 @@ class Job:
     created_at: str
     updated_at: str
     provenance: str
+    blocked_on: str | None = None  # a deps job this one waits for (round 3)
 
 
 @dataclass

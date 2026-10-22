@@ -1,5 +1,43 @@
 {
   "$defs": {
+    "DepRequest": {
+      "additionalProperties": false,
+      "description": "A dependency a worker needs and the repo's dev image doesn't have.",
+      "properties": {
+        "ecosystem": {
+          "enum": [
+            "npm",
+            "pypi"
+          ],
+          "title": "Ecosystem",
+          "type": "string"
+        },
+        "package": {
+          "maxLength": 214,
+          "minLength": 1,
+          "title": "Package",
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "why": {
+          "default": "",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ecosystem",
+        "package",
+        "version"
+      ],
+      "title": "DepRequest",
+      "type": "object"
+    },
     "Provenance": {
       "enum": [
         "claude",
@@ -70,6 +108,13 @@
     "job_id": {
       "title": "Job Id",
       "type": "string"
+    },
+    "needs_deps": {
+      "items": {
+        "$ref": "#/$defs/DepRequest"
+      },
+      "title": "Needs Deps",
+      "type": "array"
     },
     "open_questions": {
       "items": {

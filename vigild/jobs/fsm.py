@@ -177,6 +177,12 @@ def transition(
                 raise TransitionError(f"no transition {frm.value} -> {to.value}")
             if not str(evidence.get("reason", "")).strip():
                 raise TransitionError(f"{to.value} needs a reason")
+            blocker = evidence.get("blocked_on")
+            if blocker is not None:
+                try:
+                    store.get_job(str(blocker))
+                except KeyError as e:
+                    raise TransitionError(f"blocked_on names no job: {blocker}") from e
             blocked_from = frm
         elif frm in HOLDS:
             action = evidence.get("action")
@@ -187,6 +193,13 @@ def transition(
                 )
             if not owner_inbox:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
+            if to == job.blocked_from and job.blocked_on:
+                # round 3: back to work only once the deps job it waits for has merged
+                dep = store.get_job(job.blocked_on)
+                if dep.state not in (S.MERGED, S.VERIFYING, S.DONE):
+                    raise TransitionError(
+                        f"waiting on {dep.id} (a deps job, {dep.state.value}); it must merge first"
+                    )
         else:
             guard = EDGES.get((frm, to))
             if guard is None:
@@ -204,6 +217,10 @@ def transition(
                     )
 
         store._write_state(job_id, to, blocked_from)
+        if to in HOLDS:
+            store._set_blocked_on(job_id, evidence.get("blocked_on"))
+        elif frm in HOLDS:
+            store._set_blocked_on(job_id, None)
         store.add_event(
             "state",
             {

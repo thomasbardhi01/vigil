@@ -279,3 +279,41 @@ def test_abandoned_is_terminal_and_reachable_from_spec_pending(store: Store) -> 
     )
     with pytest.raises(TransitionError, match="no transition out"):
         transition(store, jid, S.BLOCKED, Actor.VIGILD, evidence={"reason": "x"})
+
+
+# owner direction, round 3: a task blocked on a dependency waits for its deps job
+def test_a_job_blocked_on_a_deps_job_resumes_only_after_it_merges(store: Store) -> None:
+    parent = _job(store, S.BUILDING)
+    deps = _job(store, S.BUILDING)
+    transition(
+        store, parent, S.BLOCKED, Actor.VIGILD,
+        evidence={"reason": "needs_deps", "blocked_on": deps},
+    )  # fmt: skip
+    assert store.get_job(parent).blocked_on == deps
+    with pytest.raises(TransitionError, match=f"waiting on {deps}"):
+        transition(store, parent, S.BUILDING, Actor.OWNER, channel="inbox")
+    store._force_state(deps, S.MERGED)
+    job = transition(store, parent, S.BUILDING, Actor.OWNER, channel="inbox")
+    assert job.state is S.BUILDING and job.blocked_on is None
+
+
+def test_a_job_blocked_on_deps_can_still_be_abandoned(store: Store) -> None:
+    parent = _job(store, S.BUILDING)
+    deps = _job(store, S.BUILDING)
+    transition(
+        store, parent, S.BLOCKED, Actor.VIGILD,
+        evidence={"reason": "needs_deps", "blocked_on": deps},
+    )  # fmt: skip
+    job = transition(
+        store, parent, S.ABANDONED, Actor.OWNER, channel="inbox", evidence={"action": "abandon"}
+    )
+    assert job.state is S.ABANDONED
+
+
+def test_blocked_on_must_name_a_job(store: Store) -> None:
+    parent = _job(store, S.BUILDING)
+    with pytest.raises(TransitionError, match="no job"):
+        transition(
+            store, parent, S.BLOCKED, Actor.VIGILD,
+            evidence={"reason": "needs_deps", "blocked_on": "xx-9999"},
+        )  # fmt: skip
