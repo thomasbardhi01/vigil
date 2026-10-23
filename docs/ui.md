@@ -174,7 +174,7 @@ reference: a shape made of characters that breathes while it's live.
 
 ## Pages
 
-These nine pages, and nothing else. The Vigil UI canvas is the visual
+These nine pages, and nothing else (a tenth, `/learn`, is planned below). The Vigil UI canvas is the visual
 reference for all nine, Talk and Watch included. Each page lists the API calls
 behind it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
 contract, and every session (attempt, review, audit) it has spawned.
@@ -187,6 +187,14 @@ One table with every job:
 - turns, elapsed;
 - tokens in/out, $ or GPU-s;
 - PR, CI, review rung, trace link.
+
+- **Risk and readiness** (planned, `docs/design.md` "Merge risk and
+  readiness"): the PR's merge-risk grade (`low`, `med`, `HIGH`) and, when
+  the PR is UI-shaped and has no recording or screenshot pair,
+  `not ready for review`. Both are read from artifact rows. Neither is a
+  gate, and neither changes a CI or review column. `not ready for review`
+  reuses the Evidence cell's `rec` mark (the PR evidence pack) and does not
+  repeat it.
 
 Typing filters the table. `Enter` opens `/job/:id`.
 
@@ -228,6 +236,13 @@ Three columns.
   - GPU, CPU, RAM and W as per-second character sparklines.
   - J/token and GPU-s/token.
   - A link to the Langfuse trace.
+- **PR header** (planned): the merge-risk grade beside the PR link, with
+  its signals one line each: blast radius (the sensitive paths hit),
+  rollback cost (migration, down step, schema or API change), swallowed
+  errors (`not measured` until semgrep's false-positive rate is known) and
+  the reviewer's alignment and drive-by input. A `HIGH` grade shows what it
+  added: `owner look required` or `reviewed at rung N-1`. It never shows a
+  rung lower than the ladder's, and it is advisory.
 - **Kill.** `x` puts an inline line under the header: `kill pa-0142? y/n`.
   `y` stops the running session (`POST /api/sessions/{id}/kill`), the same
   call as `vigil kill`.
@@ -324,6 +339,12 @@ task passes the same gates.
   - today's open reservations;
   - the month against the monthly cap.
 - **WIP limits** per repo, with the open fleet PRs.
+- **Experiment line** (planned, `docs/design.md` "Factory engineering"):
+  the monthly experiment budget (proposed `$10`) as spent, reserved and
+  remaining, split into benchmark replays, scorer samples and proposal
+  comparisons. It counts inside the month and never inside today's bar.
+- **Cost per merged PR** beside the caps, over 30 days, by shape and route,
+  with the experiment line shown apart from it.
 - Caps are read-only here. They live in `configs/budgets.yaml`, the same
   for every interface.
 
@@ -399,6 +420,35 @@ No polling. The 100 KB page-weight limit applies.
 
 **Depends on:** the phase 2 session proxy (the code stream) and phase 2
 review data (the quality strip's findings); tower meters wait for phase 5.
+
+### 10. `/learn` (planned)
+
+The owner's request names a Learn screen; the pages above have none, so
+this is a tenth page. Open: the alternative is to put these on `/review`
+(owner to decide). It reads and never writes policy.
+
+- **Factory metrics,** each as a 30-day character sparkline with its latest
+  value (`docs/design.md` "Factory engineering"):
+  - cost per merged PR;
+  - human touches per PR: steers, takeovers, escalations answered, review
+    overrides;
+  - time to merge, time from PR open to merge, time to first human review;
+  - 14-day revert rate;
+  - auditor-confirmed finding rate (random audit sample only).
+- **Pareto view.** Cost on one axis and quality on the other, one point per
+  named benchmark config, the non-dominated points joined by a line and
+  dominated ones dimmed. Each point carries its *n*; a comparison under 8
+  tasks in a shape reads `insufficient n` and is not ranked. A job whose
+  hidden tests were shown to a model reads `exposed` and is not plotted.
+- **Scorers.** Each scorer with its agreement over its owner-labelled runs
+  (`n/30` until 30, then the rate). Below 30 labels or 80% it reads
+  `uncalibrated` and none of its trends is drawn. The owner labels a run
+  here.
+- **Proposals.** Open improvement-proposal PRs with the runs they cite and
+  their replay comparison.
+
+**API:** `GET /api/metrics`, `GET /api/benchmarks`, `GET /api/scorers`,
+`POST /api/scorers/{id}/labels`.
 
 ## Files
 
