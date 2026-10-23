@@ -225,6 +225,22 @@ numbers if a role's worst-case first call no longer fits its reservation, and
 A session whose final model call stopped at the cap is marked failed
 ("truncated at the output cap"), not done.
 
+### Unstable test ids and redacted keys
+
+The verifier runs the base twice (four runs with must-fail-first), so a
+verification takes about a third longer; each run still has its own
+15-minute cap. A test whose id changes every run (a `test.each` title with
+`crypto.randomUUID()` or a generated key) is matched by file and title
+without its parameters, by count, and `tests.json` lists it under
+`ran.unstable`. A random value the rule does not recognise (see B33) makes
+the title never match: the task fails, and the fix is a stable title in the
+repo's test.
+
+`redact` also drops PEM private keys. On start, vigild re-applies it to
+stored inbox bodies, events and `tests.json` (a migration), so a key that was
+stored before the fix is scrubbed on the next restart; an item's status is
+not changed.
+
 ### Check everything
 
 ```sh
