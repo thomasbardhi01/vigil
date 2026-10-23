@@ -327,15 +327,20 @@ def belongs(case: Case, files: Iterable[str]) -> bool:
 
 
 # What a test.each title interpolates that changes on every run, and nothing else:
-# a PEM block, a uuid, a long hex run, a long base64-looking token that has a digit,
-# a number of 10 or more digits (a timestamp). A pytest id's `[...]` is cut off
-# whole. A random value that is none of these (a short number, a word) is not
-# masked, so a title that carries one never matches: that fails closed.
+# a PEM block, a uuid, a long hex run, a long base64-looking token (mixed case with
+# a digit, or with `+`/`/` and a digit, or ending in `=` with a digit; never a plain
+# `[a-z0-9_]` name), a number of 10 or more digits (a timestamp). A pytest id's
+# `[...]` is cut off whole. A random value that is none of these is not masked; the
+# two base runs then show it under different titles, and `compare_runs` requires
+# head to have as many leftover new ids in that file (fails closed on a deletion).
+_B64 = r"[A-Za-z0-9+/_-]"
 _PARAMS = re.compile(
     r"-----BEGIN [A-Z ]+-----.*?(?:-----END [A-Z ]+-----|\Z)"
     r"|\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
     r"|\b[0-9a-fA-F]{16,}\b"
-    r"|(?<![A-Za-z0-9+/_=-])(?=[A-Za-z0-9+/_-]*\d)[A-Za-z0-9+/_-]{24,}={0,2}"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*[A-Z])(?={_B64}*[a-z])(?={_B64}*\d){_B64}{{24,}}={{0,2}}"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*[+/])(?={_B64}*\d){_B64}{{24,}}={{0,2}}"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*\d){_B64}{{24,}}={{1,2}}"
     r"|\b\d{10,}\b",
     re.S,
 )
@@ -371,6 +376,8 @@ def compare_runs(
     parameters) and by count: head needs at least as many of each as both base
     runs had (the lower of the two counts), counting only head ids that are not
     stable base ids. A drop in count fails."""
+    if not base2:  # no second base run, or one with no report: exact ids only
+        base2 = None
     unstable = ({c.id for c in base} ^ {c.id for c in base2}) if base2 is not None else set()
     ids_b = {c.id for c in base} - unstable
     ids_h = {c.id for c in head}
@@ -385,14 +392,31 @@ def compare_runs(
         in_a = _title_counts(c for c in base if c.id in unstable)
         in_b = _title_counts(c for c in base2 if c.id in unstable)
         at_head = _title_counts(c for c in head if c.id not in ids_b)
+        used: dict[str, int] = {}  # head ids spent on matched titles, per file
+        loose_a: dict[str, int] = {}  # unstable ids whose title didn't match across runs
+        loose_b: dict[str, int] = {}
         for key in sorted(set(in_a) | set(in_b)):
-            need = min(in_a.get(key, 0), in_b.get(key, 0))
+            na, nb = in_a.get(key, 0), in_b.get(key, 0)
+            need = min(na, nb)
+            loose_a[key[0]] = loose_a.get(key[0], 0) + na - need
+            loose_b[key[0]] = loose_b.get(key[0], 0) + nb - need
             if not need:
-                continue  # in one base run only: flaky, nothing to require
+                continue
             got = at_head.get(key, 0)
+            used[key[0]] = used.get(key[0], 0) + min(got, need)
             rows.append({"file": key[0], "title": key[1], "base": need, "head": got})
             if got < need:
                 missing.append(f"{key[0]}::{key[1]}: {need} at base, {got} at head")
+        spare: dict[str, int] = {}
+        for (f, _), n in at_head.items():
+            spare[f] = spare.get(f, 0) + n
+        for f in sorted(set(loose_a) | set(loose_b)):
+            need = min(loose_a.get(f, 0), loose_b.get(f, 0))
+            left = spare.get(f, 0) - used.get(f, 0)
+            if need:
+                rows.append({"file": f, "title": "<unmatched>", "base": need, "head": left})
+            if left < need:
+                missing.append(f"{f}: {need} unmatched unstable ids at base, {left} new at head")
     out: dict[str, Any] = {
         "checked": True,
         "ids": {"base": len({c.id for c in base}), "head": len(ids_h)},
@@ -462,9 +486,12 @@ class Verifier:
             # #1). It costs one more run the length of the base's, and only when the
             # base reported.
             base2 = self._run(repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin])
-            record["base_repeat"] = {
-                k: base2[k] for k in ("sha", "exit", "outcome", "tests") if k in base2
-            }
+            if base2["_report"] and base2["_cases"]:
+                record["base_repeat"] = {
+                    k: base2[k] for k in ("sha", "exit", "outcome", "tests") if k in base2
+                }
+            else:
+                record["base_repeat"] = "unavailable"  # exact ids only
         before: dict[str, Any] | None = None
         if must_fail_first:
             before = self._run(

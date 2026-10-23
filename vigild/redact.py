@@ -11,10 +11,11 @@ from typing import Any
 
 SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
 # A PEM private key, through its END line; or, if the text was cut off, to the end
-# of the string or the next `"` (a PEM body has none), so a JSON string holding it
-# keeps parsing. Matches real newlines and the escaped backslash-n of a JSON string.
+# of the string or the next `"` or escaped `\"` (a PEM body has neither), so a JSON string
+# holding it keeps parsing. Matches real newlines and the escaped backslash-n of JSON.
 PEM_KEY = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^\"]*?(?:-----END [A-Z ]*PRIVATE KEY-----|(?=\")|\Z)"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[^\"\\]|\\(?!\"))*?"
+    r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=\\?\")|\Z)"
 )
 
 

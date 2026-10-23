@@ -232,9 +232,8 @@ verification takes about a third longer; each run still has its own
 15-minute cap. A test whose id changes every run (a `test.each` title with
 `crypto.randomUUID()` or a generated key) is matched by file and title
 without its parameters, by count, and `tests.json` lists it under
-`ran.unstable`. A random value the rule does not recognise (see B33) makes
-the title never match: the task fails, and the fix is a stable title in the
-repo's test.
+`ran.unstable`. A random value the rule does not recognise (see B33) is
+checked by count per file instead, so a deleted test still fails.
 
 `redact` also drops PEM private keys. On start, vigild re-applies it to
 stored inbox bodies, events and `tests.json` (a migration), so a key that was

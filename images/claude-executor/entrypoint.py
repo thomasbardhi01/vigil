@@ -58,7 +58,8 @@ BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
 SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
 PEM_KEY = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^\"]*?(?:-----END [A-Z ]*PRIVATE KEY-----|(?=\")|\Z)"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[^\"\\]|\\(?!\"))*?"
+    r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=\\?\")|\Z)"
 )
 # Paths in .git that send git somewhere else for its config, hooks or objects.
 ELSEWHERE = ("commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates")

@@ -109,3 +109,54 @@ def test_compare_runs_with_vitest_shaped_unstable_titles() -> None:
     got = compare_runs(a, h, b)
     assert got["ok"] and got["unstable"][0]["title"] == "loads <>"
     assert not compare_runs(a, h[1:], b)["ok"]  # a drop in count fails
+
+
+# --- review of PR 17 ------------------------------------------------------------------------
+
+
+def _c(file: str, name: str) -> Case:
+    return Case(f"{file}::{name}", file, "pass")
+
+
+def test_a_base_repeat_with_no_report_falls_back_to_exact_ids() -> None:
+    base = [_c("f", "x 111"), _c("f", "stable")]
+    head = [_c("f", "other")]
+    assert not compare_runs(base, head, [])["ok"]
+    assert "stable" in " ".join(compare_runs(base, head, [])["missing_ids"])
+    assert not compare_runs(base, head, None)["ok"]
+
+
+def test_an_unmasked_random_value_cannot_be_deleted() -> None:
+    a = [_c("f", "x 111"), _c("f", "keep")]
+    b = [_c("f", "x 222"), _c("f", "keep")]
+    got = compare_runs(a, [_c("f", "keep")], b)
+    assert not got["ok"], got
+    assert compare_runs(a, [_c("f", "keep"), _c("f", "x 333")], b)["ok"]
+
+
+def test_snake_case_names_with_a_digit_are_not_parameters() -> None:
+    one = normalise_title("test_rejects_expired_token_v1")
+    two = normalise_title("test_rejects_missing_token_v2")
+    assert one != two and "<>" not in one + two
+    assert normalise_title("jwt Zm9vYmFyLWJhei1xdXV4LTEyMzQ1Ng") == "jwt <>"
+
+
+def test_a_verifier_with_a_reportless_repeat_records_it_unavailable(
+    ws: Workspace,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    from tests.harness import LocalTestRunner
+    from vigild.verifier import RunResult
+
+    class Flaky(LocalTestRunner):
+        n = 0
+
+        def run(self, *a: object, **k: object) -> RunResult:
+            self.n += 1
+            r = super().run(*a, **k)  # type: ignore[arg-type]
+            return RunResult(r.exit, r.output) if self.n == 2 else r
+
+    base, head = _session(ws, tmp_path, _turn_on)
+    rec = _verify(ws, base, head, runner=Flaky())
+    assert rec["base_repeat"] == "unavailable"
+    assert rec["ran"]["unstable"] == [] and rec["ran"]["ok"]

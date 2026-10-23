@@ -118,3 +118,23 @@ def test_a_stored_private_key_is_scrubbed_and_clean_rows_are_untouched(tmp_path:
     store.conn.close()
     again = Store.open(path)  # idempotent
     assert [r["body"] for r in again.q("SELECT body FROM inbox_items ORDER BY id")] == bodies
+
+
+def test_a_double_encoded_json_with_an_unterminated_pem_still_parses() -> None:
+    inner = json.dumps({"k": f"x {BEGIN}\n{BODY}"})
+    outer = json.dumps({"o": inner, "p": "z"})
+    out = json.loads(redact(outer))
+    assert out["p"] == "z" and "MIIEvQ" not in out["o"]
+    assert json.loads(out["o"]) == {"k": "x [redacted]"}
+
+
+def test_the_migration_step_directly_is_idempotent_and_leaves_clean_rows(tmp_path: Path) -> None:
+    path = tmp_path / "vigil.db"
+    _, clean = _pem_db(path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    db._m5_scrub_private_keys(conn)
+    first = [r[0] for r in conn.execute("SELECT body FROM inbox_items ORDER BY id")]
+    assert "MIIEvQ" not in first[0] and first[1] == clean
+    db._m5_scrub_private_keys(conn)
+    assert [r[0] for r in conn.execute("SELECT body FROM inbox_items ORDER BY id")] == first
