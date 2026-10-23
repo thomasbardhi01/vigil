@@ -907,10 +907,10 @@ How the factory is measured, evidenced and tuned once it runs. **Design only; no
 | Stage | Starts | What it holds |
 |---|---|---|
 | **A** | build now | metrics, config split, merge-risk grade, readiness evidence, CI after the PR opens. Cheap, no model call of its own, works at low volume |
-| **B** | 30 or more merged jobs | benchmarks, scorers |
-| **C** | 60 or more merged jobs, or when the owner turns it on | improvement proposals, webhook intake |
+| **B** | 30 or more validated benchmark tasks in the repo (both sources) | benchmarks, scorers |
+| **C** | 60 or more merged Vigil jobs in the repo, or when the owner turns it on | improvement proposals, webhook intake |
 
-Open: **what a stage gate counts.** "Merged jobs" can be counted per repo or across all repos. This section counts **across all repos for the stage gate** (one fleet, one owner, and a small repo would otherwise never reach 30), and counts per repo and per shape for any comparison that names a repo or shape (a Pareto point needs its own *n*). (owner to decide)
+**What a stage gate counts (owner ruling).** Stage B counts **validated benchmark tasks from both sources, 30 per repo**. Stage C counts **merged Vigil jobs, 60 per repo**. Every comparison is per repo and per shape. "Across all repos" is rejected.
 
 **Greyed until the count is reached.** A grey feature shows its name, the count it needs and the count it has (`merged 12 / 30`), and no number. The counts are:
 
@@ -920,11 +920,11 @@ Open: **what a stage gate counts.** "Merged jobs" can be counted per repo or acr
 | 14-day revert rate | 10 merged PRs that are at least 14 days old |
 | Auditor-confirmed finding rate | 20 audited reviews from the random sample |
 | Merge-risk grade, footer, recording, CI reopening | 0 (advisory or per-PR; they act on one PR) |
-| Benchmarks, Pareto view | 30 merged jobs; and 8 tasks in a shape before that shape is ranked |
+| Benchmarks, Pareto view | 30 validated benchmark tasks in the repo; and 8 tasks in a shape before that shape is ranked |
 | Scorer trends | 30 owner-labelled runs at 80% agreement or better, per scorer |
-| Improvement proposals | 60 merged jobs or the owner's switch; and a failure class at 5 runs, or failures 14 days old |
+| Improvement proposals | 60 merged Vigil jobs in the repo or the owner's switch; and a failure class at 5 runs, or failures 14 days old |
 
-**The learning loop's rules win.** Where this section meets one, the rule stands and the conflict is marked **Open** where it arises. The rules it must keep:
+**The learning loop's rules win.** Where this section meets one, the rule stands; each such point is settled in place and listed in "Decisions" at the end. The rules it must keep:
 - hidden tests are stored by vigild and never shown;
 - `reward.json` is sealed and is never an input to a decision about the job itself;
 - training uses `local` provenance only, and only runs that pass the repo's suite and the hidden set;
@@ -944,13 +944,13 @@ Built from the event log (`events`), the artifacts, the sessions, gateway meteri
 | 14-day revert rate | merged PRs whose merge commit was reverted on the default branch within 14 days, over merged PRs at least 14 days old | git in the vault |
 | Auditor-confirmed finding rate | reviewer findings the auditor tags **real**, over reviewer findings in audited reviews; **random audit sample only**, like the ladder's statistics | `audit.json` |
 
-Open: `vigild/kpis.py` already defines "cost per merged PR" and "median spec→merge" (architecture "KPIs"), and the learning loop's metric 4 is "human interventions per merged PR". This section keeps one definition of each: the table supersedes the first's wording, "human touches" is metric 4 under a new name, and "autonomy rate" is the share of PRs with zero takeovers. Spec-to-merge stays a KPI and is not repeated here. (owner to decide)
+`vigild/kpis.py` already defines "cost per merged PR" and "median spec→merge" (architecture "KPIs"), and the learning loop's metric 4 is "human interventions per merged PR". This section keeps one definition of each: the table supersedes the first's wording, "human touches" is metric 4 under a new name, and "autonomy rate" is the share of PRs with zero takeovers. Spec-to-merge stays a KPI and is not repeated here.
 
-Open: "14-day revert rate" is a mechanical count of revert commits. It is not the learning loop's 30-day attribution, which bisects a regression to a job and sets its reward to 0. Both stay under different names, and a revert does not by itself write to `reward.json`. (owner to decide)
+"14-day revert rate" is a mechanical count of revert commits. It is not the learning loop's 30-day attribution, which bisects a regression to a job and sets its reward to 0. Both stay under different names, and a revert does not by itself write to `reward.json`.
 
-Open: "auditor-confirmed" needs the auditor's real-or-false tag, which arrives with the learning epic (stage 6). Until then the audit's match rate stands in, and the screen says so. (owner to decide)
+"Auditor-confirmed" needs the auditor's real-or-false tag, which arrives with the learning epic (stage 6). Until then the audit's match rate stands in, and the screen says so.
 
-Open: the UI has nine pages "and nothing else" (`docs/ui.md`), and none is called Learn. `/review` is the trust ladder and `/budget` the caps. This section adds a tenth page, `/learn`, as the owner's request names it; the alternative is to put the metrics on `/review`. (owner to decide)
+The UI has nine pages "and nothing else" (`docs/ui.md`), and none is called Learn. **Owner ruling: a tenth page, `/learn`**, as the request names it; `docs/ui.md` is updated.
 
 **Where they show.** The Learn screen carries the metrics as 30-day trends with the latest value. The Budget screen carries cost per merged PR beside the caps, and the experiment line. Both read `GET /api/metrics`. The metrics are for the owner to read; **no gate, route, rung or reward reads them.**
 
@@ -969,9 +969,9 @@ Three rules:
 - **Every change is audited.** vigild writes a `config_loaded` event at each start with the sha256 of every policy file and the diff from the previous load. A policy file whose hash changed with no owner-merged commit behind it stops vigild from starting.
 - **Nothing in a repo overrides it.** A repo or task value for a host key is **refused with an error, not ignored**. The one existing exception is the contract's own limits, which may go below the caps and never above (architecture B14).
 
-Open: **verify levels and the gate contract as host policy.** The verification ladder (this document, above) has the spec set a level per criterion, with `why_not_higher` at level 0, and the learning loop has the spec carry a `reward_schema`. This section reads host policy as the **allowed range and the floor**: a spec chooses a level inside what the host allows for that shape, and neither a repo nor a spec can lower the floor or edit the gate contract. The per-criterion choice stays in the spec. (owner to decide)
+**Verify levels and the gate contract as host policy.** The verification ladder (this document, above) has the spec set a level per criterion, with `why_not_higher` at level 0, and the learning loop has the spec carry a `reward_schema`. Host policy is the **allowed range and the floor**: a spec chooses a level inside what the host allows for that shape, and neither a repo nor a spec can lower the floor or edit the gate contract. The per-criterion choice stays in the spec.
 
-Open: `configs/` is in the vigil repo, and vigil is also a repo that sessions work on (`repos.yaml`: self-maintenance). "No session changes host policy" then needs `configs/**` to be a locked path for sessions of the vigil repo too, not only a rule that a human merges; phase 2a edits `configs/budgets.yaml` and `configs/review.yaml` by session today. Alternative: a separate host-only config directory outside any managed repo. (owner to decide)
+**`configs/**` is a locked path for sessions on the vigil repo** (owner ruling), since vigil is also a repo sessions work on (`repos.yaml`: self-maintenance). Config changes arrive as **structured edits that vigild commits from the host**, by the mechanism in "Stage C: improvement proposals". Phase 2a's by-session edits to `configs/budgets.yaml` and `configs/review.yaml` are grandfathered; nothing after them.
 
 **Repo playbook** lives under `.vigil/` in the repo:
 
@@ -989,12 +989,8 @@ Open: `configs/` is in the vigil repo, and vigil is also a repo that sessions wo
 
 **`.vigil/` is a locked path for all sessions**, like `gate.json`: a session cannot write it, and vigild refuses a bundle whose diff touches it. **Changes arrive only as proposal PRs** (Stage C), or as the owner's own commit. Before Stage C, the owner edits it by hand.
 
-Open: **`.vigil/` is already in use, and the worker writes there.** Layer 6 of the documentation tree commits stage artifacts on the job's branch under `.vigil/<job>/` (`spec.md`, `plan.md`, `intake.json`, `review.json`, `audit.json`, `close.md`) and `.vigil/<job>/<task>/worker_report.json` (`vigild/jobs/runner.py` reads them from the vault; architecture B34 has the harness commit new files "under `.vigil/`"). A worker also writes `.vigil/<job>/<task>/ask_coord.json`, and the workspace writes `.vigil/task.json` (git-ignored). "Locked for all sessions" would stop the worker's report. Options:
-1. **Lock by subpath, recommended.** `.vigil/` stays one directory. A session may write only `.vigil/<its job>/<its task>/` and the fixed `.vigil/task.json`. Every other path under `.vigil/` (`vigil.yaml` and the seven directories above) is locked, and vigild checks it on the imported bundle, so the lock does not rest on the harness alone. Those names become reserved: no job id may equal one.
-2. **Split by prefix.** The playbook keeps `.vigil/`; job artifacts move to another prefix (for example `.vigil-jobs/<job>/<task>/`). `.vigil/` is then locked whole, the simplest rule, but it changes shipped phase 1 code, the harness, the packet and layer 6.
-(owner to decide)
-
-Open: `.vigil/lessons/` and layer 5 (`docs/knowledge/lessons.jsonl`, phase 2) are two stores for the same thing. Pick one home; this section assumes `.vigil/lessons/` replaces layer 5 before layer 5 is built, so the lock covers it. (owner to decide)
+**`.vigil/` is already in use, and the worker writes there (owner ruling: lock by subpath).** Layer 6 of the documentation tree commits stage artifacts on the job's branch under `.vigil/<job>/` (`spec.md`, `plan.md`, `intake.json`, `review.json`, `audit.json`, `close.md`) and `.vigil/<job>/<task>/worker_report.json` (`vigild/jobs/runner.py` reads them from the vault; architecture B34 has the harness commit new files "under `.vigil/`"). A worker also writes `.vigil/<job>/<task>/ask_coord.json`, and the workspace writes `.vigil/task.json` (git-ignored). So `.vigil/` stays one directory and the lock is by subpath: a session may write only `.vigil/<its job>/<its task>/` and the fixed `.vigil/task.json`. Every other path under `.vigil/` (`vigil.yaml` and the seven directories above) is locked, and vigild checks it on the imported bundle, so the lock does not rest on the harness alone. Those names are **reserved and enforced in the job-id validator**: no job id may equal one.
+**`.vigil/lessons/` replaces layer 5** (`docs/knowledge/lessons.jsonl`, phase 2) as the one lessons store, before layer 5 is built, so the lock covers it.
 
 **Repo prompts versus vigil's prompts.** Vigil's role prompts are `prompts/<role>.md` in the vigil repo: host-level, versioned, changed only by a PR with an eval run attached. A repo's `.vigil/prompts/` therefore may only add an **appendix**, and only for the roles that do the work.
 
@@ -1007,9 +1003,9 @@ Open: `.vigil/lessons/` and layer 5 (`docs/knowledge/lessons.jsonl`, phase 2) ar
 
 The packet puts the appendix after vigil's rules, under a label that says it cannot relax them, and a test plants an appendix that tries to and asserts no tool call or verdict follows.
 
-Open: precedence against prompt injection. The owner's request lists `prompts/` in the playbook. An appendix is the proposal here; a full override of a work role is the alternative and is the larger injection surface (a merged PR can then rewrite how the coord reads untrusted text). (owner to decide)
+**Appendix only (owner ruling).** A full override of any role is not allowed: a merged PR could then rewrite how the coord reads untrusted text.
 
-Open: `.vigil/automations/` must not start work. Intake rule 3 says audits produce findings, not tasks, and the WIP limit and intake scoring apply to everything. An automation is limited to read-only checks that file `vigil:proposed` findings. (owner to decide)
+`.vigil/automations/` must not start work. Intake rule 3 says audits produce findings, not tasks, and the WIP limit and intake scoring apply to everything. An automation is limited to read-only checks that file `vigil:proposed` findings.
 
 ### Stage A: the merge-risk grade
 
@@ -1028,13 +1024,13 @@ Every PR gets a grade, **low, medium or high**, computed by vigild from three si
 - **It shows on the PR header** in the UI, with the signals one line each.
 - The reviewer's two fields are added to `review.json` (`alignment`, `drive_by`); the schemas regenerate when built.
 
-Open: **semgrep.** Part A puts semgrep in phase 7 behind a false-positive baseline (amendment A12), and it is a new dependency: an exact version at least two weeks old, recorded in `docs/sources.md`, with a one-line reason ("swallowed-error rules in the merge-risk grade"), run in a vigild-owned container with no network and host-side rules (never rules a repo supplies). Until the pin exists and the false-positive rate is measured under A12, the grade runs **without** that signal and shows `swallowed errors: not measured`; once it exists it stays an advisory signal. (owner to decide)
+**Semgrep.** Part A puts semgrep in phase 7 behind a false-positive baseline (amendment A12), and it is a new dependency: an exact version at least two weeks old, recorded in `docs/sources.md`, with a one-line reason ("swallowed-error rules in the merge-risk grade"), run in a vigild-owned container with no network and host-side rules (never rules a repo supplies). Until the pin exists and the false-positive rate is measured under A12, the grade runs **without** that signal and shows `swallowed errors: not measured`; once it exists it stays an advisory signal.
 
-Open: Part A's amendment numbers (A1, A6, A12, A15) and its seeded-defect set are cited from the owner's requests; Part A is not in the tree (`docs/` on `main`, `feat/phase-2a`, the evidence-pack branch), so those citations cannot be checked here. (owner to decide)
+Part A's amendment numbers (A1, A6, A12, A15) and its seeded-defect set are cited from the owner's requests. **The Part A memo lands after 2a; these are cited by memo section then.** No action now.
 
-Open: a "down step" check suits a repo that uses down migrations. vigil's own migrations are append-only and idempotent with no down step (`vigild/db.py` `MIGRATIONS`), so every vigil migration would grade as high. The rollback rule is per repo in host policy (the repo's migration style); a repo's `.vigil/` cannot declare its migrations safe, since that would lower the grade. (owner to decide)
+**Rollback rule per repo, in host policy.** A down-step check suits a repo that uses down migrations. vigil's own migrations are append-only and idempotent with no down step (`vigild/db.py` `MIGRATIONS`), so for the vigil repo a migration grades on **"append-only and idempotent"** instead of a down step. A repo's `.vigil/` cannot declare its migrations safe, since that would lower the grade.
 
-Open: **the rung locks.** Money, auth and consent shapes stay at rung 0 and `deps` is capped at rung 1 (`configs/review.yaml`; phase 2a). This section adds only an owner look, which touches neither lock; the grade never writes `review.yaml`. The v1 draft's "one rung more scrutiny" is dropped as the v2 request names only the owner look. (owner to decide)
+**The rung locks.** Money, auth and consent shapes stay at rung 0 and `deps` is capped at rung 1 (`configs/review.yaml`; phase 2a). This section adds only an owner look, which touches neither lock; the grade never writes `review.yaml`. The v1 draft's "one rung more scrutiny" is dropped as the v2 request names only the owner look.
 
 ### Stage A: readiness evidence
 
@@ -1048,9 +1044,9 @@ This folds in the PR evidence pack (#13). Nothing here is a gate input or a rewa
   |---|---|---|
   | spec | `spec.md` artifact, by sha256 | exists (phase 1) |
   | plan | `plan.md` artifact, by sha256 | exists (phase 1) |
-  | event-log range | the session's events, as an id range | `pending` (needs a per-attempt log) |
+  | event-log range | the session's events, as an id range | `pending` until a per-attempt sequence exists (2b; see Decisions) |
   | gate digest | the digest of `gate.json` | `pending` (learning epic) |
-  | hidden-test categories | categories and counts only, as the retry feedback gives them ("hidden 3/7 pass; failing: concurrency, empty-input") | `pending` (learning epic) |
+  | hidden-test counts | counts only on a public repo ("4 of 7, 3 categories"); the category names are on the Vigil PR screen, not in a public PR body | `pending` (learning epic) |
   | cost | gateway metering, the task total against the $2 cap | exists (phase 1) |
   | recording | the recording artifact, if made | `skipped: <reason>` |
   | diagram | in a collapsible `<details>` block, if made | `skipped: <reason>` |
@@ -1062,7 +1058,7 @@ This folds in the PR evidence pack (#13). Nothing here is a gate input or a rewa
 **The recording.** For tasks labelled `kind:ui`, or whose diff touches a web surface (a path matching the repo's `ui_paths`, strict `in_scope` globs); skipped when no UI path changed.
 - **When:** after the task's final verify, as a stage that cannot change a gate and never moves a job's state. If the gate is red it is skipped (`verify_failed`).
 - **Where (resolved in #13):** a **vigild-owned container** built from the vault checkout, like the verifier: no network, the checkout read-only, the repo's dev image plus a recorder layer. Not the worker's container, which is untrusted and has already exited.
-- **What:** headless Chromium, driven over CDP `Page.startScreencast`; an overlay injected with `Page.addScriptToEvaluateOnNewDocument` that draws clicks and key presses; an **idle cut** (frames with no input and no pixel change for over 2 s are dropped, keeping 0.5 s); a **5-minute cap** (a hit cap ends the recording, keeps what exists and says `truncated`).
+- **What:** headless Chromium (approved, pinned by image digest), driven over raw CDP `Page.startScreencast` with no library; an overlay injected with `Page.addScriptToEvaluateOnNewDocument` that draws clicks and key presses; an **idle cut** (frames with no input and no pixel change for over 2 s are dropped, keeping 0.5 s); a **5-minute cap** (a hit cap ends the recording, keeps what exists and says `truncated`). **Encoder:** only what the pinned image ships; if it ships none, the evidence is screenshots only.
 - **Who drives the clicks (resolved in #13):** a **scripted flow**, a file the coord names in the plan (`evidence.flow`: URL paths, clicks, text to type), run by a fixed driver. It costs no tokens, so the $2 cap is untouched.
 - **Stored** as a vigild artifact in the vault with its hash, referenced from the footer. **No third-party upload** and no GitHub attachment.
 - **Masked.** Typed text shows bullets, never keys, and injected CSS sets `-webkit-text-security: disc` on every `input`, `textarea` and `[contenteditable]`. Also masked: `type=password`, any `data-vigil-mask`, and `autocomplete` tokens naming a credential or card. Not drawn at all: the URL bar, cookies, storage, console and network. **Not masked:** values the page renders as text; the defence is that the recorder's container holds no secret, so only fixture and test data can appear.
@@ -1074,56 +1070,49 @@ This folds in the PR evidence pack (#13). Nothing here is a gate input or a rewa
 
 **The Mermaid diagram (owner decision, 2026-10-23: kept in Stage A).** One diagram of the changed call path in the PR body.
 - **Structure is vigild's, labels are the model's.** vigild builds the nodes and edges from the diff's changed files and their imports and calls. A model only writes the labels. No node exists that vigild did not derive.
-- **The model** is set by `diagram.model` in routing config (host policy). The default is local: the tower, then the Mac mini if the tower is busy, at $0. Any model on the provider allowlist may be configured; an API model must **also** be on the data-terms allowlist.
+- **The model** is set by `diagram.model` in routing config (host policy). The default is local, on the tower, at $0. There is no runtime on the Mac mini. Until phase 5 the default skips the diagram with `skipped: no_local_model` unless an allowlisted API model is configured. Any model on the provider allowlist may be configured; an API model must **also** be on the data-terms allowlist.
 - **Cost cap:** `diagram.max_cost_usd`, default `$0.02`. If the cap would be exceeded the diagram is skipped and the footer says why (`skipped: budget`). The cost counts toward the task cap and the daily cap.
-- **When:** automatically when 3 or more modules are touched (a module is the directory of a changed non-test source file; a repo may name its own in host policy), or on `/diagram`. Otherwise `skipped: fewer_than_3_modules`.
-- **Validation before attaching:** the diagram must parse as Mermaid, and every node must map to a file in the diff. On failure it is omitted and the footer notes why (`diagram_invalid`).
+- **When:** automatically when 3 or more modules are touched (a module is the directory of a changed non-test source file; a repo may name its own in host policy), or on `/diagram`, issued **only from an inbox action or the owner CLI (`vigil diagram <pr>`), never from a PR comment** (a PR comment is untrusted and anyone who can comment on a public repo can write one). Otherwise `skipped: fewer_than_3_modules`.
+- **Validation before attaching:** vigild generates a **restricted Mermaid subset** (flowchart nodes and edges only, labels as quoted strings) from its own structure and validates that itself, so there is no parser dependency. Every node must map to a file in the diff. On failure it is omitted and the footer notes why (`diagram_invalid`).
 - **Where:** a collapsible `<details>` section of the PR body, written by vigild with the footer.
 - **Never an input** to a gate, the reward, the risk grade or a scorer; the evidence-code import test covers it.
 - **Provenance:** `local` for a local label model; `claude` (or the configured provider's tag) for an API model.
 - **Input to the label model** is the file and symbol names, fenced with `packets.fence()` as untrusted text, not the diff body.
+- **Labels** pass `vigild.redact.redact` and a check so they cannot inject Markdown or HTML outside the collapsible section: length-capped, a character allowlist, no backticks, angle brackets, brackets, pipes, URLs or `click` directives, rendered only as quoted labels inside the fenced `mermaid` block. A label that fails is replaced by its file name.
 - **Skip reasons added:** `fewer_than_3_modules`, `no_local_model`, `budget`, `diagram_invalid`.
 
-Open: **no local model yet.** No local model runtime exists before phase 5, on the tower or on the Mac mini. Running one on the Mac mini (24 GiB, already hosting vigild and Docker Desktop) is new: it needs a runtime and a pin, and its memory use competes with the sessions. Until either host has a model, the default skips the diagram (`skipped: no_local_model`) unless an allowlisted API model is configured. (owner to decide)
+**The event-log range (owner ruling: defer to 2b).** `events` has one global `id` (`vigild/db.py:54-56`) and no per-attempt sequence. The footer shows `pending` until one exists, and **the 2b plan must specify it.** The 2b section lives on `feat/phase-2a`, not on `main`, so this is recorded in "Decisions" for the coordinator to carry.
 
-Open: **Mermaid validation.** Parsing Mermaid needs a validator, a new dependency (exact pin at least two weeks old, in `docs/sources.md`, one-line reason). Alternative: vigild generates a restricted Mermaid subset (flowchart nodes and edges only, labels as quoted strings) from its own structure and validates that itself, which needs no dependency and no parser for arbitrary input. This section recommends the restricted subset, since vigild already owns the structure. (owner to decide)
+**The `pending` fields** (event-log range, gate digest, hidden-test counts) have no source until the learning epic. #13's "reward seal id" **stays dropped** (owner ruling): the seal arrives after the audit, and v2's footer list omits it.
 
-Open: **label text.** Labels are model text in a PR body. They pass through `vigild.redact.redact`, and are checked so they cannot inject Markdown or HTML outside the collapsible section: length-capped, a character allowlist, no backticks, angle brackets, brackets, pipes, URLs or `click` directives, and rendered only inside quoted labels within the fenced `mermaid` block. A label that fails is replaced by its file name. (owner to decide)
+**The reviewer packet excludes the footer** (owner ruling), so the auditor's blind-first rule holds: the packet carries the diff, issue and spec only.
 
-Open: **the `/diagram` command.** Where it comes from and who may issue it. Options: an inbox action or the `vigil diagram <pr>` CLI (owner only, authenticated), or a PR comment. This section accepts only the first two: a PR comment is untrusted text and may be written by anyone who can comment on a public repo. (owner to decide)
+**Chromium** (owner ruling): approved, pinned by image digest at least two weeks old, recorded in `docs/sources.md` with the reason "CDP screencast for the evidence recording". Raw CDP, no library. The encoder is only what the pinned image ships; otherwise screenshots only.
 
-Open (from #13): the footer's **event-log range** and a per-attempt log are assumed from a 2b plan line that is not in the tree; `events` has one global `id` (`vigild/db.py:54-56`) and no per-attempt sequence. Confirm where they are specified. (owner to decide)
+**What a public PR body discloses** (owner ruling): hidden-test **categories stay out** of public PR bodies; the body shows counts only ("4 of 7, 3 categories") and the full categories are on the Vigil PR screen. Task cost may appear. Revisit when the vigil repo goes private.
 
-Open (from #13): **the `pending` fields** (event-log range, gate digest, hidden-test categories) have no source until the learning epic. v2 drops #13's "reward seal id" from the footer; it is gone here unless the owner restores it (the seal arrives after the audit, so it would need a post-audit body write). (owner to decide)
-
-Open (from #13): **reviewers read the PR and may read the footer.** The learning loop says reviewers never see `reward.json`. The footer holds a gate digest and categories, not the reward, but the auditor's blind-first rule assumes the reviewer packet carries the diff, issue and spec only. Either the reviewer packet excludes the footer, or the owner accepts it does not. (owner to decide)
-
-Open (from #13): **Chromium is a new dependency.** Exact version and image digest at least two weeks old, in `docs/sources.md`; one-line reason "CDP screencast for the evidence recording". Raw CDP or a library, and a video encoder, are each another dependency needing a reason. (owner to decide)
-
-Open (from #13): **what the body discloses.** Hidden-test categories and task cost in a PR body on a repo that is public (the vigil repo is temporarily public). Categories already go to the worker as retry feedback; GitHub readers are a wider audience. (owner to decide)
-
-Open (from #13): **`ui_paths` and the module definition** are new `configs/repos.yaml` keys (`ui_paths` is repo-specific; it is read from host policy, not `.vigil/vigil.yaml`, so a repo cannot declare its UI away). Also: **where the link goes** (opaque `vigil:` reference or nothing). (owner to decide)
+**Host-policy keys as written** (owner ruling): `ui_paths` and the module definition are new `configs/repos.yaml` keys, read from host policy and not from `.vigil/vigil.yaml`, so a repo cannot declare its UI away. Links are opaque `vigil:` references.
 
 ### Stage A: CI after the PR opens
 
 A **red CI run on an open PR reopens the same task**, inside its existing `attempt` counter and its $2 cap. Nothing resets.
 
-- **Reading CI.** vigild polls the PR's check runs. The App already holds `checks:read` (architecture B19), but B19's ceiling lists only contents, pull_requests, metadata and issues, and a classic commit status needs `statuses:read`, which the App does not hold.
+- **Reading CI.** vigild polls the PR's check runs. The App already holds `checks:read` (architecture B19), but B19's ceiling lists only contents, pull_requests, metadata and issues, and a classic commit status needs `statuses:read`, which the App does not hold. **Planned (owner ruling):** the owner grants `statuses:read` in GitHub, and the code gets a ceiling entry for it; this PR changes neither.
 - **The edge.** A task in `pr_open` goes back to building with the failing log attached (fenced, redacted). Today the job FSM has `in_review → building` and no edge out of `ready` for a CI failure after the PR is open. A new job edge (`ready → building` on a red check) and the task-level `pr_open → building` are needed. Every transition writes an `events` row and the FSM stays the only place state changes.
 - **Counters.** The reopen counts as an attempt. If `attempt` is at its limit or the $2 cap would be crossed, the task goes to the owner's inbox instead.
 - **Test weakening.** A fix that **modifies or deletes tests** is flagged as possible test-weakening and **routed to the owner**, with the diff of the test files.
 
-Open: **the FSM edges and the permission.** The new edges (`ready → building`, `pr_open → building`) need tests per transition; check runs fit the App's current grants, but `statuses:read` would be a permission the owner grants, with a ceiling entry in code. (owner to decide)
+**The FSM edges** (`ready → building`, `pr_open → building`) need a test per transition; the `statuses:read` grant and its ceiling entry are planned as above.
 
-Open: **overlap with the 2b test-weakening gates (Part A amendment A1).** Stage 3 already checks "no test weakened" before the push. The post-open flag is the same rule applied to a fix made after the PR exists; it must call the same check. Part A is not in the tree. (owner to decide)
+**Overlap with the 2b test-weakening gates (Part A amendment A1).** Stage 3 already checks "no test weakened" before the push. The post-open flag is the same rule applied to a fix made after the PR exists; it must call the same check. Part A is cited by memo section once its memo lands after 2a.
 
-Open: **an auto-merge race.** At rung 3 a PR may auto-merge. One that merges before CI turns red cannot be reopened; the phase 6 post-merge watcher owns that case. (owner to decide)
+**An auto-merge race.** At rung 3 a PR may auto-merge. One that merges before CI turns red cannot be reopened; **the phase 6 post-merge watcher owns that case** (owner ruling; planned, and noted in the phase 6 plan in `docs/architecture.md`).
 
 ### Stage A: the experiment budget line
 
 Stage B and C spend model money, and Stage A does not. **Proposed: `experiment_monthly_usd: 20.00`** in `configs/budgets.yaml`, **planned; this PR changes no config.** It covers every model call in Stage B and C: Sonnet task validation, Sonnet experiment design, the Opus analysis review, scorer samples, and proposal comparisons that use a hosted arm.
 
-- **Counts against the monthly cap, not the daily one.** It never draws from the $5 daily job cap (ruling 5); it sits inside the $100/month hard stop, so total outflow cannot exceed $100.
+- **A sub-cap inside the $100 month, not a separate line (owner ruling).** It never draws from the $5 daily job cap (ruling 5); it sits inside the $100/month hard stop, which does not move, so total outflow cannot exceed $100.
 - **Reserved before use**, like a session. No rollover; the month is UTC. A validation, review or design session is held to the $2 per-task cap.
 - **Local arms cost $0** in API spend and never touch the line. The original merged run is the reference arm and costs nothing to re-use.
 
@@ -1134,9 +1123,7 @@ Why $20 (v1 proposed $10, when replays were hosted):
 - The existing lines (#9, #10 and #11 of the learning epic, and #8's per-config runs) are **one-time, sized by the owner before each run** ("owner to set before the first run" in #8). They share the $100 month, not this line.
 - **Caps inside the line:** at most 15 mined tasks validated a month, at most 2 experiments a month.
 
-Open: whether the experiment line counts inside the $100 month (this proposal) or outside, which would make the real ceiling $120. Ruling 5 says "own line" and "never the daily cap" and is silent on the month. (owner to decide)
-
-### Stage B: benchmarks (30 or more merged jobs)
+### Stage B: benchmarks (30 or more validated benchmark tasks in the repo)
 
 Benchmarks are **part of phase 7 Eval**, not a second eval (learning ruling 3). They are the "merged-PR replay" pool, widened with a second source. They run after the learning epic, because the oracle is hidden tests plus gates. **Local-first.**
 
@@ -1158,7 +1145,7 @@ Benchmarks are **part of phase 7 Eval**, not a second eval (learning ruling 3). 
 
 **Output.** Quality and cost per config, with the **number of tasks and the confidence shown**. Quality is the gate tier's pass rate and, if every gate passed, the quality tier's changed-line coverage and audit findings. The Learn screen shows a **Pareto view**: cost against quality, one point per config, non-dominated points joined, dominated points dimmed, each point with its *n* and an interval. A shape with fewer than 8 tasks reads `insufficient n`. The tune and held-out splits of the eval apply; the held-out split is read once per release.
 
-**Provenance.** Every benchmark artifact written by Anthropic or xAI models is tagged **`eval-only`** and is excluded from every training set.
+**Provenance.** Every benchmark artifact written by any hosted provider's model carries an **`eval-only` flag** beside the provenance value (owner ruling: a flag, not a fourth value) and is excluded from every training set.
 
 **Private repos** replay on local models only, or the feature is off for that repo. The vigil repo may use `anthropic` (its hard-coded exception).
 
@@ -1168,25 +1155,23 @@ Benchmarks are **part of phase 7 Eval**, not a second eval (learning ruling 3). 
 
 Enforced by an **exposure ledger**: whenever hidden-test text is placed on any path that can reach a model, vigild writes a `hidden_exposed` event naming the job; such a job is refused as an oracle and shown as `exposed`. The gateway also fingerprints hidden test names and assertion strings and checks outgoing requests, as a tripwire, not a proof. Diagnosis bundles, scorer inputs and proposal-job run summaries carry category feedback at most.
 
-Open: **the validator is a viewer.** For a mined task (b), the Sonnet validation session reads the withheld tests to check that they fail on the parent and pass on the commit, and may author more. This section treats it as the **one authoring session** the definition allows (like the hidden-test author at spec time), on condition that it is never reused as a worker, reviewer, auditor or scorer for that task. Separately, a mined commit's tests sit in public git history, so any model trained after the commit date may have seen them; the contamination tag, not the definition, covers that. (owner to decide)
+**The validator is a viewer.** For a mined task (b), the Sonnet validation session reads the withheld tests to check that they fail on the parent and pass on the commit, and may author more. It is the **one authoring session** the definition allows (like the hidden-test author at spec time), on condition that it is never reused as a worker, reviewer, auditor or scorer for that task. **That condition is enforced in code (owner ruling):** the session role is recorded, and dispatch refuses a session whose task has a validator-role record for the same session. Separately, a mined commit's tests sit in public git history, so any model trained after the commit date may have seen them; the contamination tag, not the definition, covers that.
 
-Open: the owner sees hidden tests' names in the inbox. If the owner pastes one into a coord thread through the bridge, that is a model input. The ledger catches only what vigild routes; the tripwire catches the paste when it matches. (owner to decide)
+The owner sees hidden tests' names in the inbox. If the owner pastes one into a coord thread through the bridge, that is a model input. The ledger catches only what vigild routes; the tripwire catches the paste when it matches.
 
-Open: **the reference arm is not paired.** The original merged run came from a different config, model and moment than a replay arm, so comparing them is **not a paired comparison**: it differs in more than the config. The Pareto view marks the reference arm as such and does not compute a paired difference against it. (owner to decide)
+**The reference arm is not paired.** The original merged run came from a different config, model and moment than a replay arm, so comparing them is **not a paired comparison**: it differs in more than the config. The Pareto view marks the reference arm as such and does not compute a paired difference against it.
 
-Open: **mining ParkAgent history happens only through vigild's mirror, after the owner confirms.** No build session touches ParkAgent (CLAUDE.md); this section reads the commit history from the mirror vigild already keeps, and the first mining run waits for the owner's confirmation, as the learning epic's experiments do. (owner to decide)
+**Mining ParkAgent history happens only through vigild's mirror, after the owner confirms.** No build session touches ParkAgent (CLAUDE.md); the commit history comes from the mirror vigild already keeps, and the first mining run waits for the owner's confirmation, as the learning epic's experiments do.
 
-Open: **commits from before ParkAgent went private count as public under Part A A6**, so (b) tasks from that period may use hosted models; later commits follow the private-repo rule (local only, or off). Part A is not in the tree, so A6 cannot be read here. (owner to decide)
+**Commits from before ParkAgent went private count as public under Part A A6**, so (b) tasks from that period may use hosted models; later commits follow the private-repo rule (local only, or off). A6 is cited by memo section once the Part A memo lands.
 
-Open: **a Sonnet validation session reading ParkAgent code needs the data-terms allowlist** (the cleanup PR). Until that allowlist exists, validation of (b) tasks cannot run. (owner to decide)
+**A Sonnet validation session reading ParkAgent code needs the data-terms allowlist** (the cleanup PR). Until that allowlist exists, validation of (b) tasks cannot run.
 
-Open: **`eval-only` provenance.** Provenance has three values (`claude | local | human`). `eval-only` is a fourth tag, or a flag beside the three. xAI models are not in the provider allowlist today (`configs/backends.yaml`), so naming them in the tag assumes a provider the owner has not added. (owner to decide)
+**Replay results and the sealed reward.** A replay is a new run with its own learning record. A config decision made from replay results must not read `reward.json`; the Pareto view and the proposal comparison read the replay's `gate.json`, the quality tier and metering.
 
-Open: **replay results and the sealed reward.** A replay is a new run with its own learning record. A config decision made from replay results must not read `reward.json`; the Pareto view and the proposal comparison read the replay's `gate.json`, the quality tier and metering. (owner to decide)
+The learning loop's merged-PR pool is "closed jobs" replayed weekly. This section folds owner-marked jobs and mined tasks in as sources of that pool, so there is still one eval and one set of splits.
 
-Open: the learning loop's merged-PR pool is "closed jobs" replayed weekly. This section folds owner-marked jobs and mined tasks in as sources of that pool, so there is still one eval and one set of splits. (owner to decide)
-
-### Stage B: scorers (30 or more merged jobs)
+### Stage B: scorers (30 or more validated benchmark tasks in the repo)
 
 **Rubric files** in `.vigil/scorers/`. Each states a criterion, a scale and examples. Scorers are **diagnostic only**: they must never feed `reward.json` or any gate, and nothing routes, promotes or merges on a score.
 
@@ -1198,11 +1183,11 @@ Open: the learning loop's merged-PR pool is "closed jobs" replayed weekly. This 
 - **Reward.** `reward.json`'s schema has no scorer field, and a test asserts it; the scorer code and reward assembly import nothing from each other.
 - **Rubrics are repo files, so they are untrusted input to a judge.** A rubric is fenced with `packets.fence()` and the judge prompt is vigil's own.
 
-Open: a scorer's input is a run's diff, transcript and report. It must not read `reward.json` or hidden-test text (that would make the job `exposed`). A test plants a hidden-test string in a transcript and asserts it is removed or the job is marked exposed. (owner to decide)
+A scorer's input is a run's diff, transcript and report. It must not read `reward.json` or hidden-test text (that would make the job `exposed`). A test plants a hidden-test string in a transcript and asserts it is removed or the job is marked exposed.
 
-Open: the learning loop lists "LLM-as-judge as a reward component" under keep-out and allows it "as a reviewer". A scorer is neither; this section places it as a third thing, a diagnostic read by the owner and by the proposal job only. (owner to decide)
+The learning loop lists "LLM-as-judge as a reward component" under keep-out and allows it "as a reviewer". A scorer is neither; this section places it as a third thing, a diagnostic read by the owner and by the proposal job only.
 
-### Stage C: improvement proposals (60 or more merged jobs, or when the owner turns it on)
+### Stage C: improvement proposals (60 or more merged Vigil jobs in the repo, or when the owner turns it on)
 
 **Trigger:** one failure class reaches **5 runs**, or failures are **14 days old**. A scheduled job groups low-scoring runs (calibrated scorers, reviews, failed gates) and opens a **PR against `.vigil/` only**. Each PR:
 - cites the runs it came from (job and task ids);
@@ -1213,29 +1198,29 @@ Open: the learning loop lists "LLM-as-judge as a reward component" under keep-ou
 
 **How often.** At most **one open proposal PR per repo**, at most **two a month** across repos, which is also what the experiment line funds. No replay budget, no PR. Skipped when fewer than 8 benchmark tasks exist in the shape.
 
-Open: "Owner owner merges only" in the request is read as **"owner merges only"**. (owner to decide)
+The request's "Owner owner merges only" is **"owner merges only"** (owner ruling).
 
-Open: **who writes the diff.** `.vigil/` is locked for all sessions, but a proposal is a change to `.vigil/`. This section has the proposal job emit a structured edit (file, old text, new text) that **vigild** validates and commits from the host, so no session holds the lock open. (owner to decide)
+**Who writes the diff.** `.vigil/` is locked for all sessions, but a proposal is a change to `.vigil/`. The proposal job emits a structured edit (file, old text, new text) that **vigild** validates and commits from the host, so no session holds the lock open. The same mechanism carries config changes on the vigil repo (above).
 
-Open: these PRs are what the learning loop calls "a PR for the owner" and what phase 7 Eval already suggests from the tune split. This section adds a second source of the same kind of PR, in the same shape; both must carry a replay comparison. And intake rule 3 says audits produce findings, not tasks: a proposal job is not an audit and a PR is not a task, but it is self-generated work, so it is a `vigil:proposed` item like intake rule 6's product-model PRs, counts toward the repo's WIP limit of 4, and is never auto-dispatched or auto-merged. (owner to decide)
+These PRs are what the learning loop calls "a PR for the owner" and what phase 7 Eval already suggests from the tune split. This section adds a second source of the same kind of PR, in the same shape; both must carry a replay comparison. And intake rule 3 says audits produce findings, not tasks: a proposal job is not an audit and a PR is not a task, but it is self-generated work, so it is a `vigil:proposed` item like intake rule 6's product-model PRs, counts toward the repo's WIP limit of 4, and is never auto-dispatched or auto-merged.
 
-Open: **reviewer prompts are vigil's own `prompts/reviewer.md`, which is host-level**, and the reviewer is on the never-appendix list. A `.vigil/` PR cannot hold a reviewer prompt. This section sends reviewer prompt proposals as PRs against the vigil repo's `prompts/reviewer.md`, under the rule "changing a prompt is a PR with an eval run attached". The alternative is a `.vigil/` appendix for the reviewer. And the seeded-defect set does not exist until Part A merges, so none runs before then. The labels carry `human`, but the findings they label may be `claude`-written; they validate a prompt and never train the local model, and a test asserts the exporter reads no override label. (owner to decide)
+**Reviewer prompts are vigil's own `prompts/reviewer.md`, which is host-level** (owner ruling), and the reviewer is on the never-appendix list. A reviewer-prompt proposal is a **PR against `prompts/reviewer.md` in the vigil repo with an eval run attached**, under the rule "changing a prompt is a PR with an eval run attached". **Nothing runs before Part A merges**, since the seeded-defect set comes from it. The override labels carry `human`, but the findings they label may be `claude`-written; they validate a prompt and never train the local model, and a test asserts the exporter reads no override label.
 
 ### Stage C: webhook intake (design only, build later)
 
 Error-monitoring events and **CI events** become **Inbox proposals**, never jobs.
 
-- **Pull, not push (recommended).** vigild is reachable on loopback and the tailnet only. Instead of a public receiver, vigild polls the source's API on a schedule, like the label intake of phase 2. A pushed webhook is a new inbound surface.
+- **Pull, not push (owner ruling).** The service is **Sentry, once ParkAgent has traffic, and not before.** vigild is reachable on loopback and the tailnet only. Instead of a public receiver, vigild polls the source's API on a schedule, like the label intake of phase 2. A pushed webhook is a new inbound surface.
 - **Personal data is stripped on the way in, by code, before any model sees it.** The event is reduced to an allowlist of fields (error type, scrubbed message, stack frame paths and function names, release, first and last seen, count, environment; for CI, the workflow, job and step names, the failing check and a log tail). Everything else is dropped: user, IP, email, headers, cookies, request bodies, breadcrumbs, query strings. A field the allowlist does not name is dropped. A message passes `vigild.redact.redact` for secrets and then a PII scrub.
 - **The payload is quoted as untrusted:** it enters any packet only through `packets.fence()` with a nonce the content cannot contain.
 - **Intake rules apply.** A proposal is scored by the decider and needs `value >= 3` to be queued; the rest are `vigil:proposed` for the weekly look. Rule 3 pages the owner for `risk >= 4`; rule 5 means an event on a money, auth or consent path becomes a proposal the owner reads but opens by hand. Events are deduplicated by fingerprint, rate-limited per repo and per hour, and capped at 10 open proposals per repo.
 - **It never starts a job without owner acceptance,** from the inbox, by the same approval path as any spec.
 
-Open: the PII scrub is a new function, and `CLAUDE.md` says secrets are scrubbed by one function (`vigild.redact.redact`). The PII scrub is a separate module with its own tests. (owner to decide)
+The PII scrub is a new function, and `CLAUDE.md` says secrets are scrubbed by one function (`vigild.redact.redact`). The PII scrub is a separate module with its own tests.
 
-Open: a monitoring or CI event is neither `claude`, `local` nor `human`. A stored artifact with no valid tag breaks the rule that every one carries one. This section proposes a tag for external content, kept out of training; the exporter already takes `local` only, so the effect is nil. (owner to decide)
+A monitoring or CI event is neither `claude`, `local` nor `human`. **`external` is added as a provenance value for webhook payloads only** (owner ruling). The training exporter still takes `local` only.
 
-Open: **"CI events"** is read as failures on branches vigild did not open (a default branch, a human's PR). Failures on a fleet PR reopen the task (Stage A) and are not proposals. Pull needs the source's key and egress to its API from vigild, a host credential in `~/.config/vigil/env` and a name in `vigil doctor`. Which service is the owner's choice and is not named here. (owner to decide)
+**"CI events"** are failures on branches vigild did not open (a default branch, a human's PR). Failures on a fleet PR reopen the task (Stage A) and are not proposals. Pull needs the source's key and egress to its API from vigild, a host credential in `~/.config/vigil/env` and a name in `vigil doctor`.
 
 ### Phasing
 
@@ -1249,6 +1234,37 @@ Open: **"CI events"** is read as failures on branches vigild did not open (a def
 | Scorers | B | phase 5 (local model) |
 | Improvement proposals | C | benchmarks, calibrated scorers |
 | Webhook intake | C | phase 2 intake; build later |
+
+### Decisions (owner, 2026-10-23)
+
+These settle every question the first draft of this section raised. One line each:
+1. **Stage gates.** Stage B counts validated benchmark tasks (both sources), 30 per repo. Stage C counts merged Vigil jobs, 60 per repo. Comparisons are per repo and shape; "across all repos" is rejected.
+2. **`/learn`.** A tenth page; `docs/ui.md` is updated.
+3. **`configs/**` on the vigil repo** is a locked path for sessions; changes arrive as structured edits vigild commits from the host; phase 2a's by-session edits are grandfathered.
+4. **`.vigil/`** is locked by subpath; a session writes only `.vigil/<its job>/<its task>/` and `task.json`; reserved names are enforced in the job-id validator.
+5. **`.vigil/lessons/`** replaces layer 5.
+6. **Repo prompts** are appendices only; no full override of any role.
+7. **Part A** (A1, A6, A12, A15) is cited by memo section once its memo lands after 2a; no action now.
+8. **Rollback rule** is per repo in host policy; vigil's own migrations grade on "append-only and idempotent" instead of a down step.
+9. **Diagram label model:** `skipped: no_local_model` until phase 5; no runtime on the Mac mini.
+10. **Diagram validation:** a restricted Mermaid subset generated and validated by vigild; no parser dependency.
+11. **`/diagram`** comes only from an inbox action or the owner CLI, never a PR comment.
+12. **Event-log range:** deferred to 2b; the footer shows `pending` until a per-attempt sequence exists, and the 2b plan must specify it (the coordinator carries this to the 2b plan, which lives on `feat/phase-2a`).
+13. **Reward seal id** stays dropped from the footer.
+14. **The reviewer packet excludes the footer.**
+15. **Chromium** is approved, pinned by digest, raw CDP, no library; the encoder is only what the pinned image ships, otherwise screenshots only.
+16. **Public PR bodies** show hidden-test counts only ("4 of 7, 3 categories"); categories are on the Vigil PR screen; task cost may appear; revisit when vigil goes private.
+17. **Host-policy keys** (`ui_paths`, the module definition) as written; links are opaque `vigil:` references.
+18. **`statuses:read`** is granted with a ceiling entry (planned: the owner grants it in GitHub); tests per transition.
+19. **The auto-merge race** belongs to the phase 6 watcher; noted in the phase 6 plan.
+20. **The experiment line** is a sub-cap inside the $100 month; the month ceiling does not move.
+21. **The validator** is the one authoring session for a mined task, and the never-reused condition is enforced in code: session role recorded, checked at dispatch.
+22. **`eval-only`** is a flag beside the three provenance values, not a fourth; "any hosted provider", not xAI.
+23. **"Owner merges only"** for improvement proposals.
+24. **Reviewer-prompt proposals** are PRs against `prompts/reviewer.md` in the vigil repo with an eval run attached; nothing runs before Part A merges; the exporter test stays.
+25. **`external`** is a provenance value for webhook payloads only; the exporter still takes `local` only.
+26. **Webhook intake** is pull; the service is Sentry, once ParkAgent has traffic, and not before.
+27. **Stands as proposed:** the metric definitions and overlaps, the 14-day revert rate versus the 30-day attribution, the audit tag stand-in, verify levels and the gate contract as host policy's range and floor, read-only automations, semgrep as an advisory signal behind a pin and the A12 baseline, the owner-look-only rung rule, label-text checks, the pasted-names gap, the unpaired reference arm, mining only through vigild's mirror, pre-private commits as public, the data-terms allowlist, replay reads `gate.json` not `reward.json`, one eval pool, scorer inputs, scorers versus the judge keep-out, the PII scrub as its own module, and what "CI events" means.
 
 ## Repo layout and build order
 

@@ -348,7 +348,7 @@ task passes the same gates.
   reserved and remaining, split into task validation, experiment design and
   analysis review, scorer samples and proposal comparisons. It counts inside
   the month and never inside today's bar. Local arms cost `$0` and are not
-  drawn. Greyed until 30 merged jobs.
+  drawn. Greyed until 30 validated benchmark tasks.
 - **Cost per merged PR** beside the caps, over 30 days, by shape and route,
   with the experiment line shown apart from it. Greyed until 10 merged PRs.
 - Caps are read-only here. They live in `configs/budgets.yaml`, the same
@@ -430,8 +430,8 @@ review data (the quality strip's findings); tower meters wait for phase 5.
 ### 10. `/learn` (planned)
 
 The owner's request names a Learn screen; the pages above have none, so
-this is a tenth page. Open: the alternative is to put these on `/review`
-(owner to decide). It reads and never writes policy.
+this is a tenth page (owner ruling, 2026-10-23). It reads and never writes
+policy.
 
 **Greyed until the count is reached.** Every block below declares the run
 count it needs (`docs/design.md` "Factory engineering"). Until then it shows
@@ -449,7 +449,7 @@ number or chart.
     reviews).
 
   Each is a 30-day character sparkline with its latest value.
-- **Stage B, 30 merged jobs:**
+- **Stage B, 30 validated benchmark tasks in the repo:**
   - **Pareto view.** Cost on one axis and quality on the other, one point
     per named benchmark config, the non-dominated points joined and
     dominated ones dimmed. Each point carries its *n* and interval; a shape
@@ -462,7 +462,7 @@ number or chart.
     runs (`n/30` until 30, then the rate). Below 30 labels or 80% it reads
     `uncalibrated` and none of its trends is drawn. The owner labels a run
     here.
-- **Stage C, 60 merged jobs or the owner's switch:** open
+- **Stage C, 60 merged Vigil jobs in the repo or the owner's switch:** open
   improvement-proposal PRs with the runs they cite and their replay
   comparison.
 
