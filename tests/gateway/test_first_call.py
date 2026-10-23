@@ -24,12 +24,12 @@ def test_every_roles_worst_case_first_call_fits_its_cap(cfg: Config) -> None:
         )
 
 
-def test_the_opus_coord_keeps_its_one_dollar_reservation(cfg: Config) -> None:
+def test_the_opus_coords_first_call_fits_its_two_dollar_reservation(cfg: Config) -> None:
     (coord,) = [r for r in first_calls(cfg) if r.role == "coord"]
     assert coord.model == "claude-opus-5-5"
     # 200,000 chars / 3 = 66,667 tokens at $8/M, plus 16,384 output tokens at $20/M
     assert coord.worst_usd == pytest.approx(66_667 * 8e-6 + 16_384 * 20e-6, rel=1e-3)
-    assert coord.limit_usd == cfg.budgets.coord_session_usd == 1.00
+    assert coord.limit_usd == cfg.budgets.coord_session_usd == 2.00
     assert coord.worst_usd < 0.90
 
 
@@ -51,3 +51,17 @@ def test_a_role_the_repo_may_not_use_is_not_checked(cfg: Config) -> None:
     cfg.budgets.coord_session_usd = 0.50
     cfg.repo(REPO).backends = ["claude-sonnet"]  # no Opus here: the coord can't run anyway
     assert all("coord" not in m for m in refusals(cfg, REPO))
+
+
+def test_the_coord_keeps_headroom_for_a_long_session(cfg: Config) -> None:
+    """Why $2: at $1 a coord is refused mid-session once its request reaches
+    about 230-270k characters, a few file reads past its ~200k start. At $2,
+    with ~$0.30 already spent, the gateway can still give it the 4,096-token
+    floor until the request is about 600k characters."""
+    from vigild.gateway.service import MIN_OUTPUT_TOKENS, worst_case_usd
+    from vigild.metering.prices import PriceTable
+
+    prices = PriceTable(cfg.prices)
+    left = cfg.budgets.coord_session_usd - 0.30
+    assert worst_case_usd(prices, "claude-opus-5-5", 590_000, MIN_OUTPUT_TOKENS) < left
+    assert worst_case_usd(prices, "claude-opus-5-5", 620_000, MIN_OUTPUT_TOKENS) > left

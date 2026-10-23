@@ -749,3 +749,27 @@ def test_a_normal_stop_is_not_truncated(
     _sid, tok = _session(store, budget, gw)
     client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
     assert store.q("SELECT truncated FROM model_calls")[0]["truncated"] == 0
+
+
+@pytest.mark.parametrize(("tokens", "ok"), [(5120, True), (5119, False)])
+def test_thinking_boundary_is_exactly_the_answer_room_plus_the_minimum_budget(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    tokens: int,
+    ok: bool,
+) -> None:
+    """out = 4,096 answer + 1,024 minimum thinking = 5,120 is allowed; 5,119 is not."""
+    _sid, tok = _session(store, budget, gw)
+    r = client.post(
+        "/v1/messages",
+        json=_msg(max_tokens=tokens, thinking={"type": "enabled", "budget_tokens": 4000}),
+        headers={"x-api-key": tok},
+    )
+    assert (r.status_code == 200) is ok
+    if ok:
+        assert _sent(upstream)["thinking"]["budget_tokens"] == 1024
+    else:
+        assert "thinking" in r.json()["error"]["message"]
