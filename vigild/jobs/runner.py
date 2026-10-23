@@ -144,6 +144,9 @@ class JobRunner:
         self.budget = budget
         self.gateway = gateway
         self.executor = executor
+        stop = getattr(executor, "stop", None)
+        if stop is not None:  # the gateway stops a session whose metering failed
+            self.gateway.stop_session = stop
         self.workspace = workspace
         self.publisher = publisher
         self.telemetry = telemetry
@@ -420,6 +423,13 @@ class JobRunner:
                         f"({self.cfg.budgets.session_max_output_tokens} tokens per call)"
                     )
                     tr.set("vigil.truncated", True)
+                    tr.set("vigil.status", out.status)
+                failed_metering = self.store.q(
+                    "SELECT 1 FROM events WHERE session_id=? AND type='metering_failed'", (s.id,)
+                )
+                if failed_metering:  # a call's spend is unbooked: never a finished session
+                    out.status = "failed"
+                    out.error = "metering failed; see the inbox page"
                     tr.set("vigil.status", out.status)
                 if out.status != "done":
                     refused = self.store.q(
