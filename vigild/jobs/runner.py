@@ -63,7 +63,7 @@ from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
-from vigild.metering.calls import session_cost
+from vigild.metering.calls import last_call_truncated, session_cost
 from vigild.packets.assemble import assemble_coord, assemble_worker
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
@@ -361,6 +361,15 @@ class JobRunner:
                 with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
                     out = self.executor.run(spec, token, self._event_sink(s))
                 tr.set("vigil.status", out.status)
+                if out.status == "done" and last_call_truncated(self.store, s.id):
+                    # never a finished turn: it was cut off at the output cap
+                    out.status = "failed"
+                    out.error = (
+                        "the final turn was truncated at the output cap "
+                        f"({self.cfg.budgets.session_max_output_tokens} tokens per call)"
+                    )
+                    tr.set("vigil.truncated", True)
+                    tr.set("vigil.status", out.status)
             return out
         finally:
             self.gateway.revoke(s.id)
@@ -520,6 +529,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
+            max_output_tokens=self.cfg.budgets.session_max_output_tokens,
         )
         out = self._run_session(
             coord,
@@ -916,6 +926,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
+            max_output_tokens=self.cfg.budgets.session_max_output_tokens,
         )
         attrs = {
             "vigil.job_id": job_id,

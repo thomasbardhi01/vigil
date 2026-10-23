@@ -1197,3 +1197,62 @@ def test_a_scripts_edit_is_runner_config_not_needs_deps(world: World) -> None:  
     assert w.store.get_task(f"{job}-w1").state == "failed"  # not needs_deps
     item = _failure_item(w, job)
     assert "changes how tests run" in json.dumps(item["body"])
+
+
+def test_coord_and_worker_sessions_cap_each_calls_output(world: World) -> None:
+    """The gateway holds max_tokens of output against the reservation, so every
+    coord and worker session carries the cap from configs/budgets.yaml."""
+    w = world
+    seen: list[tuple[Role, int | None]] = []
+    w.standin.on_session = lambda spec: seen.append((spec.role, spec.max_output_tokens))
+    _approve(w)
+    cap = 16384  # session_max_output_tokens in configs/budgets.yaml
+    roles = {r for r, _ in seen}
+    assert {Role.COORD, Role.WORKER} <= roles
+    assert all(n == cap for _, n in seen)
+
+
+def test_a_session_whose_last_turn_hit_the_cap_is_not_done(world: World) -> None:
+    """stop_reason max_tokens on the final model call: the session failed, and
+    its page says the turn was truncated at the cap."""
+    w = world
+
+    def truncate(spec: SessionSpec) -> None:
+        if spec.role is Role.COORD:
+            from vigild.metering.calls import CallUsage, record_call
+            from vigild.metering.prices import PriceTable
+
+            record_call(
+                w.store,
+                PriceTable(w.runner.cfg.prices),
+                session_id=spec.session_id,
+                task_id=None,
+                job_id=spec.job_id,
+                purpose="session",
+                provider="anthropic",
+                backend_preset="claude-opus",
+                model="claude-opus-5-5",
+                usage=CallUsage(tokens_out=16384),
+                truncated=True,
+            )
+
+    w.standin.on_session = truncate
+    _request(w)
+    pages = json.dumps(w.client.get("/api/inbox", headers=auth(w.tokens.read)).json())
+    assert "truncated at the output cap" in pages
+
+
+def test_a_job_whose_first_call_cannot_fit_is_refused_before_any_session(world: World) -> None:
+    """Preflight at submission: a 422 with the numbers, no job, no session, no attempt."""
+    w = world
+    w.runner.cfg.budgets.coord_session_usd = 0.50
+    before = (len(w.store.list_jobs()), w.store.q("SELECT COUNT(*) n FROM sessions")[0]["n"])
+    r = w.client.post(
+        "/api/jobs",
+        headers=auth(w.tokens.admin),
+        json={"repo": REPO, "title": "t", "request": "r", "why": "w", "value": 3, "risk": 1},
+    )
+    assert r.status_code == 422
+    assert "$0.50" in json.dumps(r.json()) and "claude-opus-5-5" in json.dumps(r.json())
+    after = (len(w.store.list_jobs()), w.store.q("SELECT COUNT(*) n FROM sessions")[0]["n"])
+    assert after == before
