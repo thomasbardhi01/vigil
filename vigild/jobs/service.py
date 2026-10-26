@@ -321,10 +321,25 @@ class JobService:
                 out[w.task_id] = hit
         return out
 
+    def _hidden_frozen(self, job_id: str) -> dict[str, bool]:
+        """The host switch as it is when the spec is gated: recorded in `spec_gate.json`,
+        so what is built and verified follows the spec the owner approved."""
+        return {"hidden_tests_enabled": self._hidden_live(job_id)}
+
+    def _hidden_live(self, job_id: str) -> bool:
+        return self.cfg.repo(self.store.get_job(job_id).repo).hidden_tests.enabled
+
+    def hidden_enabled(self, job_id: str) -> bool:
+        """Whether hidden tests apply to this job: the value frozen at its spec gate,
+        or, for a job gated before the freeze existed, the live host policy."""
+        art = self.store.get_artifact(job_id, "spec_gate.json")
+        frozen = json.loads(art.content).get("hidden_tests_enabled") if art else None
+        return frozen if isinstance(frozen, bool) else self._hidden_live(job_id)
+
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]:
         """`flagged_tasks`, but only when the host policy turns hidden tests on for
         the job's repo: off, nothing waits for an author."""
-        if not self.cfg.repo(self.store.get_job(job_id).repo).hidden_tests.enabled:
+        if not self.hidden_enabled(job_id):
             return {}
         return self.flagged_tasks(job_id)
 
@@ -350,7 +365,7 @@ class JobService:
         self.store.add_artifact(
             job_id,
             "spec_gate.json",
-            json.dumps({"ok": not errors, "errors": errors}),
+            json.dumps({"ok": not errors, "errors": errors, **self._hidden_frozen(job_id)}),
             Provenance.HUMAN,
         )
         if errors:
@@ -364,7 +379,14 @@ class JobService:
             self.store.add_artifact(
                 job_id,
                 "spec_gate.json",
-                json.dumps({"ok": True, "errors": [], "runner_file_change": flagged}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "errors": [],
+                        "runner_file_change": flagged,
+                        **self._hidden_frozen(job_id),
+                    }
+                ),
                 Provenance.HUMAN,
             )
         return []
@@ -395,9 +417,9 @@ class JobService:
                 return it
         return None
 
-    def _hidden_view(self, job: Job, entry: dict[str, Any] | None) -> dict[str, Any]:
+    def _hidden_view(self, job_id: str, entry: dict[str, Any] | None) -> dict[str, Any]:
         """What the spec item says of a flagged task's hidden tests."""
-        if not self.cfg.repo(job.repo).hidden_tests.enabled:
+        if not self.hidden_enabled(job_id):
             return {
                 "status": "disabled",
                 "note": "hidden tests are disabled (host policy); the task is built on its "
@@ -465,7 +487,7 @@ class JobService:
                         # categories only) and an owner look
                         "runner_file_change": flagged.get(w.task_id, []),
                         **(
-                            {"hidden_tests": self._hidden_view(job, hidden.get(w.task_id))}
+                            {"hidden_tests": self._hidden_view(job_id, hidden.get(w.task_id))}
                             if w.task_id in flagged
                             else {}
                         ),

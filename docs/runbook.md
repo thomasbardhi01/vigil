@@ -258,6 +258,19 @@ repo cannot set it; `vigil doctor` shows it per repo). Today, then:
   the runner files. Read the runner-file diff yourself: you are the oracle. You merge as
   always. The spec item says hidden tests are disabled for the task.
 - Nothing escalates for want of hidden tests.
+- **Replan with a note** works whatever the switch says. When the spec is not right but
+  not wrong enough to throw away, send it back from the spec item (or from a failed
+  build's page) with a note, 8 KB at most. The coord amends the approved spec and lists
+  what it changed; the new item shows that list and a diff. It is never an approval.
+  ```sh
+  curl -sS -X POST -H "Authorization: Bearer $VIGIL_API_TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -n --rawfile note note.md '{note: $note}')" \
+    http://127.0.0.1:8787/api/inbox/<item id>/replan
+  ```
+  Over 8 KB is refused (413); an empty note is refused (422); the spec item's replan
+  needs a note. (With the switch on, the hidden-test author also gets the amended spec
+  and the lines of your note under an item or heading with the word "author" in its
+  title, or the whole note if none has it.)
 
 The rest of this section describes what the code does **if the switch is turned on**; it
 is not in use, and its sandbox is under review in ADR-0003, so it states no guarantee.
@@ -296,23 +309,10 @@ is not in use, and its sandbox is under review in ADR-0003, so it states no guar
   script (`pnpm -C server test <that directory>`). If the config can't be read
   (projects/workspace, no include that fits) the task shows "hidden tests
   missing" and can only escalate.
-- **Fixtures.** A hidden test makes every fixture with `make_fixture({"dir/a.txt": "text"})`
-  (`makeFixture` in vitest), which returns a directory under `/vigil-fx` (traversable, not listable); the code
-  under test (uid 10002) can read it and cannot write it, and cannot read a temp dir
-  the test makes for itself.
-- **Replan with a note.** When the spec is not right but not wrong enough to throw
-  away, send it back from the spec item (or from a failed build's page) with a note,
-  8 KB at most. The coord amends the approved spec and lists what it changed; the new
-  item shows that list and a diff, and the hidden-test author gets the amended spec
-  and the lines of your note under an item or heading with the word "author" in its title (or
-  the whole note if none does). It is never an approval.
-  ```sh
-  curl -sS -X POST -H "Authorization: Bearer $VIGIL_API_TOKEN" -H 'Content-Type: application/json' \
-    -d "$(jq -n --rawfile note note.md '{note: $note}')" \
-    http://127.0.0.1:8787/api/inbox/<item id>/replan
-  ```
-  Over 8 KB is refused (413); an empty note is refused (422); the spec item's replan
-  needs a note.
+- **Fixtures.** The hidden-test helpers' `make_fixture({"dir/a.txt": "text"})`
+  (`makeFixture` in vitest) returns a fresh directory under `/vigil-fx`, a tmpfs owned by
+  the test's uid, with directories at 0755 and files at 0644, for the code under test to
+  read. The helpers are the way a hidden test makes a fixture.
 - **If vigild restarts while the author runs** the inbox shows "vigild restarted
   while the hidden-test author was writing"; retry runs the author step only.
   A hidden run that crashes while the author's tests are checked shows the task

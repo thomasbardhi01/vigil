@@ -114,6 +114,7 @@ class Pager(Protocol):
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
+    def hidden_enabled(self, job_id: str) -> bool: ...
     def file_item(self, job_id: str) -> None: ...
     def open_spec_item(self, job_id: str) -> Any: ...
 
@@ -1652,7 +1653,11 @@ class JobRunner:
         )
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
-        hidden_on = self.cfg.repo(job.repo).hidden_tests.enabled
+        hidden_on = (
+            self.jobs.hidden_enabled(job_id)
+            if self.jobs is not None
+            else self.cfg.repo(job.repo).hidden_tests.enabled
+        )
         hidden_entry = self._hidden_entry(job_id, task_id) if overlap and hidden_on else None
         if overlap and hidden_on and self.verifier.host_key is None:
             # without the key nothing hidden can count: escalate, never retry forever

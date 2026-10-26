@@ -21,6 +21,7 @@ from tests.jobs.test_coord_loop import (  # noqa: F401
     _named,
     _request,
     _spec_item,
+    auth,
     world,
 )
 from vigild import config as config_mod
@@ -126,3 +127,26 @@ def test_on_the_author_still_runs(world: World) -> None:
     w.runner.cfg.repos.repos[REPO].hidden_tests = HiddenTestsPolicy(enabled=True)
     _request(w)
     assert [c[0] for c in w.standin.calls] == ["coord", "hidden_test_author"]
+
+
+def test_the_switch_is_frozen_on_the_job_when_its_spec_is_filed(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec with the switch off, flip it on, build: the job still takes the disabled path."""
+    w = world
+    _flagged_world(w)
+    job = _request(w)
+    assert (
+        json.loads(w.store.get_artifact(job, "spec_gate.json").content)["hidden_tests_enabled"]
+        is False
+    )
+    w.runner.cfg.repos.repos[REPO].hidden_tests = HiddenTestsPolicy(enabled=True)  # flipped later
+    _tripwires(w, monkeypatch)
+    w.standin.worker_edit = _flag_edit()
+    item = _spec_item(w)
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
+    assert pr["title"] == TITLE and pr["draft"] is True
+    rec = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
+    assert "hidden" not in rec and rec["hidden_disabled"] is True
+    assert w.store.get_job(job).state.value != "escalated"
