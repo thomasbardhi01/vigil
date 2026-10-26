@@ -109,9 +109,8 @@ container**. The subject runs only there.
   on a crash, by the same cleanup path the verifier already has). It holds
   no tag, no key and no report.
 
-How a two-container run counts against `container.verifier_concurrency`, and
-how memory is split between the containers, are open (see "Open questions for
-the owner").
+The pair counts as one verifier slot, and its memory and limits are fixed by
+the owner (see "Owner decisions (2026-10-26)").
 
 **Why this closes items 1 to 3 by construction.**
 - Item 1: the subject's container has no mount of the checkout, so there is
@@ -270,9 +269,9 @@ with a clean review. The owner turns it on.
 - **Cost.** One more container per hidden run: its start, a copy of the
   subject, a channel volume and its cleanup. The verifier already runs one
   container at a time per machine, so a hidden run takes longer by the
-  subject container's start for each call batch. Two containers in the 11.7
-  GiB Docker VM need a memory split that is not decided (see "Open
-  questions for the owner").
+  subject container's start for each call batch. The two containers
+  share one verifier slot and its 6 GiB budget in the 11.7 GiB Docker VM (see
+  "Owner decisions (2026-10-26)").
 - **Complexity.** A protocol to maintain, and a second image path (the
   subject runs in the repo's dev image, never the session image).
 - **What B40 says until it's done.** It says what the code does today and
@@ -300,16 +299,30 @@ with a clean review. The owner turns it on.
 5. **Turn the feature off for good.** It is off now. The runner-file class
    has no other way to be accepted besides owner review of every task.
 
-## Open questions for the owner
+## Owner decisions (2026-10-26)
 
-None of these is settled; each needs an owner decision before (b).
+1. **Verifier slot.** A hidden run's test and subject containers count as one
+   verifier slot. They start and stop together, and
+   `container.verifier_concurrency` stays at 1, so nothing else runs in the
+   verifier while a pair is up. Raising concurrency is not worth it on an
+   11.7 GiB VM.
+2. **Memory, within the slot's existing 6 GiB budget:**
+   - test container: 4.5 GiB, tmpfs included (it runs only the hidden tests,
+     not the full suite);
+   - subject container: 1 GiB;
+   - headroom: 0.5 GiB.
 
-1. Does a hidden run with two containers (test and subject) count as one
-   verifier slot, given B33's rule of one verifier container at a time and
-   `container.verifier_concurrency` = 1?
-2. How should memory be split between the two containers inside the 11.7 GiB
-   Docker VM?
-3. What is the subject container's memory cap?
+   Workers' sessions keep the rest of the VM exactly as today.
+3. **Subject container limits:** 1 GiB of memory with no swap, 256
+   processes, 1 CPU, a 256 MiB tmpfs, and the existing per-call timeout.
+4. **Out of memory.**
+   - If the subject runs out of memory, that is a subject failure, and the
+     test observes it as an error.
+   - If the test container runs out of memory, the result is unknown: it
+     escalates and never passes.
+5. **Settings and reporting.** All of these are host-policy settings. Each
+   container's `memory.peak` is recorded in `tests.json`, and the peaks are
+   reported to the owner after the first five hidden runs.
 
 ## When this changes
 
