@@ -109,8 +109,9 @@ container**. The subject runs only there.
   on a crash, by the same cleanup path the verifier already has). It holds
   no tag, no key and no report.
 
-The memory and CPU limits are the dev image's; the verifier's concurrency
-setting counts a hidden run as one slot for both containers together.
+How a two-container run counts against `container.verifier_concurrency`, and
+how memory is split between the containers, are open (see "Open questions for
+the owner").
 
 **Why this closes items 1 to 3 by construction.**
 - Item 1: the subject's container has no mount of the checkout, so there is
@@ -217,10 +218,14 @@ Accepted, and stated in B40 once the series is done.
 - **The owner pasting hidden tests into a session.** A person can move the
   tests into a worker's context, which ends their secrecy for that task. The
   files stay out of every packet by construction; a person is not covered.
-- **The tag in the test container.** The test side holds the tag for the
-  base run. With the subject in another container, only the test process can
-  read it, but a hostile test (not a subject) can still forge a result.
-  This is the author-is-hostile risk again.
+- **The tag in the test container.** The HMAC tag is not the host key. It is
+  a per-task value derived from `VIGIL_HOST_KEY`, and ruling 10's "no key in
+  a container" refers to `VIGIL_HOST_KEY`, which never enters a container.
+  The tag itself is in the test container's environment for the base run, so
+  it is exposed there: with the subject in another container only the test
+  process can read it, but a hostile test (not a subject) can read it and
+  forge a failure that counts. The exposure is limited to one task's tag and
+  to the base run. This is the author-is-hostile risk again.
 - **The author's output is trusted for what it asserts.** A test that is
   weaker than the spec says is not detected by the verifier. Only fails-on-
   base is checked.
@@ -265,9 +270,9 @@ with a clean review. The owner turns it on.
 - **Cost.** One more container per hidden run: its start, a copy of the
   subject, a channel volume and its cleanup. The verifier already runs one
   container at a time per machine, so a hidden run takes longer by the
-  subject container's start for each call batch. The 11.7 GiB Docker VM
-  limit means the subject container's memory must be small; if both do not
-  fit, the run waits.
+  subject container's start for each call batch. Two containers in the 11.7
+  GiB Docker VM need a memory split that is not decided (see "Open
+  questions for the owner").
 - **Complexity.** A protocol to maintain, and a second image path (the
   subject runs in the repo's dev image, never the session image).
 - **What B40 says until it's done.** It says what the code does today and
@@ -294,6 +299,17 @@ with a clean review. The owner turns it on.
    only). It does not test behaviour, which is the point of the tests.
 5. **Turn the feature off for good.** It is off now. The runner-file class
    has no other way to be accepted besides owner review of every task.
+
+## Open questions for the owner
+
+None of these is settled; each needs an owner decision before (b).
+
+1. Does a hidden run with two containers (test and subject) count as one
+   verifier slot, given B33's rule of one verifier container at a time and
+   `container.verifier_concurrency` = 1?
+2. How should memory be split between the two containers inside the 11.7 GiB
+   Docker VM?
+3. What is the subject container's memory cap?
 
 ## When this changes
 
