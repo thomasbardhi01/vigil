@@ -540,5 +540,6 @@ uv run python -m vigild
   merged and done included: a merged job's issue is not re-taken by label;
   submit a new job for follow-up work. Label an issue only if it wasn't
   submitted through the API, or abandon the API job first (jobs from before
-  the field carry none).
+  the field carry none). An issue intake took itself stays claimed even
+  after its job is abandoned; to redo it, submit a new job through the API.
 - Running it under launchd arrives with phase 2b, together with the CLI.
