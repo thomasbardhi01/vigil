@@ -159,6 +159,7 @@ class Pager(Protocol):
 
 SPEC_WAIT = frozenset({JobState.SPEC_PENDING})  # where a coord or an author waits
 BUILD_WAIT = frozenset({JobState.BUILDING})  # where a worker waits
+REVIEW_WAIT = frozenset({JobState.IN_REVIEW})  # where a review reserve waits
 
 
 class QueueCancelled(Exception):
@@ -768,8 +769,11 @@ class JobRunner:
                     self.store, job_id, job.blocked_from, actor,
                     channel="inbox" if actor is Actor.OWNER else None, evidence=evidence,
                 )  # fmt: skip
-            except TransitionError, KeyError:
+            except TransitionError as e:
                 log.warning("could not resume %s (%s)", job_id, evidence)
+                self._page_if_gaps(job_id, e)
+                continue
+            except KeyError:
                 continue
             status = self.on_resume(job_id)
             out["queued" if status == "queued" else "resumed"].append(job_id)
@@ -1095,8 +1099,14 @@ class JobRunner:
         except Exception as e:
             err = redact(f"{type(e).__name__}: {e}")
         log.error("settle failed for session %s: %s", s.id, err)
-        rows = self.store.q("SELECT amount_usd FROM reservations WHERE id=?", (reservation,))
-        reserved = float(rows[0]["amount_usd"]) if rows else 0.0
+        # the session's whole open money (its reservation plus an over-cap extension or a
+        # draw's top-up) is booked at once, so the sweep can't book those rows again
+        rows = self.store.q(
+            "SELECT COALESCE(SUM(amount_usd), 0) n FROM reservations"
+            " WHERE status='open' AND (id=? OR session_id=?)",
+            (reservation, s.id),
+        )
+        reserved = float(rows[0]["n"])
         steps: list[Callable[[], Any]] = [
             lambda: self.budget.settle(reservation, reserved),
             lambda: self.store.update_session(s.id, status="failed"),
@@ -1955,6 +1965,16 @@ class JobRunner:
             self._hold_without_pr(job_id, gaps, str(e))
             return False
         return True
+
+    def _page_if_gaps(self, job_id: str, why: TransitionError) -> None:
+        """A move the invariant refused (a resume into review, say) must not leave the job
+        blocked with no page: if a plan task has no open PR, page it as reconcile does."""
+        try:
+            gaps = plan_gaps(self.store, job_id)
+        except KeyError:
+            return
+        if gaps:
+            self._hold_without_pr(job_id, gaps, str(why))
 
     def _hold_without_pr(self, job_id: str, gaps: dict[str, str], why: str) -> None:
         self._block(job_id, f"no open PR for plan task(s) {sorted(gaps)}")
@@ -2848,6 +2868,7 @@ class JobRunner:
             if job.state in (JobState.ABANDONED, JobState.DONE, JobState.MERGED):
                 continue
             states: dict[str, str] = {}
+            closed_tasks: list[str] = []
             for t in self.store.list_tasks(job.id):
                 url = self._task_pr(t.id)
                 if not url or t.state in ("merged", "closed", *DEAD_TASK):
@@ -2865,6 +2886,18 @@ class JobRunner:
                     self.store.add_event(
                         f"pr_{st}", {"pr_url": url}, Provenance.HUMAN, job_id=job.id, task_id=t.id
                     )
+                    if st == "closed" and t.contract.get("shape") != "deps":
+                        closed_tasks.append(t.id)
+            if closed_tasks and self.store.get_job(job.id).state in (
+                JobState.BUILDING,
+                JobState.IN_REVIEW,
+                JobState.READY,
+            ):
+                # a live job's PR was closed by hand: replan or abandon, not drift
+                gaps = plan_gaps(self.store, job.id)
+                if gaps:
+                    self._hold_without_pr(job.id, gaps, f"PR closed: {sorted(closed_tasks)}")
+                continue
             live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
             if not live or any(t.state != "merged" for t in live):
                 continue
@@ -2901,6 +2934,7 @@ class JobRunner:
                 )  # fmt: skip
             except TransitionError as e:
                 log.warning("could not resume %s after %s merged: %s", job.id, dep_id, e)
+                self._page_if_gaps(job.id, e)
                 continue
             for item in self.store.list_inbox():
                 if item.job_id == job.id and item.body.get("kind") == "needs_deps":
@@ -2988,9 +3022,13 @@ class JobRunner:
             )  # fmt: skip
             return "done"
         try:
-            stage = self.budget.reserve(
-                session_id=None, task_id=None, amount=amount, purpose="review_stage"
-            )
+            # the review reserve waits its turn like a worker's: first in, first out
+            stage = self._reserve_queued(
+                job_id, "review_stage", session_id=None, task_id=None, amount=amount,
+                purpose="review_stage", expect=REVIEW_WAIT,
+            )  # fmt: skip
+        except QueueCancelled:
+            return "done"  # the job moved on (abandoned, held) while it waited
         except BudgetExceeded as e:
             held = self._refused_budget(job_id, e, None)
             if held is not None:
@@ -3099,8 +3137,12 @@ class JobRunner:
         2a rounds 6-7); a refusal for any other reason still raises."""
         try:
             transition(self.store, job_id, to, Actor.VIGILD, evidence=evidence)
-        except TransitionError:
+        except TransitionError as e:
             if self.store.get_job(job_id).state is JobState.IN_REVIEW:
+                gaps = plan_gaps(self.store, job_id) if to is JobState.READY else {}
+                if gaps:  # a PR closed during the pass: replan or abandon (finding #4)
+                    self._hold_without_pr(job_id, gaps, str(e))
+                    return False
                 raise
             self._drop_review(job_id, {"to": to.value, "tasks": tasks})
             return False

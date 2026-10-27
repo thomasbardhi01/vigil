@@ -119,7 +119,9 @@ class Budget:
 
     def settle(self, reservation_id: int, amount: float | None = None) -> float:
         """Close a reservation; its session's metered cost (or `amount`, for a
-        call vigild made itself) becomes spend."""
+        call vigild made itself, or a session whose spend is unknown) becomes spend.
+        For a session an `amount` may be as much as all its open reservations together,
+        and the others (an over-cap extension, a draw's top-up) close with it."""
         with self.store.tx() as c:
             row = c.execute(
                 "SELECT session_id, task_id, status FROM reservations WHERE id=?",
@@ -130,11 +132,20 @@ class Budget:
             if amount is not None:
                 # never more than was reserved (2a round 8): the rest is recorded,
                 # and the caller (the gateway) trips the daily breaker for it
-                held = float(
-                    c.execute(
-                        "SELECT amount_usd FROM reservations WHERE id=?", (reservation_id,)
-                    ).fetchone()[0]
-                )
+                if row["session_id"]:
+                    held = float(
+                        c.execute(
+                            "SELECT SUM(amount_usd) FROM reservations"
+                            " WHERE session_id=? AND status='open'",
+                            (row["session_id"],),
+                        ).fetchone()[0]
+                    )
+                else:
+                    held = float(
+                        c.execute(
+                            "SELECT amount_usd FROM reservations WHERE id=?", (reservation_id,)
+                        ).fetchone()[0]
+                    )
                 spent = min(amount, held)
                 if amount > held + EPS:
                     self.store.add_event(
@@ -151,7 +162,7 @@ class Budget:
                 "UPDATE reservations SET status='settled', closed_at=? WHERE id=?",
                 (iso(self.clock()), reservation_id),
             )
-            if amount is None and row["session_id"]:
+            if row["session_id"]:
                 # the session's other reservations (a draw's top-up, an
                 # over-cap extension) close with it: its cost is booked once
                 c.execute(

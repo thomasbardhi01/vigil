@@ -112,7 +112,7 @@ def test_a_review_refused_by_the_budget_pages_the_job_not_the_fleet(world: World
         if kw.get("purpose") == "review_stage":  # the job's one review reservation (round 5)
             from vigild.budget import BudgetExceeded
 
-            raise BudgetExceeded("daily", "a test says the day is held")
+            raise BudgetExceeded("monthly", "a test says the month is held")  # a day would queue
         return real(**kw)
 
     w.budget.reserve = refuse_reviews  # type: ignore[method-assign]

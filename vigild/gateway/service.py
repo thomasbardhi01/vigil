@@ -823,26 +823,67 @@ class Gateway:
                 or payload.get("usage")
                 or {}
             )
-            cost[0] = record_call(
-                self.store,
-                self.prices,
-                session_id=None,
-                task_id=None,
-                job_id=job_id,
-                purpose=purpose,
-                provider=provider,
-                backend_preset=route,
-                model=model,
-                usage=CallUsage(
-                    tokens_in=int(usage.get("input_tokens") or 0),
-                    tokens_out=int(usage.get("output_tokens") or 0),
+            cost[0] = self._own_record(
+                amount,
+                purpose,
+                job_id,
+                lambda: record_call(
+                    self.store,
+                    self.prices,
+                    session_id=None,
+                    task_id=None,
+                    job_id=job_id,
+                    purpose=purpose,
+                    provider=provider,
+                    backend_preset=route,
+                    model=model,
+                    usage=CallUsage(
+                        tokens_in=int(usage.get("input_tokens") or 0),
+                        tokens_out=int(usage.get("output_tokens") or 0),
+                    ),
+                    provider_cost_usd=usage.get("cost"),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    provenance=Provenance.CLAUDE,
+                    repo=repo,
                 ),
-                provider_cost_usd=usage.get("cost"),
-                latency_ms=int((time.monotonic() - started) * 1000),
-                provenance=Provenance.CLAUDE,
-                repo=repo,
             )
             return payload
+
+    def _own_record(
+        self, amount: float, purpose: str, job_id: str | None, record: Callable[[], float]
+    ) -> float:
+        """Record one of vigild's own calls and return its cost. If recording fails the
+        cost is unknown (#16's rule, here too): book the worst case it reserved, never
+        $0, and page. If the row had already been written before the failure, that
+        row's cost stands and the call is not counted again."""
+        last = int(self.store.q("SELECT COALESCE(MAX(id), 0) n FROM model_calls")[0]["n"])
+        try:
+            return record()
+        except Exception as e:
+            reason = redact(f"{type(e).__name__}: {e}")
+            log.error("metering failed for vigild's own %s call: %s", purpose, reason)
+            rows = self.store.q(
+                "SELECT cost_usd FROM model_calls WHERE id>? ORDER BY id DESC LIMIT 1", (last,)
+            )
+            booked = float(rows[0]["cost_usd"]) if rows else amount
+            try:
+                self.store.add_event(
+                    "metering_failed",
+                    {"purpose": purpose, "error": reason, "booked_usd": booked,
+                     "recorded": bool(rows)},
+                    Provenance.HUMAN, job_id=job_id,
+                )  # fmt: skip
+                if not rows:
+                    self.store.create_inbox_item(
+                        "questions", "page", job_id,
+                        f"metering failed: {reason}; spend for a {purpose} call not booked",
+                        {"purpose": purpose, "booked_usd": booked,
+                         "note": "the call's worst-case reservation was booked as spent; "
+                         "reconcile with the provider's usage", "resumable": False},
+                    )  # fmt: skip
+            except Exception:
+                log.exception("metering-failure page failed")
+            return booked
 
     @contextmanager
     def _own_call(self, amount: float, purpose: str) -> Iterator[list[float]]:
@@ -979,15 +1020,20 @@ class Gateway:
                     "api_error",
                     f"upstream {resp.status_code}: {payload.get('error')}",
                 )
-            cost[0] = self._record(
-                gs=None,
-                preset_name=preset,
-                preset=p,
-                model=payload.get("model") or model,
-                usage=usage_from_anthropic(payload.get("usage") or {}),
-                started=started,
-                purpose=purpose,
-                job_id=job_id,
-                repo=repo,
+            cost[0] = self._own_record(
+                amount,
+                purpose,
+                job_id,
+                lambda: self._record(
+                    gs=None,
+                    preset_name=preset,
+                    preset=p,
+                    model=payload.get("model") or model,
+                    usage=usage_from_anthropic(payload.get("usage") or {}),
+                    started=started,
+                    purpose=purpose,
+                    job_id=job_id,
+                    repo=repo,
+                ),
             )
             return payload

@@ -108,7 +108,7 @@ def test_a_refused_review_stage_reservation_pages_the_job(world: World) -> None:
 
     def full(**kw: Any) -> int:
         if kw.get("purpose") == "review_stage":
-            raise BudgetExceeded("daily", "a test says the day is held")
+            raise BudgetExceeded("monthly", "a test says the month is held")  # a day would queue
         return real(**kw)
 
     w.budget.reserve = full  # type: ignore[method-assign]

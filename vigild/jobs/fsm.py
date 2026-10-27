@@ -101,7 +101,9 @@ def _workers_done(c: Ctx) -> list[str]:
 HAS_OPEN_PR = ("pr_open", "reviewed", "fix")
 
 
-def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
+def plan_gaps(
+    store: Store, job_id: str, ok_states: tuple[str, ...] = HAS_OPEN_PR
+) -> dict[str, str]:
     """Tasks of the job's current plan that have no open PR for that plan's work, as
     {task id: why} (phase 1 run finding #4). A task has one only if it exists, is
     `pr_open`, and its stored contract is the plan's (an id that names other work, as
@@ -117,7 +119,7 @@ def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
         except KeyError:
             gaps[w.task_id] = "no task was created for it"
             continue
-        if task.state not in HAS_OPEN_PR:
+        if task.state not in ok_states:
             gaps[w.task_id] = f"the task is {task.state}, not pr_open"
             continue
         spec = task.contract.get("spec")
@@ -133,6 +135,15 @@ def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
 def _plan_has_prs(c: Ctx) -> list[str]:
     return [
         f"plan task {t} has no open PR: {why}" for t, why in plan_gaps(c.store, c.job.id).items()
+    ]
+
+
+def _ready_has_prs(c: Ctx) -> list[str]:
+    """No plan task may have lost its PR (closed by hand) by the time the job is ready;
+    one the owner already merged is fine."""
+    return [
+        f"plan task {t} has no open PR: {why}"
+        for t, why in plan_gaps(c.store, c.job.id, (*HAS_OPEN_PR, "merged")).items()
     ]
 
 
@@ -209,7 +220,7 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,
     (S.IN_REVIEW, S.BUILDING): _findings,
-    (S.IN_REVIEW, S.READY): _reviews_clean,
+    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c)],
     (S.READY, S.MERGED): _merged,
     (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
