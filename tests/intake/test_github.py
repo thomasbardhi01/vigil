@@ -171,3 +171,84 @@ def test_a_failure_after_the_claim_pages_and_never_loses_the_issue(
     li.decider = None  # fixed: the next poll makes the job
     (job_id,) = li.poll()
     assert runner.created == [job_id]
+
+
+# --- an issue that already has a job is not taken again (owner, 2026-10-27) ------
+
+
+def _api_job(li: LabelIntake, repo: str = REPO, issue: int | None = 7) -> str:
+    from vigild.contract.models import Source
+    from vigild.jobs.service import JobRequest
+
+    req = JobRequest(
+        repo=repo, title="via the API", request="r", why="w", value=3, risk=3,
+        source=Source.HUMAN, issue=issue,
+    )  # fmt: skip
+    return str(li.jobs.submit_request(req).id)
+
+
+def _reason(store: Store, number: int) -> str | None:
+    return store.q("SELECT reason FROM intake_seen WHERE number=?", (number,))[0]["reason"]  # type: ignore[no-any-return]
+
+
+def test_an_issue_with_an_api_job_is_not_taken_again(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, runner: RecordingRunner
+) -> None:
+    li, _ = intake
+    api = _api_job(li)
+    assert li.poll() == [] and li.poll() == []
+    assert runner.created == [api]
+    assert _reason(store, 7) == f"already a job: {api}"
+    (ev,) = [e for e in store.events() if e.type == "intake"]
+    assert ev.data["issue"] == 7 and ev.data["already_a_job"] == api
+    assert store.list_inbox() == []  # no page
+
+
+def test_an_abandoned_job_does_not_block_a_new_one(
+    intake: tuple[LabelIntake, FakeIssues], store: Store
+) -> None:
+    from vigild.jobs.fsm import Actor, transition
+    from vigild.jobs.model import JobState
+
+    li, _ = intake
+    api = _api_job(li)
+    transition(
+        store, api, JobState.ABANDONED, Actor.OWNER, channel="inbox",
+        evidence={"action": "abandon"},
+    )  # fmt: skip
+    (job_id,) = li.poll()
+    assert job_id != api and store.get_job(job_id).issue == 7
+
+
+def test_the_same_number_in_another_repo_is_not_blocked(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, cfg: Config
+) -> None:
+    li, _ = intake
+    other = "o/other"
+    cfg.repos.repos[other] = cfg.repos.repos[REPO]
+    _api_job(li, repo=other)
+    (job_id,) = li.poll()
+    assert store.get_job(job_id).repo == REPO
+
+
+def test_an_intake_job_carries_the_issue_link(
+    intake: tuple[LabelIntake, FakeIssues], store: Store
+) -> None:
+    li, _ = intake
+    (job_id,) = li.poll()
+    assert store.get_job(job_id).issue == 7
+    assert store.jobs_for_issue(REPO, 7)[0].id == job_id
+
+
+def test_the_api_takes_only_a_positive_integer_issue() -> None:
+    from pydantic import ValidationError
+
+    from vigild.jobs.service import JobRequest
+
+    base: dict[str, Any] = {"repo": "o/r", "title": "t", "request": "r", "why": "w",
+                            "value": 3, "risk": 3}  # fmt: skip
+    assert JobRequest(**base).issue is None
+    assert JobRequest(**base, issue=320).issue == 320
+    for bad in (0, -1, "7x", 1.5, True):
+        with pytest.raises(ValidationError):
+            JobRequest(**base, issue=bad)

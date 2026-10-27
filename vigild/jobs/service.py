@@ -91,6 +91,8 @@ class JobRequest(BaseModel):
     risk: Score
     source: Source = Source.HUMAN
     labels: list[str] = Field(default_factory=list)
+    # The issue in `repo` this answers: label intake skips an issue a live job carries.
+    issue: int | None = Field(default=None, gt=0, strict=True)
 
 
 def render_spec(task: Task, money_globs: list[str]) -> str:
@@ -313,6 +315,7 @@ class JobService:
             request=req.request,
             notes=req.notes,
             source=req.source.value,
+            issue=req.issue,
         )
         self.store.add_artifact(job.id, "intake.json", req.model_dump_json(), Provenance.HUMAN)
         if issue is not None:

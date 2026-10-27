@@ -9,6 +9,10 @@ exactly once. Polled; a webhook comes later.
   creates the job, in one transaction; a second poll, or a second vigild,
   finds the claim. An issue the intake gate refuses is claimed too, with the
   reason, and not retried.
+- **One job per issue:** an issue a job already carries (`jobs.issue`, set by
+  the API's `issue` field or by intake) is claimed with `already a job: <id>`
+  and skipped, unless that job is abandoned. Jobs from before the link have
+  none: label an issue only if it wasn't submitted through the API.
 - **Token:** `issues: read`, one repo, one hour, revoked after each poll.
 - **Scores:** `value:N` and `risk:N` labels. A score no label gives is asked
   of the decider (Jev on OpenRouter for a public repo, Haiku the escalation;
@@ -28,6 +32,7 @@ from typing import Any, Protocol
 from vigild.config import Config
 from vigild.contract.models import Source
 from vigild.db import Store, iso
+from vigild.jobs.model import JobState
 from vigild.provenance import Provenance
 
 log = logging.getLogger("vigild.intake")
@@ -119,6 +124,25 @@ class LabelIntake:
             )
         return True
 
+    def _has_job(self, repo: str, number: int) -> bool:
+        """The issue already has a job that isn't abandoned (an API job or an
+        earlier intake one): the claim says so, with an event and no page."""
+        live = [
+            j for j in self.store.jobs_for_issue(repo, number) if j.state is not JobState.ABANDONED
+        ]
+        if not live:
+            return False
+        job_id = live[0].id
+        self.store.x(
+            "UPDATE intake_seen SET reason=? WHERE repo=? AND number=?",
+            (f"already a job: {job_id}", repo, number),
+        )
+        self.store.add_event(
+            "intake", {"repo": repo, "issue": number, "already_a_job": job_id},
+            Provenance.HUMAN, job_id=job_id,
+        )  # fmt: skip
+        return True
+
     def poll(self) -> list[str]:
         """One pass over every repo that takes label intake; the new job ids."""
 
@@ -136,6 +160,8 @@ class LabelIntake:
                     continue
                 number = int(issue["number"])
                 if not self._claim(repo, number):
+                    continue
+                if self._has_job(repo, number):
                     continue
                 try:
                     job_id = self._take(repo, number, issue)
@@ -193,6 +219,7 @@ class LabelIntake:
             risk=scores.get("risk", 3),
             source=Source.HUMAN,
             labels=[lb for lb in labels if lb != LABEL and not SCORE.match(lb)],
+            issue=number,
         )
         detail = {
             "number": number,

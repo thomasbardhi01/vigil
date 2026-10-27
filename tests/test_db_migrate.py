@@ -178,3 +178,18 @@ def test_two_a_steps_follow_mains_and_end_with_the_full_schema(tmp_path: Path) -
     db.migrate(conn)
     assert before == [tuple(r) for r in conn.execute("SELECT * FROM sqlite_master ORDER BY name")]
     conn.close()
+
+
+def test_the_issue_link_column_is_added_idempotently(tmp_path: Path) -> None:
+    """A job from before the issue link keeps its row, with no link; the step runs twice."""
+    path = tmp_path / "issue.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    assert "issue" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    conn.commit()
+    conn.close()
+    store = Store.open(path)
+    assert "issue" in _cols(store, "jobs") and "reason" in _cols(store, "intake_seen")
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert "issue" in _cols(store, "jobs")

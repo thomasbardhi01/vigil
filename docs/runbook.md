@@ -534,5 +534,8 @@ uv run python -m vigild
   `configs/repos.yaml`. Then every five minutes vigild turns each open
   issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
   labels score it (3 each by default). Anyone who can label issues there
-  can start work, so turn it on only where that's you.
+  can start work, so turn it on only where that's you. An issue that
+  already has a job (not abandoned) is skipped, matched by the job's `issue`
+  field: label an issue only if it wasn't submitted through the API, or
+  abandon the API job first (jobs from before the field carry none).
 - Running it under launchd arrives with phase 2b, together with the CLI.
