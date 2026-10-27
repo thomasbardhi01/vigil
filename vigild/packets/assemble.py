@@ -213,7 +213,8 @@ def _test_wording(spec: dict[str, Any]) -> str:
     return (
         f"\nmust_fail_first is off (reason: {reason}): your tests pin existing behaviour; "
         "they must run and pass on the unchanged code. vigild refuses a result where none of "
-        "your new or changed tests ran. If a stated rule contradicts the code, don't bend the "
+        "your new tests ran: a new test id the base doesn't have; editing an existing test "
+        "doesn't count. If a stated rule contradicts the code, don't bend the "
         "test or the code: escalate through ask_coord, starting the question with "
         "`spec_ambiguous:` and quoting the rule and the code line.\n"
     )

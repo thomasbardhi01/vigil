@@ -889,5 +889,26 @@ def test_mff_off_reads_vitest_reports_and_skips_todo() -> None:
     )
     cases = parse_junit(xml)
     base = [c for c in cases if c.id.endswith("old") or c.id.endswith("later")]
-    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["server/test/a.test.ts"], base)
+    ids = Verifier._ids_after(
+        {"_report": True, "_cases": cases}, ["server/test/a.test.ts"], base, base
+    )
     assert ids["worker_ran"] == 1 and ids["not_passing_after"] == []
+
+
+def test_mff_off_counts_new_tests_when_the_base_ran_none() -> None:
+    # a repo's first tests: a base report with zero cases is a report, not a missing one
+    from vigild.verifier import Case, Verifier
+
+    cases = [Case("test/a.test.ts::first", "test/a.test.ts", "pass")]
+    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["test/a.test.ts"], [], [])
+    assert ids["checked"] and ids["worker_ran"] == 1
+
+
+def test_mff_off_without_a_second_base_report_settles_nothing() -> None:
+    # unstable ids can't be ruled out, so which tests are new is unknown: fail closed
+    from vigild.verifier import Case, Verifier
+
+    cases = [Case("test/a.test.ts::row 333", "test/a.test.ts", "pass")]
+    base = [Case("test/a.test.ts::row 111", "test/a.test.ts", "pass")]
+    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["test/a.test.ts"], base, None)
+    assert not ids["checked"] and "second base run" in ids["note"]

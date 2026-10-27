@@ -356,3 +356,19 @@ def test_mff_off_without_an_id_record_is_refused(ws: Workspace, tmp_path: Path) 
     base, head = _result(ws, tmp_path)
     errors = _check(ws, base, head, contract=OFF, tests=AFTER_ONLY)
     assert any("can't be confirmed" in e for e in errors)
+
+
+def test_mff_off_unsettled_ids_are_refused_with_the_reason() -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    tests = {
+        "source": "verifier",
+        "after": {"outcome": "pass"},
+        "ids": {"checked": False, "note": "the second base run gave no report"},
+    }
+    errors = check_tests({"test_cmd": "pytest -q", "must_fail_first": False}, tests)
+    assert any("second base run" in e for e in errors), errors
+    ok = {"source": "verifier", "after": {"outcome": "pass"},
+          "ids": {"checked": True, "worker_ran": 0, "not_passing_after": []}}  # fmt: skip
+    errors = check_tests({"test_cmd": "pytest -q", "must_fail_first": False}, ok)
+    assert any("new test id" in e for e in errors), errors

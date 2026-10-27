@@ -1056,13 +1056,21 @@ class Verifier:
         it added or changed that the base run(s) did not have (`_new_cases`), so
         editing an old file counts nothing. Only a new pass counts as run; skipped,
         xfail and todo do not. Every case in those files, old or new, must still
-        pass (`not_passing_after`). With no base report nothing can be settled as
-        new, so none counts."""
+        pass (`not_passing_after`). A base report with no cases is still a report
+        (a repo's first tests). Without both base reports, which tests are new can't
+        be settled (unstable ids can't be ruled out), so the ids are unchecked and
+        acceptance refuses."""
         if not after.get("_report"):
             return {"checked": False, "note": "test ids not checked: the runner gave no report"}
+        if base is None:
+            return {"checked": False, "note": "the base run gave no report, so which tests "
+                    "are new can't be settled"}  # fmt: skip
+        if base2 is None:
+            return {"checked": False, "note": "the second base run gave no report, so unstable "
+                    "ids can't be ruled out and which tests are new can't be settled"}  # fmt: skip
         cases = [c for c in after.get("_cases") or [] if belongs(c, tests)]
         every = after.get("_cases") or []
-        new = Verifier._new_cases(every, base, base2 or None, tests) if base else []
+        new = Verifier._new_cases(every, base, base2, tests)
         return {
             "checked": True,
             "mode": "after_only",
