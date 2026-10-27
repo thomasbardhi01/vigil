@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -37,6 +38,7 @@ BRANCH_NAME = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 RO_DIRS = (".github", ".claude", ".opencode", ".git/hooks")
 RO_FILES = (".git/config",)
+VIGIL_DIR = ".vigil"
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
 MAX_BUNDLE = 512 << 20
@@ -554,8 +556,68 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
 
-    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+    def push(
+        self, repo: str, head: str, branch: str, token: str | None, *, force: bool = False
+    ) -> None:
         self._git(
             self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
-            f"{head}:refs/heads/{branch}", token=token,
+            f"{'+' if force else ''}{head}:refs/heads/{branch}", token=token,
+        )  # fmt: skip
+
+    # --- what reaches the target repo (Tier 1: `.vigil/` stays in the vault) ---------------
+
+    def has_vigil(self, repo: str, sha: str) -> bool:
+        """Does `sha`'s tree carry a top-level `.vigil` (any case, any kind)?"""
+        if not SHA.match(sha):
+            raise WorkspaceError("bad sha")
+        out = self._git(self.vault(repo), "ls-tree", "-z", "--name-only", sha)
+        return any(n.lower() == VIGIL_DIR for n in out.split("\0") if n)
+
+    def _pub_ref(self, branch: str) -> str:
+        return "refs/vigil/pub/" + hashlib.sha256(branch.encode()).hexdigest()[:24]
+
+    def published_sha(self, repo: str, branch: str) -> str | None:
+        """The commit vigild last sent to `branch`, from its own record."""
+        try:
+            return self._git(
+                self.vault(repo), "rev-parse", "--verify", "--quiet",
+                f"{self._pub_ref(branch)}^{{commit}}",
+            )  # fmt: skip
+        except WorkspaceError:
+            return None
+
+    def record_published(self, repo: str, branch: str, sha: str) -> None:
+        if not SHA.match(sha):
+            raise WorkspaceError("bad sha")
+        self._git(self.vault(repo), "update-ref", self._pub_ref(branch), sha)
+
+    def public_commit(self, repo: str, head: str, base_sha: str, branch: str) -> str:
+        """The commit to send for the vault's `head`: `head` itself when it has no
+        `.vigil/` and nothing went to `branch` before; otherwise a commit of the
+        same tree without `.vigil/`, on the last commit sent to `branch` (or the
+        base), so the branch only moves forward and never carries the job's
+        artifacts. The vault keeps `head` whole."""
+        if not (SHA.match(head) and SHA.match(base_sha)):
+            raise WorkspaceError("bad sha")
+        vault = self.vault(repo)
+        prev = self.published_sha(repo, branch)
+        if prev is None and not self.has_vigil(repo, head):
+            return head
+        entries = [
+            e
+            for e in self._git(vault, "ls-tree", "-z", head).split("\0")
+            if e and e.partition("\t")[2].lower() != VIGIL_DIR
+        ]
+        try:
+            tree = git(vault, "mktree", "-z", "--missing", stdin="\0".join(entries) + "\0")
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        parent = prev or base_sha
+        if self._git(vault, "rev-parse", f"{parent}^{{tree}}") == tree:
+            return parent
+        subject = self._git(vault, "log", "-1", "--format=%s", head)
+        return self._git(
+            vault, "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}",
+            "commit-tree", tree, "-p", parent, "-m",
+            f"{subject}\n\nvigild: the job's .vigil/ artifacts stay in vigild's vault.",
         )  # fmt: skip

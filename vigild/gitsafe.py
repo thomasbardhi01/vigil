@@ -65,7 +65,12 @@ def git_env(token: str | None = None) -> dict[str, str]:
 
 
 def git(
-    cwd: Path, *args: str, token: str | None = None, timeout: int = 600, raw: bool = False
+    cwd: Path,
+    *args: str,
+    token: str | None = None,
+    timeout: int = 600,
+    raw: bool = False,
+    stdin: str | None = None,
 ) -> str:
     out = subprocess.run(
         ["git", *HARDENING, *args],
@@ -75,6 +80,7 @@ def git(
         text=not raw,
         timeout=timeout,
         check=False,
+        input=stdin,
     )
     if out.returncode != 0:
         err = out.stderr if isinstance(out.stderr, str) else out.stderr.decode(errors="replace")

@@ -147,6 +147,23 @@ def _ready_has_prs(c: Ctx) -> list[str]:
     ]
 
 
+def _pr_trees_clean(c: Ctx) -> list[str]:
+    """Tier 1: no task's PR head may carry `.vigil/` (it stays in the vault). The
+    record is vigild's own, written from the vault's tree of the commit it sent; no
+    record, or one that predates this rule, does not pass."""
+    errs: list[str] = []
+    for t in c.store.list_tasks(c.job.id):
+        if t.state in ("superseded", "abandoned", "merged"):
+            continue
+        rows = c.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (t.id,),
+        )
+        if rows and json.loads(rows[0]["data"]).get("vigil_in_pr") is not False:
+            errs.append(f"the PR head of {t.id} may carry .vigil/")
+    return errs
+
+
 def _findings(c: Ctx) -> list[str]:
     return [] if c.evidence.get("findings") else ["going back to building needs review findings"]
 
@@ -220,7 +237,7 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,
     (S.IN_REVIEW, S.BUILDING): _findings,
-    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c)],
+    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c), *_pr_trees_clean(c)],
     (S.READY, S.MERGED): _merged,
     (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,

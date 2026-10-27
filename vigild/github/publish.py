@@ -7,6 +7,12 @@ every file changed since the base commit vigild recorded (renames counted as
 delete + add) is in the contract's scope or the job's own `.vigil/`
 artifacts, then pushes the commit from the vault with a one-hour
 installation token and opens a draft PR. A draft or nothing.
+
+Tier 1 (owner, 2026-10-26): `.vigil/<job>/` stays in the vault. What goes out
+is the checked tree without `.vigil/` (`Workspace.public_commit`), on the last
+commit sent to the branch; the vault keeps the worker's full head. A branch
+sent before this (no record, `.vigil/` on it) is replaced once by a force of
+the same `vigil/*` branch, which only vigild writes.
 """
 
 from __future__ import annotations
@@ -146,13 +152,18 @@ def publish(
         changed = [path for _, path in ws.changed(repo, base_sha, head)]
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
-    if not changed:
+    if not [p for p in changed if not p.startswith(".vigil/")]:
         raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
     outside = out_of_scope(changed, scope)
     if outside:
         raise PublishError(f"files changed outside the contract's scope: {outside}")
     try:
-        ws.push(repo, head, branch, token)
+        # Tier 1: the job's `.vigil/` artifacts stay in the vault; what goes to the
+        # target repo is the same tree without them
+        send = ws.public_commit(repo, head, base_sha, branch)
+        legacy = bool(existing) and send != head and ws.published_sha(repo, branch) is None
+        ws.push(repo, send, branch, token, force=legacy)
+        ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
     if existing:

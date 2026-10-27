@@ -2694,7 +2694,13 @@ class JobRunner:
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
-            {"pr_url": url, "branch": branch, "head": head, "runner_file_change": overlap},
+            {
+                "pr_url": url,
+                "branch": branch,
+                "head": head,
+                "runner_file_change": overlap,
+                **self._pub_facts(job.repo, branch, base_sha),
+            },
             Provenance.HUMAN,
             job_id=job_id,
             session_id=s.id,
@@ -2852,7 +2858,8 @@ class JobRunner:
         )
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
-            "pr_open", {"pr_url": url, "branch": branch, "head": head},
+            "pr_open", {"pr_url": url, "branch": branch, "head": head,
+                        **self._pub_facts(job.repo, branch, base_sha)},
             Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return True
@@ -2950,6 +2957,55 @@ class JobRunner:
             (task_id,),
         )
         return str(json.loads(rows[0]["data"])["head"]) if rows else None
+
+    def _pub_facts(self, repo: str, branch: str, base_sha: str) -> dict[str, Any]:
+        """What reached the target repo, from vigild's own record and the vault: the
+        commit sent, and whether its tree carries `.vigil/` (None: unknown)."""
+        try:
+            sha = self.workspace.published_sha(repo, branch)
+            leak = None if sha is None else self.workspace.has_vigil(repo, sha)
+        except WorkspaceError:
+            sha, leak = None, None
+        return {"base_sha": base_sha, "published": sha, "vigil_in_pr": leak}
+
+    def _unstripped(self, job: Job) -> dict[str, str]:
+        """Tier 1: each live task whose PR head may carry `.vigil/`, as {task: why}.
+        One whose record says so (or predates the record) is sent again, without
+        it, to the same PR; what can't be fixed is returned."""
+        left: dict[str, str] = {}
+        for t in self.store.list_tasks(job.id):
+            if t.state in (*DEAD_TASK, "merged"):
+                continue
+            rows = self.store.q(
+                "SELECT data FROM events WHERE task_id=? AND type='pr_open' "
+                "ORDER BY id DESC LIMIT 1",
+                (t.id,),
+            )
+            if not rows:
+                continue
+            data = json.loads(rows[0]["data"])
+            if data.get("vigil_in_pr") is False:
+                continue
+            try:
+                base_sha = data.get("base_sha") or self.workspace.base_sha(t.id)
+                spec = t.contract.get("spec") or {}
+                self.publisher.publish(
+                    repo=job.repo, head=data["head"], base_sha=base_sha, branch=data["branch"],
+                    base=job.base, title="", body="", existing=data["pr_url"],
+                    scope=[*(spec.get("files_in_scope") or []), *artifact_paths(job.id, t.id),
+                           *vigild_paths(job.id)],
+                )  # fmt: skip
+            except (PublishError, WorkspaceError, KeyError, OSError, ValueError) as e:
+                left[t.id] = f".vigil/ is on its PR head and could not be removed: {e}"[:300]
+                continue
+            facts = self._pub_facts(job.repo, data["branch"], base_sha)
+            if facts["vigil_in_pr"] is not False:
+                left[t.id] = ".vigil/ is still on its PR head"
+                continue
+            self.store.add_event(
+                "pr_open", {**data, **facts}, Provenance.HUMAN, job_id=job.id, task_id=t.id
+            )
+        return left
 
     def _task_pr(self, task_id: str) -> str | None:
         rows = self.store.q(
@@ -3118,6 +3174,15 @@ class JobRunner:
             return "dispatch" if moved else "done"
         if more:
             return "next"  # clean so far; the next pass reviews the rest
+        if left := self._unstripped(self.store.get_job(job_id)):
+            self._block(job_id, f".vigil/ on the PR head of {sorted(left)}")
+            self._page(
+                job_id,
+                f"{job_id}: .vigil/ is on the PR head of {', '.join(sorted(left))}",
+                {"kind": "vigil_in_pr", "tasks": left, "actions": ["retry", "abandon"]},
+                resumable=True,
+            )
+            return "done"
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
             return "done"
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
