@@ -227,22 +227,27 @@ def test_a_metering_failure_on_vigilds_own_call_books_the_worst_case_and_pages(
     assert budget.open_reservation_ids() == []
 
 
-def test_a_call_already_recorded_before_the_failure_is_not_counted_again(
+def test_another_calls_row_landing_mid_failure_is_never_booked_for_this_call(
     cfg: Any, monkeypatch: Any
 ) -> None:
+    """The failed call books exactly its own reservation and pages, whatever other
+    calls wrote meanwhile; the page says the call may be counted twice."""
     store, _budget, gw, _sweep, _clock = _setup(cfg, monkeypatch)
     real = gsvc.record_call
 
-    def write_then_fail(*a: Any, **k: Any) -> float:
-        real(*a, **k)
+    def other_lands_then_fail(*a: Any, **k: Any) -> float:
+        real(store, a[1], session_id=None, task_id=None, job_id=None, purpose="other",
+             provider="anthropic", backend_preset="claude-sonnet", model="claude-sonnet-5-5",
+             usage=CallUsage(tokens_out=90_000))  # another call's $0.90 row  # fmt: skip
         raise RuntimeError("late failure")
 
-    monkeypatch.setattr(gsvc, "record_call", write_then_fail)
+    monkeypatch.setattr(gsvc, "record_call", other_lands_then_fail)
     _own_metered(gw, store)
-    row = store.q("SELECT COUNT(*) c, SUM(cost_usd) n FROM model_calls")[0]
-    assert row["c"] == 1
+    reserved = store.q("SELECT amount_usd a FROM reservations")[0]["a"]
     booked = store.q("SELECT SUM(amount_usd) n FROM ledger")[0]["n"]
-    assert booked == pytest.approx(row["n"])  # its real cost, once; not the worst case on top
+    assert booked == pytest.approx(reserved)
+    (page,) = [i for i in store.list_inbox() if "metering failed" in i.title]
+    assert "counted twice" in page.body["note"]
 
 
 def test_haiku_decider_failure_is_fail_closed_too(cfg: Any, monkeypatch: Any) -> None:

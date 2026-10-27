@@ -853,37 +853,31 @@ class Gateway:
         self, amount: float, purpose: str, job_id: str | None, record: Callable[[], float]
     ) -> float:
         """Record one of vigild's own calls and return its cost. If recording fails the
-        cost is unknown (#16's rule, here too): book the worst case it reserved, never
-        $0, and page. If the row had already been written before the failure, that
-        row's cost stands and the call is not counted again."""
-        last = int(self.store.q("SELECT COALESCE(MAX(id), 0) n FROM model_calls")[0]["n"])
+        cost is unknown (#16's rule, here too): book the call's reservation (`amount`,
+        never more) and page. The call may also have been recorded, so it may be counted
+        twice: that errs on the safe side (exactly-once settle: #29)."""
         try:
             return record()
         except Exception as e:
             reason = redact(f"{type(e).__name__}: {e}")
             log.error("metering failed for vigild's own %s call: %s", purpose, reason)
-            rows = self.store.q(
-                "SELECT cost_usd FROM model_calls WHERE id>? ORDER BY id DESC LIMIT 1", (last,)
-            )
-            booked = float(rows[0]["cost_usd"]) if rows else amount
             try:
                 self.store.add_event(
                     "metering_failed",
-                    {"purpose": purpose, "error": reason, "booked_usd": booked,
-                     "recorded": bool(rows)},
+                    {"purpose": purpose, "error": reason, "booked_usd": amount},
                     Provenance.HUMAN, job_id=job_id,
                 )  # fmt: skip
-                if not rows:
-                    self.store.create_inbox_item(
-                        "questions", "page", job_id,
-                        f"metering failed: {reason}; spend for a {purpose} call not booked",
-                        {"purpose": purpose, "booked_usd": booked,
-                         "note": "the call's worst-case reservation was booked as spent; "
-                         "reconcile with the provider's usage", "resumable": False},
-                    )  # fmt: skip
+                self.store.create_inbox_item(
+                    "questions", "page", job_id,
+                    f"metering failed: {reason}; spend for a {purpose} call not booked",
+                    {"purpose": purpose, "booked_usd": amount,
+                     "note": f"Metering failed for this call; its cost was booked at its "
+                     f"reservation (${amount:.4f}). The call may also have been recorded, "
+                     "so it may be counted twice.", "resumable": False},
+                )  # fmt: skip
             except Exception:
                 log.exception("metering-failure page failed")
-            return booked
+            return amount
 
     @contextmanager
     def _own_call(self, amount: float, purpose: str) -> Iterator[list[float]]:
