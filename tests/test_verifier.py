@@ -796,6 +796,7 @@ def test_mff_off_names_the_workers_tests_from_the_after_run(ws: Workspace, tmp_p
         "checked": True,
         "mode": "after_only",
         "worker_ran": 1,
+        "new_ids": ["tests.test_pinned::test_pinned"],
         "not_passing_after": [],
     }
 
@@ -829,6 +830,55 @@ def test_mff_off_a_failing_worker_test_is_named(ws: Workspace, tmp_path: Path) -
     assert ids["not_passing_after"] == ["tests.test_bad::test_bad"]
 
 
+def test_mff_off_editing_an_old_test_file_counts_nothing(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        f = c / "tests" / "test_old.py"
+        f.write_text(f.read_text() + "\n# touched\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["worker_ran"] == 0 and ids["new_ids"] == [] and ids["not_passing_after"] == []
+
+
+def test_mff_off_a_new_case_in_an_existing_file_counts(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        f = c / "tests" / "test_old.py"
+        f.write_text(f.read_text() + "\n\ndef test_added():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["worker_ran"] == 1 and ids["new_ids"] == ["tests.test_old::test_added"]
+
+
+def test_mff_off_a_new_skipped_case_beside_old_passing_ones_is_refused(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    def edit(c: Path) -> None:
+        f = c / "tests" / "test_old.py"
+        f.write_text(
+            "import pytest\n\n"
+            + f.read_text()
+            + "\n\n@pytest.mark.skip\ndef test_later():\n    assert False\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["worker_ran"] == 0 and ids["not_passing_after"] == []
+
+
+def test_new_cases_ignore_unstable_ids() -> None:
+    from vigild.verifier import Case, Verifier
+
+    def mk(i: str, st: str = "pass") -> Case:
+        return Case(i, "a.test.ts", st)
+
+    base = [mk("a.test.ts::old"), mk("a.test.ts::row 111")]
+    base2 = [mk("a.test.ts::old"), mk("a.test.ts::row 222")]
+    after = [mk("a.test.ts::old"), mk("a.test.ts::row 333"), mk("a.test.ts::fresh")]
+    new = Verifier._new_cases(after, base, base2, ["a.test.ts"])
+    assert len(new) == 1  # the unmatched unstable row absorbs one
+
+
 def test_mff_off_reads_vitest_reports_and_skips_todo() -> None:
     from vigild.verifier import Verifier, parse_junit
 
@@ -838,5 +888,6 @@ def test_mff_off_reads_vitest_reports_and_skips_todo() -> None:
         b'<testcase classname="test/old.test.ts" name="old"/></testsuite></testsuites>'
     )
     cases = parse_junit(xml)
-    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["server/test/a.test.ts"])
+    base = [c for c in cases if c.id.endswith("old") or c.id.endswith("later")]
+    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["server/test/a.test.ts"], base)
     assert ids["worker_ran"] == 1 and ids["not_passing_after"] == []

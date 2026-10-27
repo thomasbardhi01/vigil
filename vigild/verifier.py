@@ -677,7 +677,10 @@ class Verifier:
             record["ids"] = self._ids(before, after, tests)
         else:
             # #31 item 1: no "before" run, so name the worker's tests from the after run
-            record["ids"] = self._ids_after(after, tests)
+            record["ids"] = self._ids_after(
+                after, tests, base["_cases"] if base["_report"] else None,
+                base2["_cases"] if base2 and base2["_report"] else None,
+            )  # fmt: skip
         if hidden is not None:
             record["hidden"] = self._hidden_pair(
                 repo, image, task_id, base_sha, head, hidden, cfg, overlap,
@@ -998,18 +1001,74 @@ class Verifier:
         }
 
     @staticmethod
-    def _ids_after(after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
+    def _new_cases(
+        after: list[Case], base: list[Case], base2: list[Case] | None, tests: list[str]
+    ) -> list[Case]:
+        """The after-run cases in the worker's test files that the base did not
+        have: id absent from both base runs. An unstable id (in one base run only)
+        is never new because its title changed: a case whose (file, title without
+        parameters) matches an unstable base case is not new, and in a file with
+        unstable base ids that no title settles, as many cases as the base had
+        left unmatched are dropped (passing ones first). What can't be settled
+        doesn't count."""
+        seen = {c.id for c in base} | {c.id for c in base2 or []}
+        unstable = ({c.id for c in base} ^ {c.id for c in base2}) if base2 is not None else set()
+        keys = {
+            (c.file, normalise_title(c.id.split("::", 1)[-1]))
+            for c in list(base) + list(base2 or [])
+            if c.id in unstable
+        }
+        loose: dict[str, int] = {}
+        if unstable and base2 is not None:
+            la: dict[str, int] = {}
+            lb: dict[str, int] = {}
+            in_a = _title_counts(c for c in base if c.id in unstable)
+            in_b = _title_counts(c for c in base2 if c.id in unstable)
+            for key in set(in_a) | set(in_b):
+                na, nb = in_a.get(key, 0), in_b.get(key, 0)
+                need = min(na, nb)
+                la[key[0]] = la.get(key[0], 0) + na - need
+                lb[key[0]] = lb.get(key[0], 0) + nb - need
+            loose = {f: min(la[f], lb[f]) for f in la}
+        out: list[Case] = []
+        by_file: dict[str, list[Case]] = {}
+        for c in after:
+            if not belongs(c, tests) or c.id in seen:
+                continue
+            name = c.id.split("::", 1)[1] if "::" in c.id else c.id
+            if (c.file, normalise_title(name)) in keys:
+                continue
+            by_file.setdefault(c.file, []).append(c)
+        for f, cases in by_file.items():
+            drop = loose.get(f, 0)
+            cases.sort(key=lambda c: c.status != "pass")  # passing first, dropped last
+            out.extend(cases[: max(len(cases) - drop, 0)] if drop else cases)
+        return out
+
+    @staticmethod
+    def _ids_after(
+        after: dict[str, Any],
+        tests: list[str],
+        base: list[Case] | None = None,
+        base2: list[Case] | None = None,
+    ) -> dict[str, Any]:
         """must_fail_first off: the worker's tests are the cases in the test files
-        it added or changed (as in `_ids`), read from the after run. Only a pass
-        counts as run; skipped, xfail and todo do not."""
+        it added or changed that the base run(s) did not have (`_new_cases`), so
+        editing an old file counts nothing. Only a new pass counts as run; skipped,
+        xfail and todo do not. Every case in those files, old or new, must still
+        pass (`not_passing_after`). With no base report nothing can be settled as
+        new, so none counts."""
         if not after.get("_report"):
             return {"checked": False, "note": "test ids not checked: the runner gave no report"}
-        mine = [c for c in after.get("_cases") or [] if belongs(c, tests)]
+        cases = [c for c in after.get("_cases") or [] if belongs(c, tests)]
+        every = after.get("_cases") or []
+        new = Verifier._new_cases(every, base, base2 or None, tests) if base else []
         return {
             "checked": True,
             "mode": "after_only",
-            "worker_ran": sum(1 for c in mine if c.status == "pass"),
-            "not_passing_after": sorted(c.id for c in mine if c.status in ("failure", "error")),
+            "worker_ran": sum(1 for c in new if c.status == "pass"),
+            "new_ids": sorted(c.id for c in new)[:200],
+            "not_passing_after": sorted(c.id for c in cases if c.status in ("failure", "error")),
         }
 
     def _run(
