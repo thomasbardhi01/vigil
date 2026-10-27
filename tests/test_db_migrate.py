@@ -6,6 +6,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from vigild import db
 from vigild.db import Store
 
@@ -189,7 +191,33 @@ def test_the_issue_link_column_is_added_idempotently(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     store = Store.open(path)
-    assert "issue" in _cols(store, "jobs") and "reason" in _cols(store, "intake_seen")
+    assert "issue" in _cols(store, "jobs")
     db.migrate(store.conn)
     db.migrate(store.conn)
     assert "issue" in _cols(store, "jobs")
+
+
+def test_one_live_job_per_issue_is_a_unique_index(tmp_path: Path) -> None:
+    """A DB at step 11 gains the partial unique index; twice is the same; a second
+    live job for (repo, issue) fails, an abandoned one does not count."""
+    path = tmp_path / "step11.db"
+    conn = sqlite3.connect(path)
+    conn.isolation_level = None
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:11]:
+        step(conn)
+    conn.execute("PRAGMA user_version = 11")
+    conn.close()
+    store = Store.open(path)
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    names = {r["name"] for r in store.q("PRAGMA index_list(jobs)") if r["unique"]}
+    assert "jobs_live_issue" in names
+    first = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=None)
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=None)
+    store.create_job(repo="o/other", base="main", title="t", request="r", notes=[], issue=5)
+    store.x("UPDATE jobs SET state='abandoned' WHERE id=?", (first.id,))
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
