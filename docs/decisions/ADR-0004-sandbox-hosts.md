@@ -1,6 +1,6 @@
 # ADR-0004: Sandbox hosts
 
-- **Status:** proposed, 2026-10-27. Code starts after the owner approves this ADR.
+- **Status:** accepted, 2026-10-27. The owner approved it with four changes (gateway source check, SSH key restrictions, userns-remap only, a separate build phase), now folded in, and answered both open questions.
 - **Deciders:** the owner. Recorded by vigil-coord.
 - **Related:** issue #8 (vigil bench). The design note and the owner's decisions are its 2026-10-27 comments.
 
@@ -42,13 +42,23 @@ Model hosts stay in `configs/backends.yaml` as they are. **No code in `vigild/` 
 ### 3. Rules every remote sandbox host must meet
 Doctor checks every rule, and vigild refuses to start if a configured remote host fails one.
 
-1. **SSH only, private network only.**
+1. **SSH only, private network only, with a restricted key.**
    - The Docker context endpoint is `ssh://…`. A `tcp://` endpoint is refused.
    - The SSH target must resolve to a private address (RFC 1918, or the 100.64.0.0/10 range a private overlay network uses).
    - The SSH key lives on the vigild host. The sandbox host holds no secrets.
-2. **A pinned Docker Engine running with userns-remap or rootless mode.**
-   - The engine version must equal the pin in `configs/sandbox_hosts.yaml`.
-   - `docker info` must show `userns` or `rootless` in its security options.
+   - **The SSH key equals root on the sandbox host.** Anyone holding it can drive that host's Docker daemon, and through it the whole machine. So the host's `authorized_keys` entry for that key must carry all of these:
+     - `command="docker system dial-stdio"`
+     - `no-pty`
+     - `no-port-forwarding`
+     - `no-agent-forwarding`
+     - `no-X11-forwarding`
+
+     The key can then do nothing but speak the Docker API.
+   - **Doctor checks the restriction:** it opens a plain shell over that key, and the check fails unless the shell is refused.
+2. **A pinned Docker Engine running with userns-remap.**
+   - The engine version must equal **that host's** pin in `configs/sandbox_hosts.yaml`. Each host has its own pin.
+   - `docker info` must show `userns` in its security options.
+   - **Rootless mode is not supported** until the threat tests (`tests/security/test_threats.py`) pass under it.
 3. **Egress only to vigild's gateway.**
    - Each session gets its own `internal: true` network and a smokescreen sidecar on that host. The sidecar's allowlist is exactly the host's `gateway_url`.
    - Doctor runs a probe container on the host. It must reach the gateway's health route. It must fail to reach the internet, the host's own other ports, any other address on the private network, and every model endpoint in `configs/backends.yaml`.
@@ -70,10 +80,20 @@ These carry over **unchanged on every host**, local or remote:
 
 ### 4. The gateway on a private interface
 - A remote sandbox host's containers reach the gateway at that host's `gateway_url`. So vigild also listens on its private-network address when any remote host is configured, and only then. The bind address is set in config.
+- **vigild enforces the source:** the private listener accepts a connection only from a configured sandbox host's address, and drops any other source before any HTTP handling.
+  - A test shows a connection from an unlisted address is refused.
+  - The private network's access rules are **defence in depth**, not the boundary.
 - The per-session gateway token is unchanged.
-- The private network's access rules should let only sandbox hosts reach the gateway port. This is the operator's network config; doctor states the rule but can't verify it from the vigild side.
 
-### 5. Docs
+### 5. Image builds are a separate phase
+Building an image needs network. Sessions and grading never get network. The two are separate phases, on separate code paths:
+- **Builds** cover derived bench images (dependencies pre-installed), dev images and session layers. They run with network, as an explicit build step before any session or grader starts, and produce an image pinned by digest.
+- **Sessions** run with egress through the proxy to the gateway only.
+- **Grading** runs with `--network none`.
+
+No session or grader ever triggers a build. A missing image refuses the run, naming the build to run first.
+
+### 6. Docs
 - **`docs/runbook.md`:**
   - **"One machine with Docker"** stays the default path, with no sandbox host config needed.
   - **"Add a sandbox host"** is a new optional section: the six rules, how to create the SSH context and slice, and doctor's checks.
@@ -91,6 +111,8 @@ These carry over **unchanged on every host**, local or remote:
 - **Naming the x86 machine in code**, for example as a special case of the model host. Rejected by the owner: model hosts and sandbox hosts are separate, and the product must work on one machine.
 - **Normal jobs on remote hosts too.** Deferred. `uses: [jobs]` allows it later, but today normal jobs stay local.
 
-## Open questions for the owner
-1. Should the Docker Engine pin be one version for every host, or one per host?
-2. Is `bench.allow_emulation` on by default for the pilot? Proposed: yes, until the x86 host passes doctor.
+## Owner's answers (2026-10-27)
+1. **The Docker Engine pin is per host.**
+2. **`bench.allow_emulation` is on for the pilot.** The owner turns it off by hand once the x86 sandbox host passes doctor.
+
+**Before anyone touches the owner's x86 machine,** the owner reviews two documents: the deployment note in `docs/deploy/` and the "Add a sandbox host" runbook section.
