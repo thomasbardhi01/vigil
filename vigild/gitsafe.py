@@ -71,11 +71,12 @@ def git(
     timeout: int = 600,
     raw: bool = False,
     stdin: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> str:
     out = subprocess.run(
         ["git", *HARDENING, *args],
         cwd=cwd,
-        env=git_env(token),
+        env={**git_env(token), **(env or {})},
         capture_output=True,
         text=not raw,
         timeout=timeout,

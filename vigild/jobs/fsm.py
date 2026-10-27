@@ -148,9 +148,12 @@ def _ready_has_prs(c: Ctx) -> list[str]:
 
 
 def _pr_trees_clean(c: Ctx) -> list[str]:
-    """Tier 1: no task's PR head may carry `.vigil/` (it stays in the vault). The
-    record is vigild's own, written from the vault's tree of the commit it sent; no
-    record, or one that predates this rule, does not pass."""
+    """Tier 1: no task's PR head may carry `.vigil/` (it stays in the vault). Every
+    live task needs a `pr_open` row (none fails closed), and the row must name the
+    commit vigild sent now (`pr_heads`, read from the vault by the runner at the
+    move) with no job `.vigil` in its tree."""
+    heads = c.evidence.get("pr_heads")
+    heads = heads if isinstance(heads, dict) else {}
     errs: list[str] = []
     for t in c.store.list_tasks(c.job.id):
         if t.state in ("superseded", "abandoned", "merged"):
@@ -159,8 +162,16 @@ def _pr_trees_clean(c: Ctx) -> list[str]:
             "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
             (t.id,),
         )
-        if rows and json.loads(rows[0]["data"]).get("vigil_in_pr") is not False:
-            errs.append(f"the PR head of {t.id} may carry .vigil/")
+        now = heads.get(t.id)
+        if not rows:
+            errs.append(f"the PR head of {t.id} has no record")
+        elif (
+            not isinstance(now, dict)
+            or not now.get("published")
+            or now.get("vigil") is not False
+            or json.loads(rows[0]["data"]).get("published") != now["published"]
+        ):
+            errs.append(f"the PR head of {t.id} may carry .vigil/ or its record is stale")
     return errs
 
 

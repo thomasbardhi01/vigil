@@ -30,7 +30,7 @@ from tests.jobs.test_coord_loop import (  # noqa: F401
 )
 from tests.jobs.test_in_review_invariant import _plan_of
 from tests.review.test_review_stage import CHANGES, _rounds
-from vigild.github.publish import PublishError, publish
+from vigild.github.publish import LegacyBranch, PublishError, publish
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role
 from vigild.provenance import Provenance
@@ -83,7 +83,7 @@ def test_a_published_branch_has_no_vigil_and_the_vault_keeps_the_report(
     bare = fixture_repo["bare"]
     head = _session(ws, tmp_path, bare, "# Map\none\n")
     base = ws.base_sha(TID)
-    assert ws.has_vigil(REPO, head)
+    assert ws.has_vigil(REPO, head, base)
     pulls = Pulls()
     _pub(ws, head, base, pulls)
     files = git(bare, "ls-tree", "-r", "--name-only", f"refs/heads/{BRANCH}").split("\n")
@@ -95,9 +95,9 @@ def test_a_published_branch_has_no_vigil_and_the_vault_keeps_the_report(
     # the vault still holds the whole result, which readers get as vault blobs
     assert REPORT in ws.tree_paths(REPO, head)
     assert json.loads(ws.read_blob(REPO, head, REPORT) or "")["summary"] == "# Map\none\n"
-    assert ws.has_vigil(REPO, head)
+    assert ws.has_vigil(REPO, head, base)
     sent = ws.published_sha(REPO, BRANCH)
-    assert sent and not ws.has_vigil(REPO, sent)
+    assert sent and not ws.has_vigil(REPO, sent, base)
 
 
 def test_a_fix_round_moves_the_branch_forward_without_vigil(
@@ -146,18 +146,104 @@ def test_a_change_only_under_vigil_changes_nothing_for_the_target_repo(
         _pub(ws, head, base, Pulls())
 
 
-def test_a_branch_pushed_before_this_rule_is_replaced_once_and_then_moves_forward(
+def test_a_branch_sent_before_this_rule_is_refused_and_never_forced(
     ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
 ) -> None:
     bare = fixture_repo["bare"]
     head = _session(ws, tmp_path, bare, "# Map\none\n")
     base = ws.base_sha(TID)
     git(ws.vault(REPO), "push", "-q", str(bare), f"{head}:refs/heads/{BRANCH}")  # the old way
-    assert REPORT in git(bare, "ls-tree", "-r", "--name-only", BRANCH)
-    url = _pub(ws, head, base, Pulls(), existing="https://github.com/o/fixture/pull/9")
-    assert url.endswith("/9")
-    assert ".vigil" not in git(bare, "ls-tree", "-r", "--name-only", BRANCH)
-    assert git(bare, "rev-parse", f"{BRANCH}~1") == base
+    with pytest.raises(LegacyBranch, match="predates"):
+        _pub(ws, head, base, Pulls(), existing="https://github.com/o/fixture/pull/9")
+    assert git(bare, "rev-parse", BRANCH) == head  # the remote is as the owner left it
+    assert ws.published_sha(REPO, BRANCH) is None
+
+
+def _foreign_commit(bare: Path, base: str) -> str:
+    """A commit on the remote branch that is not in the vault (someone else's push)."""
+    tree = git(bare, "rev-parse", f"{base}^{{tree}}")
+    sha = git(bare, "commit-tree", tree, "-p", base, "-m", "owner's own fix")
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", sha)
+    return sha
+
+
+def test_a_remote_commit_the_vault_lacks_is_never_overwritten(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    bare = fixture_repo["bare"]
+    first = _session(ws, tmp_path, bare, "# Map\none\n")
+    base = ws.base_sha(TID)
+    url = _pub(ws, first, base, Pulls())
+    foreign = git(bare, "commit-tree", git(bare, "rev-parse", f"{BRANCH}^{{tree}}"),
+                  "-p", BRANCH, "-m", "owner's own fix")  # fmt: skip
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", foreign)
+    second = _session(ws, tmp_path, bare, "# Map\ntwo, longer\n", start=first)
+    with pytest.raises(PublishError):
+        _pub(ws, second, base, Pulls(), existing=url)
+    assert git(bare, "rev-parse", BRANCH) == foreign
+    # a first send onto a remote branch of that name fails the same way, untouched
+    ws2_foreign = _foreign_commit(bare, base)
+    ws.record_published(REPO, BRANCH, base)  # not the remote's tip
+    with pytest.raises(PublishError):
+        _pub(ws, second, base, Pulls(), existing=url)
+    assert git(bare, "rev-parse", BRANCH) == ws2_foreign
+
+
+def test_a_base_that_tracks_its_own_vigil_keeps_it_and_the_public_diff_is_exact(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    bare = fixture_repo["bare"]
+    work = tmp_path / "seedwork"
+    git(tmp_path, "clone", "-q", str(bare), str(work))
+    (work / ".vigil").mkdir()
+    (work / ".vigil" / "x").write_text("the repo's own\n")
+    git(work, "add", "-A")
+    git(work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "own .vigil")
+    git(work, "push", "-q", "origin", "HEAD:main")
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(bare))
+    head = _session(ws, tmp_path, bare, "# Map\none\n")
+    base = ws.base_sha(TID)
+    _pub(ws, head, base, Pulls())
+    sent = git(bare, "rev-parse", BRANCH)
+    files = git(bare, "ls-tree", "-r", "--name-only", sent).split("\n")
+    assert ".vigil/x" in files and REPORT not in files
+    assert git(bare, "show", f"{sent}:.vigil/x") == "the repo's own"
+    assert git(bare, "diff", "--name-only", base, sent) == "docs/feature-map.md"
+    # the guard's own question is relative to the base's `.vigil`
+    assert not ws.has_vigil(REPO, sent, base) and ws.has_vigil(REPO, head, base)
+
+
+def test_the_public_commit_is_scope_checked_too(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    bare = fixture_repo["bare"]
+    head = _session(ws, tmp_path, bare, "# Map\none\n")
+    base = ws.base_sha(TID)
+    clone = ws.clone(REPO, "fx-0001-w2", branch="vigil/fx-0001-w2-x", base="main")
+    (clone / "README.md").write_text("out of scope\n")
+    r = finish_session(clone, tmp_path / "o2", branch="vigil/fx-0001-w2-x", base_sha=base)
+    stray = ws.import_result(
+        REPO, "fx-0001-w2", tmp_path / "o2", "vigil/fx-0001-w2-x", base, head=r["head"]
+    )
+    ws.public_commit = lambda *a, **k: stray  # type: ignore[method-assign]
+    with pytest.raises(PublishError, match="outside"):
+        _pub(ws, head, base, Pulls())
+    assert ws.published_sha(REPO, BRANCH) is None  # nothing was sent
+
+
+def test_a_strip_is_deterministic_and_faithful_to_the_original_commit(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    head = _session(ws, tmp_path, fixture_repo["bare"], "# Map\none\n")
+    base = ws.base_sha(TID)
+    a = ws.public_commit(REPO, head, base, BRANCH)
+    b = ws.public_commit(REPO, head, base, BRANCH)
+    assert a == b and a != head
+    fmt = "--format=%an|%ae|%ad|%cn|%ce|%cd|%B"
+    vault = ws.vault(REPO)
+    ours = git(vault, "log", "-1", "--date=raw", fmt, a)
+    theirs = git(vault, "log", "-1", "--date=raw", fmt, head)
+    assert ours == theirs and "vigild:" not in ours
 
 
 # --- the ready guard -----------------------------------------------------------------------
@@ -187,24 +273,55 @@ def _mark(w: World, job: str, value: bool | None) -> None:
         )  # fmt: skip
 
 
-@pytest.mark.parametrize("value", [True, None])
-def test_a_job_cannot_enter_ready_while_a_pr_head_may_carry_vigil(
-    world: World, value: bool | None
+def _heads(w: World, job: str) -> dict[str, Any]:
+    return w.runner._pr_heads(job)  # type: ignore[no-any-return]
+
+
+def _try_ready(w: World, job: str, **evidence: Any) -> str:
+    with pytest.raises(TransitionError) as e:
+        transition(w.store, job, S.READY, Actor.VIGILD, evidence=evidence)
+    return str(e.value)
+
+
+def test_the_ready_guard_passes_vigils_own_part_when_the_evidence_is_current(
+    world: World,
 ) -> None:
     w = world
     job = _held_in_review(w)
-    _mark(w, job, value)
-    with pytest.raises(TransitionError, match=r"may carry \.vigil/"):
-        transition(w.store, job, S.READY, Actor.VIGILD)
+    msg = _try_ready(w, job, pr_heads=_heads(w, job))
+    assert "PR head" not in msg  # refused for its missing reviews only
 
 
-def test_a_clean_record_does_not_trip_the_guard(world: World) -> None:
+def test_the_ready_guard_needs_the_live_evidence(world: World) -> None:
     w = world
     job = _held_in_review(w)
-    _mark(w, job, False)
-    with pytest.raises(TransitionError) as e:
-        transition(w.store, job, S.READY, Actor.VIGILD)
-    assert ".vigil/" not in str(e.value)  # refused for its missing reviews only
+    assert "PR head" in _try_ready(w, job)  # fails closed with none
+
+
+def test_a_stale_event_fails_the_ready_guard(world: World) -> None:
+    w = world
+    job = _held_in_review(w)
+    for t in w.store.list_tasks(job):  # a later send changed the sha the event names
+        w.store.add_event(
+            "pr_open", {**_latest(w, t.id), "published": "0" * 40}, Provenance.HUMAN,
+            job_id=job, task_id=t.id,
+        )  # fmt: skip
+    assert "PR head" in _try_ready(w, job, pr_heads=_heads(w, job))
+
+
+def test_a_pr_head_that_carries_vigil_fails_the_ready_guard(world: World) -> None:
+    w = world
+    job = _held_in_review(w)
+    heads = {t: {**h, "vigil": True} for t, h in _heads(w, job).items()}
+    assert "PR head" in _try_ready(w, job, pr_heads=heads)
+
+
+def test_a_missing_pr_open_row_fails_the_ready_guard(world: World) -> None:
+    w = world
+    job = _held_in_review(w)
+    heads = _heads(w, job)
+    w.store.x("DELETE FROM events WHERE type='pr_open' AND job_id=?", (job,))
+    assert "PR head" in _try_ready(w, job, pr_heads=heads)
 
 
 # --- the runner ----------------------------------------------------------------------------
@@ -277,20 +394,47 @@ def _spec(w: World, job: str) -> str:
     return SPEC
 
 
-def test_an_old_record_is_sent_again_without_vigil_before_the_job_is_ready(world: World) -> None:
+def test_a_stale_event_is_rewritten_when_the_branch_is_right(world: World) -> None:
     w = world
     job = _held_in_review(w)
-    _mark(w, job, None)  # as a PR opened before this rule: no record either way
+    for t in w.store.list_tasks(job):
+        w.store.add_event(
+            "pr_open", {**_latest(w, t.id), "published": "0" * 40, "vigil_in_pr": None},
+            Provenance.HUMAN, job_id=job, task_id=t.id,
+        )  # fmt: skip
     w.runner.review(job)
     assert w.store.get_job(job).state is S.READY
     for t in w.store.list_tasks(job):
-        assert _latest(w, t.id)["vigil_in_pr"] is False
+        assert _latest(w, t.id)["published"] == w.runner.workspace.published_sha(
+            REPO, _latest(w, t.id)["branch"]
+        )
+
+
+def test_a_pre_change_pr_pages_for_the_owner_and_nothing_is_forced(world: World) -> None:
+    w = world
+    job = _held_in_review(w)
+    vault = w.runner.workspace.vault(REPO)
+    before = {}
+    for t in w.store.list_tasks(job):
+        branch = _latest(w, t.id)["branch"]
+        git(vault, "update-ref", "-d", w.runner.workspace._pub_ref(branch))  # no record
+        before[branch] = git(w.bare, "rev-parse", branch)
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.BLOCKED
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in qs if q["job_id"] == job and q["body"].get("kind") == "vigil_in_pr"]
+    assert item["body"]["actions"] == ["replan", "abandon"]
+    assert not item["body"]["resumable"] and "predates" in json.dumps(item["body"])
+    assert {b: git(w.bare, "rev-parse", b) for b in before} == before
 
 
 def test_a_pr_that_cannot_be_cleaned_pages_with_retry_and_abandon(world: World) -> None:
     w = world
     job = _held_in_review(w)
-    _mark(w, job, True)
+    ws = w.runner.workspace
+    for t in w.store.list_tasks(job):  # the record is behind: the branch must be sent again
+        ev = _latest(w, t.id)
+        ws.record_published(REPO, ev["branch"], ev["base_sha"])
     real = w.publisher.publish
 
     def refuse(**kw: Any) -> str:

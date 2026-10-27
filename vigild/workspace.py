@@ -556,22 +556,26 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
 
-    def push(
-        self, repo: str, head: str, branch: str, token: str | None, *, force: bool = False
-    ) -> None:
+    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
         self._git(
             self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
-            f"{'+' if force else ''}{head}:refs/heads/{branch}", token=token,
+            f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
 
     # --- what reaches the target repo (Tier 1: `.vigil/` stays in the vault) ---------------
 
-    def has_vigil(self, repo: str, sha: str) -> bool:
-        """Does `sha`'s tree carry a top-level `.vigil` (any case, any kind)?"""
+    def _vigil_entries(self, repo: str, sha: str) -> list[str]:
+        """`sha`'s top-level `.vigil` tree entries (any case, any kind), as ls-tree
+        prints them."""
         if not SHA.match(sha):
             raise WorkspaceError("bad sha")
-        out = self._git(self.vault(repo), "ls-tree", "-z", "--name-only", sha)
-        return any(n.lower() == VIGIL_DIR for n in out.split("\0") if n)
+        out = self._git(self.vault(repo), "ls-tree", "-z", sha)
+        return sorted(e for e in out.split("\0") if e and e.partition("\t")[2].lower() == VIGIL_DIR)
+
+    def has_vigil(self, repo: str, sha: str, base_sha: str) -> bool:
+        """Does `sha`'s top-level `.vigil` differ from the base's? A repo's own
+        tracked `.vigil` is not the job's, so it does not count."""
+        return self._vigil_entries(repo, sha) != self._vigil_entries(repo, base_sha)
 
     def _pub_ref(self, branch: str) -> str:
         return "refs/vigil/pub/" + hashlib.sha256(branch.encode()).hexdigest()[:24]
@@ -592,22 +596,24 @@ class Workspace:
         self._git(self.vault(repo), "update-ref", self._pub_ref(branch), sha)
 
     def public_commit(self, repo: str, head: str, base_sha: str, branch: str) -> str:
-        """The commit to send for the vault's `head`: `head` itself when it has no
-        `.vigil/` and nothing went to `branch` before; otherwise a commit of the
-        same tree without `.vigil/`, on the last commit sent to `branch` (or the
+        """The commit to send for the vault's `head`: `head` itself when its
+        top-level `.vigil` is the base's and nothing went to `branch` before;
+        otherwise a commit of the same tree with that entry replaced by the base's
+        (removed if the base has none), on the last commit sent to `branch` (or the
         base), so the branch only moves forward and never carries the job's
-        artifacts. The vault keeps `head` whole."""
+        artifacts. It keeps the head commit's author, committer, dates and message,
+        so the same inputs give the same commit. The vault keeps `head` whole."""
         if not (SHA.match(head) and SHA.match(base_sha)):
             raise WorkspaceError("bad sha")
         vault = self.vault(repo)
         prev = self.published_sha(repo, branch)
-        if prev is None and not self.has_vigil(repo, head):
+        if prev is None and not self.has_vigil(repo, head, base_sha):
             return head
         entries = [
             e
             for e in self._git(vault, "ls-tree", "-z", head).split("\0")
             if e and e.partition("\t")[2].lower() != VIGIL_DIR
-        ]
+        ] + self._vigil_entries(repo, base_sha)
         try:
             tree = git(vault, "mktree", "-z", "--missing", stdin="\0".join(entries) + "\0")
         except GitError as e:
@@ -615,9 +621,23 @@ class Workspace:
         parent = prev or base_sha
         if self._git(vault, "rev-parse", f"{parent}^{{tree}}") == tree:
             return parent
-        subject = self._git(vault, "log", "-1", "--format=%s", head)
-        return self._git(
-            vault, "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}",
-            "commit-tree", tree, "-p", parent, "-m",
-            f"{subject}\n\nvigild: the job's .vigil/ artifacts stay in vigild's vault.",
-        )  # fmt: skip
+        meta = self._git(
+            vault,
+            "log",
+            "-1",
+            "--date=raw",
+            "--format=%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd",
+            head,
+        ).split("\0")
+        if len(meta) != 6:
+            raise WorkspaceError("unreadable head commit")
+        env = dict(zip(
+            ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+             "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"),
+            meta, strict=True,
+        ))  # fmt: skip
+        try:
+            message = git(vault, "log", "-1", "--format=%B", head, raw=True)
+            return git(vault, "commit-tree", tree, "-p", parent, stdin=message, env=env)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
