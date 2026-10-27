@@ -869,7 +869,7 @@ class Gateway:
                 )  # fmt: skip
                 self.store.create_inbox_item(
                     "questions", "page", job_id,
-                    f"metering failed: {reason}; spend for a {purpose} call not booked",
+                    f"metering failed: {reason}; {purpose} call booked at its reservation",
                     {"purpose": purpose, "booked_usd": amount,
                      "note": f"Metering failed for this call; its cost was booked at its "
                      f"reservation (${amount:.4f}). The call may also have been recorded, "
