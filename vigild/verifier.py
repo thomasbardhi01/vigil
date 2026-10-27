@@ -675,6 +675,9 @@ class Verifier:
             }
         if before is not None:
             record["ids"] = self._ids(before, after, tests)
+        else:
+            # #31 item 1: no "before" run, so name the worker's tests from the after run
+            record["ids"] = self._ids_after(after, tests)
         if hidden is not None:
             record["hidden"] = self._hidden_pair(
                 repo, image, task_id, base_sha, head, hidden, cfg, overlap,
@@ -992,6 +995,21 @@ class Verifier:
             "checked": True,
             "failing_before": failing,
             "not_passing_after": sorted(i for i in failing if i not in passing),
+        }
+
+    @staticmethod
+    def _ids_after(after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
+        """must_fail_first off: the worker's tests are the cases in the test files
+        it added or changed (as in `_ids`), read from the after run. Only a pass
+        counts as run; skipped, xfail and todo do not."""
+        if not after.get("_report"):
+            return {"checked": False, "note": "test ids not checked: the runner gave no report"}
+        mine = [c for c in after.get("_cases") or [] if belongs(c, tests)]
+        return {
+            "checked": True,
+            "mode": "after_only",
+            "worker_ran": sum(1 for c in mine if c.status == "pass"),
+            "not_passing_after": sorted(c.id for c in mine if c.status in ("failure", "error")),
         }
 
     def _run(

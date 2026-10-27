@@ -779,3 +779,64 @@ def test_one_erroring_test_among_failing_ones_is_rejected(ws: Workspace, tmp_pat
         runner_config=[], overlap=[],
     )  # fmt: skip
     assert not got["ok"] and got["failing"] == 1 and got["errors"] == 1
+
+
+# --- #31 item 1: must_fail_first off still needs the worker's own tests to run ---------------
+
+
+def _tests_only(c: Path) -> None:
+    (c / "tests" / "test_pinned.py").write_text("def test_pinned():\n    assert 2 > 1\n")
+
+
+def test_mff_off_names_the_workers_tests_from_the_after_run(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _session(ws, tmp_path, _tests_only)
+    rec = _verify(ws, base, head, mff=False)
+    assert "before" not in rec  # no extra run
+    assert rec["ids"] == {
+        "checked": True,
+        "mode": "after_only",
+        "worker_ran": 1,
+        "not_passing_after": [],
+    }
+
+
+def test_mff_off_with_no_test_changes_counts_zero(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        (c / "docs" / "feature-map.md").write_text("rate limit\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["checked"] is True and ids["worker_ran"] == 0
+
+
+def test_mff_off_a_skipped_worker_test_does_not_count(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_skipped.py").write_text(
+            "import pytest\n\n\n@pytest.mark.skip\ndef test_s():\n    assert False\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["worker_ran"] == 0 and ids["not_passing_after"] == []
+
+
+def test_mff_off_a_failing_worker_test_is_named(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_bad.py").write_text("def test_bad():\n    assert 1 == 2\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    ids = _verify(ws, base, head, mff=False)["ids"]
+    assert ids["not_passing_after"] == ["tests.test_bad::test_bad"]
+
+
+def test_mff_off_reads_vitest_reports_and_skips_todo() -> None:
+    from vigild.verifier import Verifier, parse_junit
+
+    xml = (
+        b'<testsuites><testsuite name="a"><testcase classname="test/a.test.ts" name="ok"/>'
+        b'<testcase classname="test/a.test.ts" name="later"><skipped/></testcase>'
+        b'<testcase classname="test/old.test.ts" name="old"/></testsuite></testsuites>'
+    )
+    cases = parse_junit(xml)
+    ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["server/test/a.test.ts"])
+    assert ids["worker_ran"] == 1 and ids["not_passing_after"] == []
