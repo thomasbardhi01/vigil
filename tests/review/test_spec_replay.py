@@ -531,3 +531,38 @@ def test_the_cli_prints_a_refusal_and_fails(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(config, "load_secrets", lambda: config.Secrets({"VIGIL_API_TOKEN": "t"}))
     out = CliRunner().invoke(app, ["spec", "replay", "vi-0002", "--packet", "x"])
     assert out.exit_code == 1 and "unknown packet variant" in out.output
+
+
+def test_the_replay_gate_must_read_the_base_not_the_tip_end_to_end(
+    world: World, tmp_path: Path
+) -> None:
+    """The gate refuses a bare directory in scope (`use dir/**`), which it learns by reading
+    the repo. A directory that exists only at the base fails a base-keyed gate and passes a
+    tip-keyed one; a directory that exists only at the tip is the reverse."""
+    w = world
+    job = _approved(w)
+    ws, jobs = w.runner.workspace, w.runner.jobs
+    assert jobs is not None
+    # the live wiring (vigild/server.py): readers keyed by the branch, read at its tip
+    jobs.files = lambda repo, base: lambda path: ws.mirror_file(repo, base, path)
+    jobs.dirs = lambda repo, base: lambda path: ws.mirror_is_dir(repo, base, path)
+    work = tmp_path / "tipwork"
+    git(tmp_path, "clone", "-q", str(w.bare), str(work))
+    (work / "fresh").mkdir()
+    (work / "fresh" / "x.txt").write_text("x\n")  # a directory only the tip has
+    git(work, "rm", "-rq", "docs")  # a directory only the base has
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", "tip moves")
+    git(work, "push", "-q", "origin", "HEAD:main")
+
+    def draft(entry: str) -> None:
+        text = SPEC.replace("## Files in scope\n", f"## Files in scope\n- `{entry}`\n")
+        w.standin.coord_drafts = [lambda j: (text, plan(j))]
+
+    draft("docs")  # a directory at the base, gone at the tip
+    out = _post(w, job).json()
+    assert out["status"] == "done" and out["gate"]["ok"] is False, out
+    assert any("docs" in e and "dir/**" in e for e in out["gate"]["errors"]), out["gate"]
+    draft("fresh")  # a directory at the tip, not at the base
+    out = _post(w, job).json()
+    assert out["status"] == "done" and out["gate"]["ok"] is True, out
