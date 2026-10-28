@@ -443,6 +443,7 @@ class JobRunner:
                              "actions": ["retry", "abandon"]},
                             resumable=True,
                         )  # fmt: skip
+                    self._close_killed(j)  # a run that outlived the kill's wait ends here
                     with self._running_lock:
                         run = next_run(j)
                         if run is None:
@@ -883,7 +884,7 @@ class JobRunner:
         actually reached the cap. Anything else (open reservations fill the
         day, a wave too big for what's left) is the job's own problem: None,
         and the caller pages the job."""
-        if e.cap in ("experiment", "bench_task"):
+        if e.cap in ("experiment", "bench_task", "abandoned"):
             return None  # the experiment line is its own hard stop; no global breaker
         kind = CAP_KIND.get(e.cap, Kind.DAILY)
         if kind is Kind.PER_TASK and task_id and self.budget.task_spent(task_id) > 0:
@@ -1304,6 +1305,16 @@ class JobRunner:
             return self.store.get_job(job_id).state is JobState.ABANDONED
         except KeyError:
             return False
+
+    def _close_killed(self, job_id: str) -> None:
+        """A session of an abandoned job always ends `killed` (#60), including when its run
+        outlived the kill's wait or halted in the verifier. Only the task reset, the failure
+        event and the page are skipped."""
+        if not self._abandoned(job_id):
+            return
+        for s in self.store.list_sessions(job_id):
+            if s.status in LIVE_SESSION:
+                self.store.update_session(s.id, status="killed", ended_at=iso())
 
     def busy(self, job_id: str) -> bool:
         """Whether a run already holds the job (a second start would be dropped)."""
@@ -2555,6 +2566,7 @@ class JobRunner:
         state: str = "failed",
     ) -> bool:
         if self._abandoned(job_id):  # killed: the close-out stands; nothing resets it
+            self._close_killed(job_id)  # but its session ends `killed`, never left running
             return False
         if s is not None:
             self.store.update_session(s.id, status=state)
@@ -2792,6 +2804,9 @@ class JobRunner:
             s.id, detail={"image": session_image, "session_base": session_base}
         )
         out = self._run_session(s, spec, reservation, attrs)
+        if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
+            self._close_killed(job_id)
+            return False
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
             self.store.update_session(s.id, status="crashed")
@@ -2929,6 +2944,7 @@ class JobRunner:
                         scope=list(contract["spec"].get("files_in_scope") or []),
                     )
             except Halted:
+                self._close_killed(job_id)
                 return False  # killed between two runs: no verdict and nothing is written
             except HostRefused as e:  # the grader's host refused: no verdict
                 self._host_refused(job_id, e, "the grader")
@@ -3691,6 +3707,8 @@ class JobRunner:
             return "dispatch" if moved else "done"
         if more:
             return "next"  # clean so far; the next pass reviews the rest
+        if self._abandoned(job_id):
+            return "done"  # killed during the pass: nothing more is written
         left, legacy = self._unstripped(self.store.get_job(job_id))
         if left:
             self._block(job_id, f".vigil/ on the PR head of {sorted(left)}")

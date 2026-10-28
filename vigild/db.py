@@ -593,6 +593,27 @@ class Store:
         rows = self.q("SELECT source FROM jobs WHERE id=?", (job_id,))
         return bool(rows) and rows[0][0] == "bench"
 
+    def is_abandoned(
+        self,
+        *,
+        job_id: str | None = None,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> bool:
+        """Whether a record belongs to an abandoned job (killed, or abandoned from the
+        inbox), found through whichever of the job, its session or its task the caller
+        has. Nothing new is opened for such a job (#60)."""
+        if job_id is None and session_id is not None:
+            rows = self.q("SELECT job_id FROM sessions WHERE id=?", (session_id,))
+            job_id = rows[0][0] if rows else None
+        if job_id is None and task_id is not None:
+            rows = self.q("SELECT job_id FROM tasks WHERE id=?", (task_id,))
+            job_id = rows[0][0] if rows else None
+        if job_id is None:
+            return False
+        rows = self.q("SELECT state FROM jobs WHERE id=?", (job_id,))
+        return bool(rows) and rows[0][0] == "abandoned"
+
     # --- review replays (#47) ---------------------------------------------------------------
 
     def is_replay(self, session_id: str | None) -> bool:
@@ -1118,6 +1139,20 @@ class Store:
         body: Mapping[str, Any],
         provenance: Provenance | str = Provenance.HUMAN,
     ) -> InboxItem:
+        if job_id is not None and self.is_abandoned(job_id=job_id):
+            # one guard for every page and item path (#60): a killed job gets none. The
+            # caller gets a closed item that is not stored, and the event says what was dropped.
+            self.add_event(
+                "inbox_item_suppressed",
+                {"queue": queue, "kind": kind, "title": title[:200]},
+                Provenance.HUMAN,
+                job_id=job_id,
+            )
+            return InboxItem(
+                id=0, queue=queue, kind=kind, job_id=job_id, title=title, body=dict(body),
+                status="resolved", created_at=iso(), resolved_at=iso(), resolved_by="abandoned",
+                provenance=Provenance.HUMAN.value,
+            )  # fmt: skip
         iid = self.x(
             "INSERT INTO inbox_items (queue, kind, job_id, title, body, created_at, provenance)"
             " VALUES (?,?,?,?,?,?,?)",

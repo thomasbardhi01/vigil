@@ -735,6 +735,8 @@ class JobService:
         nobody: the page is recorded
         as an event (and its item closed at once), for the run's report."""
         body = {**body, "resumable": resumable}
+        if job_id is not None and self.store.is_abandoned(job_id=job_id):
+            return self.store.create_inbox_item("questions", "page", job_id, title, body)
         if job_id is not None and self.store.is_bench(job_id=job_id):
             item = self.store.create_inbox_item("questions", "page", job_id, title, body)
             self.store.resolve_inbox_item(item.id, "bench")
