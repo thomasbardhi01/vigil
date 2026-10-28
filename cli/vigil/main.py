@@ -298,11 +298,17 @@ def batch_submit(file: Annotated[Path, typer.Argument(help="a batch YAML file")]
 @batch_app.command("status")
 def batch_status(batch: str = typer.Argument(..., help="a batch id, e.g. b-0001")) -> None:
     """Each job's state and cost, and the total (spent plus held)."""
+    import re
+    from urllib.parse import quote
+
     import httpx2
 
+    if not re.fullmatch(r"b-[0-9]+", batch):
+        typer.echo("a batch id looks like b-0001")
+        raise typer.Exit(1)
     with _api_client() as client:
         try:
-            r = client.get(f"/api/batch/{batch}")
+            r = client.get(f"/api/batch/{quote(batch, safe='')}")
         except httpx2.HTTPError as e:
             typer.echo(f"could not reach vigild: {type(e).__name__}")
             raise typer.Exit(1) from e

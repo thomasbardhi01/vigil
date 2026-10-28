@@ -191,3 +191,13 @@ def test_batch_status_prints_each_job_and_the_total(monkeypatch: pytest.MonkeyPa
 def test_batch_status_of_an_unknown_batch_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
     _api(monkeypatch, 404, {"detail": "no such batch"})
     assert CliRunner().invoke(app, ["batch", "status", "b-9"]).exit_code == 1
+
+
+def test_batch_status_refuses_an_id_that_is_not_a_batch_id_before_any_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _api(monkeypatch, 200, {})
+    for bad in ("../x", "b-1/../../jobs", "b-0001?x=1", "x", "b-", "B-1", ""):
+        out = CliRunner().invoke(app, ["batch", "status", bad])
+        assert out.exit_code == 1, bad
+    assert seen == []

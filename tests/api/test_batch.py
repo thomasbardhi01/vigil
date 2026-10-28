@@ -277,3 +277,28 @@ def test_approve_all_leaves_other_batches_and_jobs_alone(
     assert store.get_job(one["jobs"][0]).state is JobState.APPROVED
     assert store.get_job(two["jobs"][0]).state is JobState.SPEC_PENDING
     assert store.get_job(solo).state is JobState.SPEC_PENDING
+
+
+def test_approve_all_goes_on_past_a_job_that_raises_and_lists_it(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner
+) -> None:
+    ids = _post(client, tokens, [_job(1), _job(2), _job(3)]).json()
+    a, b, c = ids["jobs"]
+    for jid in (a, b, c):
+        _spec_item(store, jid)
+    ok = runner.on_approved
+
+    def flaky(job_id: str) -> None:
+        if job_id == b:
+            raise RuntimeError("the runner fell over")
+        ok(job_id)
+
+    runner.on_approved = flaky  # type: ignore[method-assign]
+    r = client.post(f"/api/batch/{ids['batch_id']}/approve-all", headers=auth(tokens.admin))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert [x["job_id"] for x in out["approved"]] == [a, c] and out["skipped"] == []
+    (bad,) = out["failed"]
+    assert bad["job_id"] == b and bad["error"] == "RuntimeError"
+    assert "fell over" in bad["message"]
+    assert runner.approved == [a, c]
