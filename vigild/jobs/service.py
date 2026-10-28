@@ -59,6 +59,7 @@ class Runner(Protocol):
         self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
     ) -> dict[str, Any]: ...
     def replay_set(self, prompt_version: str) -> dict[str, Any]: ...
+    def replay_spec(self, job_id: str, packet_variant: str) -> dict[str, Any]: ...
 
 
 class SubmitError(ValueError):
@@ -242,7 +243,15 @@ class JobService:
         return r.reasons if r.outcome is IntakeOutcome.PROPOSE else []
 
     def _gate(
-        self, repo: str, spec_text: str, plan_text: str, base: str, job_id: str | None = None
+        self,
+        repo: str,
+        spec_text: str,
+        plan_text: str,
+        base: str,
+        job_id: str | None = None,
+        *,
+        read: Callable[[str], str | None] | None = None,
+        is_dir: Callable[[str], bool] | None = None,
     ) -> list[str]:
         return check_job_spec(
             parse_spec(spec_text),
@@ -251,11 +260,29 @@ class JobService:
             missing_tools=lambda cmd: missing_tools(self.cfg, repo, cmd),
             # the base's files, so the gate resolves package scripts as the
             # verifier will (round 4, item 6)
-            read=self.files(repo, base) if self.files is not None else None,
-            is_dir=self.dirs(repo, base) if self.dirs is not None else None,
+            read=read or (self.files(repo, base) if self.files is not None else None),
+            is_dir=is_dir or (self.dirs(repo, base) if self.dirs is not None else None),
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
         )
+
+    def gate_drafts(
+        self,
+        repo: str,
+        spec_text: str,
+        plan_text: str,
+        base: str,
+        *,
+        read: Callable[[str], str | None] | None = None,
+        is_dir: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """The spec gate's errors for drafts held as text: stores nothing, files nothing
+        (a spec replay's one gate run). `read` and `is_dir` (a replay's, keyed by the base
+        sha) replace the live branch-tip readers. A draft that can't be parsed is an error."""
+        try:
+            return self._gate(repo, spec_text, plan_text, base, None, read=read, is_dir=is_dir)
+        except Exception as e:
+            return [f"the draft can't be parsed: {type(e).__name__}: {e}"[:300]]
 
     def _first_call_fits(self, repo: str) -> None:
         """Preflight: refuse, with the numbers, a job whose roles' first calls

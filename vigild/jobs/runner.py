@@ -111,6 +111,7 @@ from vigild.review.replay import (
     ReplayInvalid,
     ReplayNotFound,
     ReplayRefused,
+    ac_coverage,
     load_cases,
     resolve_prompt,
     run_set,
@@ -186,6 +187,16 @@ class Pager(Protocol):
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def gate_spec(self, job_id: str) -> list[str]: ...
+    def gate_drafts(
+        self,
+        repo: str,
+        spec_text: str,
+        plan_text: str,
+        base: str,
+        *,
+        read: Callable[[str], str | None] | None = None,
+        is_dir: Callable[[str], bool] | None = None,
+    ) -> list[str]: ...
     def approve_bench(self, job_id: str) -> Any: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
@@ -1185,7 +1196,11 @@ class JobRunner:
                         try:
                             out = self.executor.run(spec, token, self._event_sink(s))
                         except HostRefused as e:  # no host may run it: nothing ran
-                            self._host_refused(spec.job_id, e, "the session")
+                            if self.store.is_replay(s.id):
+                                # a replay pages nobody and files nothing on the job it copies
+                                self.store.gate_refuse_replay(s.id, f"host_refused: {e}"[:500])
+                            else:
+                                self._host_refused(spec.job_id, e, "the session")
                             out = ExecOutcome("failed", None, {}, f"sandbox host refused: {e}")
                     tr.set("vigil.status", out.status)
                     if cap is not None:  # a review or audit: did it go past its cap?
@@ -1704,7 +1719,7 @@ class JobRunner:
                 )  # fmt: skip
         self.store.add_event(
             "packet",
-            {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
+            {"role": "coord", "attempt": attempt, "dropped": packet.dropped, "base_sha": base_sha},
             Provenance.HUMAN,
             job_id=job_id,
             session_id=coord.id,
@@ -4260,6 +4275,8 @@ class JobRunner:
         except (StaleDevImage, HostRefused) as e:  # DevImages paged a stale image with Rebuild
             self.budget.settle(rid)
             self.store.update_session(s.id, status="failed")
+            if replay is not None:
+                raise ReplayRefused(409, f"the sandbox image isn't ready: {e}"[:300]) from e
             if isinstance(e, HostRefused):
                 self._host_refused(job.id, e, "the review session")
             return None, f"the sandbox image isn't ready: {e}"[:300]
@@ -4453,6 +4470,214 @@ class JobRunner:
             load_cases(),
         )
         return {"prompt_version": prompt_version, "prompt_sha256": prompt.sha256, **report}
+
+    # --- spec replay (ADR-0005 part 7) ------------------------------------------------------
+
+    def _spec_replay_base(self, job_id: str, approved_at: str) -> tuple[str, str]:
+        """The base sha the approved spec was drafted on, and where it came from: the
+        `base_sha` of the last coord packet event at or before the approval
+        (`packet_event`), else, for a job from before the event carried it, the clone record
+        of the coord attempt numbered by the coord sessions begun by the approval
+        (`clone_record`, the last resort). Always vigild's own record."""
+        rows = self.store.q(
+            "SELECT data, ts FROM events WHERE job_id=? AND type='packet' ORDER BY id", (job_id,)
+        )
+        early = [
+            str(d["base_sha"]) for r in rows
+            if (d := json.loads(r["data"])).get("role") == "coord" and d.get("base_sha")
+            and str(r["ts"]) <= approved_at
+        ]  # fmt: skip
+        if early:
+            return early[-1], "packet_event"
+        n = len(
+            [x for x in self.store.list_sessions(job_id)
+             if x.role is Role.COORD and str(x.created_at) <= approved_at]
+        )  # fmt: skip
+        try:
+            return self.workspace.base_sha(f"{job_id}-coord{max(n, 1)}"), "clone_record"
+        except (OSError, ValueError, KeyError, WorkspaceError) as e:
+            raise ReplayInvalid(f"no record of the base {job_id}'s spec was drafted on") from e
+
+    def _session_tokens(self, session_id: str | None) -> dict[str, int]:
+        rows = self.store.q(
+            "SELECT COALESCE(SUM(tokens_in),0) i, COALESCE(SUM(tokens_cache_read),0) cr,"
+            " COALESCE(SUM(tokens_cache_write_5m),0) w5, COALESCE(SUM(tokens_cache_write_1h),0) w1,"
+            " COALESCE(SUM(tokens_out),0) o FROM model_calls WHERE session_id=?",
+            (session_id,),
+        )
+        r = rows[0]
+        return {"in": int(r["i"]), "cache_read": int(r["cr"]), "cache_write_5m": int(r["w5"]),
+                "cache_write_1h": int(r["w1"]), "out": int(r["o"])}  # fmt: skip
+
+    def replay_spec(self, job_id: str, packet_variant: str) -> dict[str, Any]:
+        """Re-draft a job's approved spec in one coord session (`POST /api/spec/replay`).
+        It drafts from the job's original request and notes at the base the approved spec
+        was drafted on, with the chosen packet variant, on the experiment line; every row is
+        `eval-only`. The gate runs once on the draft (no re-draft); nothing is imported to
+        the job, published or filed, and the job is unchanged. Reports the gate, AC coverage
+        against the approved spec, the packet's size, the tokens and the cost."""
+        assemble = COORD_PACKETS.get(packet_variant)
+        if assemble is None:
+            raise ReplayInvalid(
+                f"unknown packet variant {packet_variant!r}; one of {sorted(COORD_PACKETS)}"
+            )
+        try:
+            job = self.store.get_job(job_id)
+        except KeyError as e:
+            raise ReplayNotFound(f"no such job: {job_id}") from e
+        approval = self.store.get_artifact(job.id, "approval.json")
+        if approval is None:
+            raise ReplayInvalid(f"{job.id} has no approved spec")
+        before = self.store.spec_before(job.id, approval.id) or self.store.get_artifact(
+            job.id, "spec.md"
+        )
+        if before is None:
+            raise ReplayInvalid(f"{job.id} has no approved spec")
+        approved_spec = spec_body(before.content)
+        base_sha, base_source = self._spec_replay_base(job.id, approval.created_at)
+        open_ = self.breakers.open_breakers()
+        if open_:
+            raise ReplayRefused(
+                409, "a breaker is open: " + ", ".join(f"{b.kind.value}:{b.scope}" for b in open_)
+            )
+        errors = repo_rule_errors(self.cfg, job.repo, live_private(job.repo))
+        if errors:
+            raise ReplayRefused(403, "the private-repo rule: " + "; ".join(errors)[:300])
+        preset = self._healthy(self.cfg.routing.coord)
+        if preset is None:
+            raise ReplayRefused(409, "the coord's backend breaker is open")
+        rid = self.store.create_replay(job.id, "", base_sha, packet_variant, "", kind="spec")
+        try:
+            self._spec_replay_session(
+                job, rid, preset, assemble, base_sha, approved_spec, base_source
+            )
+        except ReplayRefused as e:
+            self.store.finish_replay(rid, "refused", error=str(e)[:1000])
+            raise
+        except Exception as e:
+            log.exception("spec replay %s failed", rid)
+            self.store.finish_replay(rid, "failed", error=f"vigild error: {type(e).__name__}")
+        return self._spec_replay_result(rid)
+
+    def _spec_replay_session(
+        self,
+        job: Any,
+        rid: str,
+        preset: str,
+        assemble: Any,
+        base_sha: str,
+        approved_spec: str,
+        base_source: str,
+    ) -> None:
+        branch = f"vigil/{rid}-spec"
+        s = self.store.create_session(
+            None, Role.COORD, backend_preset=preset, branch=branch,
+            provenance=Provenance.EVAL_ONLY,
+        )  # fmt: skip
+        self.store.link_replay(rid, s.id)  # from here the session books to the experiment line
+        amount = self.cfg.budgets.coord_session_usd
+        try:
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
+            res = self.budget.reserve(session_id=s.id, task_id=None, amount=amount, purpose="coord")
+        except (RepoPolicyError, BudgetExceeded) as e:
+            self.store.update_session(s.id, status="refused")
+            raise ReplayRefused(403 if isinstance(e, RepoPolicyError) else 409, str(e)) from e
+        try:
+            clone_id = f"{rid}-coord"
+            clone = self.workspace.clone(
+                job.repo, clone_id, branch=branch, base=job.base, start=base_sha,
+                record_as=base_sha,
+            )  # fmt: skip
+            meta_art = self.store.get_artifact(job.id, "intake.json")
+            meta = json.loads(meta_art.content) if meta_art else {}
+            request = {
+                "job_id": job.id, "repo": job.repo, "base": job.base, "base_sha": base_sha,
+                "branch": branch, "title": job.title, "request": job.request,
+                "notes": job.notes, "why": meta.get("why"), "value": meta.get("value"),
+                "risk": meta.get("risk"), "existing_task_ids": [],
+            }  # fmt: skip
+            untrusted: dict[str, str] = {}
+            issue = issue_text(self.store, job.id)
+            if issue is not None:
+                untrusted["github issue"] = issue
+            self.workspace.write_task(clone, request)
+            packet = assemble(clone, request, untrusted=untrusted, gate_errors=None)
+            session_image = self._session_image(job.repo, base_sha)
+            spec = SessionSpec(
+                session_id=s.id, role=Role.COORD, job_id=job.id, task_id=None, repo=job.repo,
+                preset=preset, model=self.cfg.preset(preset).model or "", clone=clone,
+                session_dir=self._session_dir(s.id), max_turns=40, max_minutes=COORD_MINUTES,
+                max_budget_usd=amount, mounts=self.workspace.overlays(clone),
+                packet=packet.text, image=session_image,
+                max_output_tokens=self.cfg.budgets.session_max_output_tokens,
+            )  # fmt: skip
+            out = self._run_session(
+                s, spec, res, {"vigil.job_id": job.id, "vigil.role": "coord",
+                               "vigil.repo": job.repo, "vigil.attempt": 1},
+            )  # fmt: skip
+        except (StaleDevImage, HostRefused) as e:
+            self.budget.settle(res)
+            self.store.update_session(s.id, status="failed")
+            raise ReplayRefused(409, redact(f"the sandbox isn't ready: {e}")[:1000]) from e
+        except Exception:
+            self.budget.settle(res)
+            self.store.update_session(s.id, status="failed")
+            raise
+        cost = round(session_cost(self.store, s.id), 6)
+        base_result: dict[str, Any] = {
+            "packet_chars": len(packet.text), "tokens": self._session_tokens(s.id),
+            "base_source": base_source,
+            "gate": None, "ac_coverage": None,
+        }  # fmt: skip
+        gate_refused = str(self.store.get_replay(rid)["error"] or "").startswith("gate_refused")
+        if gate_refused or out.status != "done":
+            self.store.update_session(s.id, status="failed")
+            self.store.finish_replay(
+                rid, "refused" if gate_refused else "failed", cost_usd=cost,
+                error=redact(out.error or out.status)[:1000], result=base_result,
+            )  # fmt: skip
+            return
+        try:
+            head = self.workspace.import_result(
+                job.repo, clone_id, spec.session_dir / "out", branch, base_sha,
+                head=str(out.result.get("head") or ""),
+            )  # fmt: skip
+        except WorkspaceError as e:
+            self.store.update_session(s.id, status="failed")
+            self.store.finish_replay(
+                rid, "failed", cost_usd=cost, error=redact(str(e))[:1000], result=base_result
+            )
+            return
+        texts = {
+            n: self.workspace.read_blob(job.repo, head, f".vigil/{job.id}/{n}.md") or ""
+            for n in ("spec", "plan")
+        }
+        assert self.jobs is not None
+        if not texts["spec"] or not texts["plan"]:
+            errors = ["spec.md and plan.md are both required"]
+        else:
+            errors = self.jobs.gate_drafts(
+                job.repo, texts["spec"], texts["plan"], job.base,
+                read=lambda path: self.workspace.mirror_file_at(job.repo, base_sha, path),
+                is_dir=lambda path: self.workspace.mirror_is_dir_at(job.repo, base_sha, path),
+            )  # fmt: skip
+        self.store.update_session(s.id, status="done")
+        self.store.finish_replay(
+            rid, "done", cost_usd=cost,
+            result={**base_result, "gate": {"ok": not errors, "errors": redact(errors)},
+                    "ac_coverage": ac_coverage(approved_spec, texts["spec"])},
+        )  # fmt: skip
+
+    def _spec_replay_result(self, replay_id: str) -> dict[str, Any]:
+        row = self.store.get_replay(replay_id)
+        return {
+            "id": row["id"], "kind": row["kind"], "job_id": row["job_id"],
+            "base_sha": row["head"], "packet": row["prompt_version"], "status": row["status"],
+            "cost_usd": row["cost_usd"], "error": row["error"], "provenance": row["provenance"],
+            **dict.fromkeys(("gate", "ac_coverage", "tokens", "base_source")),
+            "packet_chars": 0,
+            **json.loads(row["result"]),
+        }  # fmt: skip
 
 
 # --- wiring for the real daemon ------------------------------------------------------------
