@@ -100,6 +100,17 @@ class RepoPolicy(_M):
     # item 2). Off unless a repo turns it on.
     intake: bool = False
 
+    @model_validator(mode="after")
+    def _pinned_paths_are_well_formed(self) -> RepoPolicy:
+        # A malformed entry would never match, so its pin would fail open
+        # (#59 review r1): refuse it at load, by the spec gate's own rule.
+        from vigild.intake.paths import scope_entry_error
+
+        for entry in self.ladder_pinned_paths:
+            if err := scope_entry_error(entry):
+                raise ValueError(f"ladder_pinned_paths: {err}")
+        return self
+
 
 class ReposFile(_M):
     repos: dict[str, RepoPolicy]

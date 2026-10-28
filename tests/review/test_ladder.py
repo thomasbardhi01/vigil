@@ -297,6 +297,22 @@ def test_pinned_paths_are_per_repo_with_strict_globs(cfg: Config, ladder: Ladder
     assert not ladder.pinned(_vtask(["vigild/gateway/service.py"], "o/unknown"))
 
 
+@pytest.mark.parametrize(
+    "entry", ["vigild/gateway/", "./vigild/budget.py", "vigild/../x", "/abs", " x.py", ""]
+)
+def test_a_malformed_pinned_path_is_refused_at_load(entry: str) -> None:
+    # a malformed entry would never match, so the pin would fail open (review r1, F1)
+    from pydantic import ValidationError
+
+    from vigild.config import RepoPolicy
+
+    with pytest.raises(ValidationError, match="ladder_pinned_paths"):
+        RepoPolicy(
+            decider=["jev"], backends=[], dev_dockerfile="d", dev_lockfiles=["uv.lock"],
+            dev_suites={"t": "true"}, dev_image_tools=["pytest"], ladder_pinned_paths=[entry],
+        )  # fmt: skip
+
+
 def test_a_pinned_task_stays_at_rung_zero_and_never_promotes_its_shape(
     evaluated: Config, ladder: Ladder, store: Store
 ) -> None:
