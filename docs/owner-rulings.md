@@ -8,9 +8,9 @@ it. Coord checks this file before asking the owner, and logs which ruling it
 applied.
 
 ## Merging and PRs
-- **2026-10-28**: The main ruleset requires a PR, squash only, the lint, types and test checks, linear history, no force pushes, and no bypass; "require up to date" is off and auto-merge is on (#1).
+- **2026-10-28**: The main ruleset requires a PR, squash only, the lint, types and test checks, linear history, no force pushes, and no bypass; "require up to date" is meant to be off (the rules API still reported it on, 2026-10-28) and auto-merge is on (#1).
 - **2026-10-28**: Coord marks a PR ready and the owner runs `gh pr merge --squash --auto`; rebase only for a textual conflict (#1).
-- **2026-10-28**: Merge tiers: docs-only or tests-only with green CI, the owner enables auto-merge on sight; code, the owner merges after a read; pinned paths, the owner reads the diff himself (#59).
+- **2026-10-28**: Merge tiers: docs-only or tests-only with green CI, the owner enables auto-merge on sight; code, the owner merges after a read; pinned paths, the owner reads the diff in person (#1).
 - **2026-10-28**: One feature slice per PR, under about 600 lines changed, or split it before dispatch; the rule applies from the next dispatch, and #48, #49 and #58 merge as they are (#1).
 - **2026-10-28**: A flaky required check is fixed deterministically (a fake clock or event, no longer timeout, no rerun plugin), with 20 consecutive local runs in the PR (#66).
 - **2026-10-24**: The owner merges nothing until the focused review of a gateway, verifier or hidden-test PR is clean; the PR keeps `needs-review` until then (#19).
@@ -36,7 +36,7 @@ applied.
 - **2026-10-23**: Coord uses Opus for rung 0, cross-module work and escalation; batch goes through the gateway (#1).
 
 ## Security and secrets
-- **2026-10-28**: A session never opens a `.env` file or anything under `~/.config/vigil/`, even when the owner asks; the owner opens it in his own Terminal (#1).
+- **2026-10-28**: A session never opens a `.env` file or anything under `~/.config/vigil/`, even when the owner asks; the owner opens it in a Terminal of the owner's own (#1).
 - **2026-10-26**: Hidden tests ship disabled by default; a flagged task opens an owner-review draft PR (#22).
 - **2026-10-24**: Hidden tests are black-box (never import scope, base runner config, worker code only as a subprocess on a read-only checkout), and config overlaps are refused (#19).
 - **2026-10-24**: Assertion failures carry an HMAC tag keyed by the host key, which the owner creates (#19).
