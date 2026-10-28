@@ -87,6 +87,11 @@ class RepoPolicy(_M):
     # base's copies over every run, and a worker's change to one is rejected
     # unless the approved spec names its exact path. Strict globs.
     runner_config: list[str] = Field(default_factory=list)
+    # Money-adjacent paths (owner, 2026-10-27; vigild/review/ladder.py): a task
+    # whose scope touches one is pinned at ladder rung 0 for good. Strict
+    # globs, per repo, no global list. No other effect: routing and intake
+    # ignore it.
+    ladder_pinned_paths: list[str] = Field(default_factory=list)
     hidden_tests: HiddenTestsPolicy = Field(default_factory=HiddenTestsPolicy)
     # Commands a test_cmd may use in the image. A test_cmd that needs anything
     # else is refused at the spec gate (review r1, blocker 4).
