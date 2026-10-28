@@ -174,7 +174,13 @@ class Publisher(Protocol):
 
 class Pager(Protocol):
     def page(
-        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+        self,
+        job_id: str | None,
+        title: str,
+        body: dict[str, Any],
+        *,
+        resumable: bool = False,
+        own_job: bool = True,
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def gate_spec(self, job_id: str) -> list[str]: ...
@@ -795,7 +801,7 @@ class JobRunner:
 
     def _breaker_page(self, job_id: str | None, title: str, body: dict[str, Any]) -> Any:
         assert self.jobs is not None
-        return self.jobs.page(job_id, title, body)
+        return self.jobs.page(job_id, title, body, own_job=False)  # a breaker's page is global
 
     def _tree_root(self, job: Job) -> str:
         root = job
@@ -942,13 +948,17 @@ class JobRunner:
         check is the last thing before the push, for the worker, the deps job and the
         re-send of an open PR alike."""
         if self._abandoned(job.id):
+            killed = bool(
+                self.store.q("SELECT 1 FROM events WHERE job_id=? AND type='job_killed'", (job.id,))
+            )
+            how = "killed" if killed else "abandoned"  # an inbox abandon is not a kill
             self.store.add_event(
                 "publish_skipped",
-                {"reason": "the job was killed", "branch": kw.get("branch"),
+                {"reason": f"the job was {how}", "branch": kw.get("branch"),
                  "head": kw.get("head")},
                 Provenance.HUMAN, job_id=job.id,
             )  # fmt: skip
-            raise PublishSkipped(f"{job.id} was killed; nothing is published")
+            raise PublishSkipped(f"{job.id} was {how}; nothing is published")
         if job.source == "bench":
             url = self.bench_publisher.publish(**kw)
             self.store.add_event(
@@ -2872,6 +2882,7 @@ class JobRunner:
                     "resumable": False,
                 },
                 Provenance.CLAUDE,
+                own_job=True,
             )
             return self._fail(
                 job_id,
@@ -3867,6 +3878,7 @@ class JobRunner:
         self.store.create_inbox_item(
             "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}",
             {"prs": prs, "actions": ["fix"]},
+            own_job=True,
         )  # fmt: skip
 
     def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:

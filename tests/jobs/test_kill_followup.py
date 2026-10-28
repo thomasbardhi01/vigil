@@ -54,7 +54,6 @@ def test_nothing_leaves_a_terminal_state(
     for channel in CHANNELS:
         for evidence in EVIDENCES:
             for force in (False, True):
-                before = len(_events(w, job, "transition_refused"))
                 with (
                     caplog.at_level(logging.WARNING, logger="vigild.jobs.fsm"),
                     pytest.raises(TransitionError, match="no transition out of it"),
@@ -64,17 +63,30 @@ def test_nothing_leaves_a_terminal_state(
                         force=force,
                     )  # fmt: skip
                 assert w.store.get_job(job).state is final
-                refused = _events(w, job, "transition_refused")
-                assert len(refused) == before + 1, "every refusal is logged as an event"
-                assert refused[-1].data["from"] == final.value
-                assert refused[-1].data["to"] == target.value
-                assert refused[-1].data["actor"] == actor.value
-    assert any(final.value in r.getMessage() for r in caplog.records), "and in the log"
+    assert any(final.value in r.getMessage() for r in caplog.records), "refusals are logged"
     assert not _events(w, job, "state") or all(
         e.data["to"] != target.value
         for e in _events(w, job, "state")
         if e.data["from"] == final.value
     )
+
+
+def test_an_inbox_abandon_of_a_done_job_is_refused_and_logged(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Through the service, inside its transaction: a Conflict, the state unchanged, and
+    a log line (an event written in that transaction would be rolled back, so there is none)."""
+    from vigild.jobs.service import Conflict
+
+    w = world
+    job = _request(w)
+    item = w.runner.jobs.page(job, "p", {"actions": ["abandon"]})  # type: ignore[union-attr]
+    w.store._write_state(job, S.DONE, None)
+    with caplog.at_level(logging.WARNING, logger="vigild.jobs.fsm"), pytest.raises(Conflict):
+        w.runner.jobs.abandon(item.id)  # type: ignore[union-attr]
+    assert w.store.get_job(job).state is S.DONE
+    assert any("refused" in r.getMessage() and job in r.getMessage() for r in caplog.records)
+    assert not _events(w, job, "transition_refused")
 
 
 def test_the_already_replies_stay_200(world: World) -> None:
@@ -211,9 +223,8 @@ def test_no_page_or_item_is_opened_on_an_abandoned_job(world: World) -> None:
     before = len(w.store.list_inbox())
     w.runner._page(job, "late", {"kind": "x"})
     w.runner.jobs.page(job, "late", {"kind": "x"})  # type: ignore[union-attr]
-    w.runner._breaker_page(job, "late", {"kind": "x"})
-    w.store.create_inbox_item("questions", "page", job, "late", {})
-    w.store.create_inbox_item("ready", "ready_to_merge", job, "late", {})
+    w.store.create_inbox_item("questions", "page", job, "late", {}, own_job=True)
+    w.store.create_inbox_item("ready", "ready_to_merge", job, "late", {}, own_job=True)
     assert len(w.store.list_inbox()) == before
     assert not [q for q in w.store.list_inbox("resolved") if q.job_id == job and q.title == "late"]
     assert not _events(w, job, "page")
@@ -261,3 +272,63 @@ def test_no_reservation_is_opened_for_an_abandoned_job(world: World) -> None:
     with pytest.raises(BudgetExceeded):
         w.budget.draw(1, session_id=s.id, amount=0.4, purpose="reviewer")
     assert _open_reservations(w) == []
+
+
+# --- the guard is for the job's own pages only ---------------------------------------------
+
+
+def test_a_jev_drift_page_for_an_abandoned_jobs_decision_still_opens(world: World) -> None:
+    from types import SimpleNamespace
+
+    from vigild.decider.policy import Decider
+
+    w = world
+    job = _killed_job(w)
+    d = Decider.__new__(Decider)
+    d.store = w.store  # type: ignore[attr-defined]
+    d._fallback_spend_today = lambda: 0.0  # type: ignore[method-assign]
+    e = SimpleNamespace(route="r", version="v2", pin="v1")
+    d._drift(e, None, job)
+    items = [q for q in w.store.list_inbox() if q.body.get("kind") == "jev_drift"]
+    assert len(items) == 1 and items[0].id > 0
+    (row,) = w.store.q("SELECT item_id FROM jev_drift WHERE route='r' AND version='v2'")
+    assert row["item_id"] == items[0].id, "the dedupe row carries the real item"
+
+
+def test_a_breaker_page_for_an_abandoned_job_is_not_suppressed(world: World) -> None:
+    w = world
+    job = _killed_job(w)
+    w.runner._breaker_page(job, "breaker", {"kind": "breaker"})
+    assert [q for q in w.store.list_inbox() if q.title == "breaker"]
+
+
+# --- the wording (#58 reviews) -------------------------------------------------------------
+
+
+def test_a_kill_after_an_inbox_abandon_does_not_say_nothing_to_kill(world: World) -> None:
+    w = world
+    job = _request(w)
+    w.store._write_state(job, S.ABANDONED, None)  # abandoned from the inbox: no kill ran
+    r = _kill(w, job)
+    assert r.status_code == 200 and r.json()["already"] == "abandoned"
+    assert "nothing to kill" not in r.json()["message"]
+    assert "stopped" in r.json()["message"]
+    # and a kill that is already complete still says so
+    assert "nothing to kill" in _kill(w, job).json()["message"]
+
+
+def test_publish_skipped_says_abandoned_when_there_was_no_kill(world: World) -> None:
+    from vigild.jobs.runner import PublishSkipped
+
+    w = world
+    kw: dict[str, Any] = {"repo": "r", "head": "0" * 40, "base_sha": "1" * 40, "branch": "b",
+                          "base": "main", "title": "t", "body": "b", "scope": []}  # fmt: skip
+    a = _request(w)
+    w.store._write_state(a, S.ABANDONED, None)  # inbox abandon
+    with pytest.raises(PublishSkipped, match="abandoned"):
+        w.runner._publish(w.store.get_job(a), **kw)
+    assert _events(w, a, "publish_skipped")[-1].data["reason"] == "the job was abandoned"
+    b = _killed_job(w)
+    with pytest.raises(PublishSkipped, match="killed"):
+        w.runner._publish(w.store.get_job(b), **kw)
+    assert _events(w, b, "publish_skipped")[-1].data["reason"] == "the job was killed"

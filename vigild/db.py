@@ -1138,9 +1138,14 @@ class Store:
         title: str,
         body: Mapping[str, Any],
         provenance: Provenance | str = Provenance.HUMAN,
+        *,
+        own_job: bool = False,
     ) -> InboxItem:
-        if job_id is not None and self.is_abandoned(job_id=job_id):
-            # one guard for every page and item path (#60): a killed job gets none. The
+        if own_job and job_id is not None and self.is_abandoned(job_id=job_id):
+            # the guard for the job's own pages and items (worker, review, spec, budget:
+            # `own_job=True`, #60): a killed job gets none. A global page (a decider
+            # drift, a breaker, a metering failure) is about something else and is never
+            # dropped here. The
             # caller gets a closed item that is not stored, and the event says what was dropped.
             self.add_event(
                 "inbox_item_suppressed",
