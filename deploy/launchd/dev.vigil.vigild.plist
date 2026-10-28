@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template. Replace the three __PLACEHOLDERS__ (see docs/runbook.md, "Run
+<!-- Template. Replace the four __PLACEHOLDERS__ (see docs/runbook.md, "Run
      vigild under launchd"); keep the filled copy out of the repo. vigild reads
      its secrets from ~/.config/vigil/env itself; nothing secret lives here. -->
 <plist version="1.0">
@@ -18,6 +18,11 @@
     <string>-m</string>
     <string>vigild</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

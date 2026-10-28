@@ -584,8 +584,15 @@ GitHub). It logs to `~/vigil-data/logs/vigild.log`. The template is
 2. `mkdir -p ~/vigil-data/logs`
 3. Copy `deploy/launchd/dev.vigil.vigild.plist` to
    `~/Library/LaunchAgents/dev.vigil.vigild.plist`, and replace
-   `__REPO_CHECKOUT__` (the main checkout), `__UV_PATH__` (`command -v uv`)
-   and `__HOME__` (your home directory, absolute; launchd doesn't expand `~`).
+   `__REPO_CHECKOUT__` (the main checkout), `__UV_PATH__` (`command -v uv`),
+   `__HOME__` (your home directory, absolute; launchd doesn't expand `~`) and
+   `__PATH__`: the `PATH` of the shell that runs vigild successfully today
+   (`echo $PATH` there). launchd's own `PATH` is only
+   `/usr/bin:/bin:/usr/sbin:/sbin`. Check that the value holds
+   `~/.docker/bin` (written out absolute) and uv's directory. No
+   `DOCKER_HOST` is needed: the Docker SDK follows the CLI's current context
+   (`desktop-linux`, `~/.docker/run/docker.sock`); Docker Desktop has no
+   `/var/run/docker.sock` unless that option is on.
 4. `plutil -lint ~/Library/LaunchAgents/dev.vigil.vigild.plist`
 5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.vigil.vigild.plist`
 6. Check: `launchctl print gui/$(id -u)/dev.vigil.vigild | grep -E "state|pid"`,

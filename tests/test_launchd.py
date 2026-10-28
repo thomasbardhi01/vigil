@@ -32,12 +32,18 @@ def test_vigild_plist_logs_under_the_data_dir() -> None:
     assert d["StandardErrorPath"] == "__HOME__/vigil-data/logs/vigild.log"
 
 
-def test_vigild_plist_is_throttled_and_sets_no_environment() -> None:
-    # A refused start (the private-repo rule) exits; launchd must not hammer
-    # GitHub. Secrets come from ~/.config/vigil/env, read by vigild, never here.
+def test_vigild_plist_is_throttled() -> None:
+    # A refused start (the private-repo rule) exits; launchd must not hammer GitHub.
     d = _load(VIGILD)
     assert isinstance(d["ThrottleInterval"], int) and d["ThrottleInterval"] >= 30
-    assert "EnvironmentVariables" not in d
+
+
+def test_vigild_plist_sets_path_and_nothing_else() -> None:
+    # launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin, without ~/.docker/bin or
+    # uv's directory; the runbook fills __PATH__ from a shell that runs vigild.
+    # Secrets come from ~/.config/vigil/env, read by vigild, never from here.
+    d = _load(VIGILD)
+    assert d["EnvironmentVariables"] == {"PATH": "__PATH__"}
 
 
 def test_launchd_templates_hold_no_host_paths() -> None:
