@@ -31,6 +31,7 @@ from vigild.packets.assemble import COORD_PACKETS, assemble_coord
 from vigild.provenance import Provenance
 from vigild.repos import set_visibility_source
 from vigild.review.replay import ac_coverage
+from vigild.router.rules import CoordRoute
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cli"))
 from vigil.main import app
@@ -97,6 +98,21 @@ def test_the_coverage_rule_is_same_id_and_same_command_after_whitespace() -> Non
 
 def test_the_variants_are_registered_in_one_dict() -> None:
     assert COORD_PACKETS["classic"] is assemble_coord
+    assert set(COORD_PACKETS) == {"classic", "lean"}
+
+
+def test_a_lean_replay_uses_the_lean_assembler_and_records_the_route(world: World) -> None:
+    w = world
+    job = _approved(w)
+    since = len(w.standin.specs)
+    out = _post(w, job, "lean").json()
+    assert out["status"] == "done" and out["packet"] == "lean"
+    assert out["coord_route"].startswith("coord:")
+    (spec,) = _sessions(w, since)
+    live = COORD_PACKETS["lean"]
+    assert live is not assemble_coord
+    assert out["packet_chars"] == len(spec.packet)
+    assert spec.preset == w.store.get_session(spec.session_id).backend_preset
 
 
 # --- the route -----------------------------------------------------------------------
@@ -434,6 +450,11 @@ def test_a_private_repo_is_refused_at_the_session_too(
     job = _approved(w)
     set_visibility_source(lambda repo: True)
     monkeypatch.setattr("vigild.jobs.runner.repo_rule_errors", lambda cfg, repo, private: [])
+    # the router's own private-repo check is skipped too, so only the session path is left
+    monkeypatch.setattr(
+        "vigild.jobs.runner.route_coord",
+        lambda cfg, repo, shape: CoordRoute(preset="claude-sonnet", reason="coord:test"),
+    )
     before = len(w.standin.specs)
     r = _post(w, job)
     assert r.status_code == 403

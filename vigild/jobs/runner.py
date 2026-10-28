@@ -4543,13 +4543,17 @@ class JobRunner:
         errors = repo_rule_errors(self.cfg, job.repo, live_private(job.repo))
         if errors:
             raise ReplayRefused(403, "the private-repo rule: " + "; ".join(errors)[:300])
-        preset = self._healthy(self.cfg.routing.coord)
+        try:  # the preset a live first draft would get
+            picked = route_coord(self.cfg, job.repo, self.coord_shape(job))
+        except RoutingError as e:
+            raise ReplayRefused(403, f"backend refused: {e}"[:300]) from e
+        preset = self._healthy(picked.preset)
         if preset is None:
             raise ReplayRefused(409, "the coord's backend breaker is open")
         rid = self.store.create_replay(job.id, "", base_sha, packet_variant, "", kind="spec")
         try:
             self._spec_replay_session(
-                job, rid, preset, assemble, base_sha, approved_spec, base_source
+                job, rid, preset, assemble, base_sha, approved_spec, base_source, picked.reason
             )
         except ReplayRefused as e:
             self.store.finish_replay(rid, "refused", error=str(e)[:1000])
@@ -4568,6 +4572,7 @@ class JobRunner:
         base_sha: str,
         approved_spec: str,
         base_source: str,
+        route_reason: str,
     ) -> None:
         branch = f"vigil/{rid}-spec"
         s = self.store.create_session(
@@ -4626,7 +4631,7 @@ class JobRunner:
         cost = round(session_cost(self.store, s.id), 6)
         base_result: dict[str, Any] = {
             "packet_chars": len(packet.text), "tokens": self._session_tokens(s.id),
-            "base_source": base_source,
+            "base_source": base_source, "coord_route": route_reason,
             "gate": None, "ac_coverage": None,
         }  # fmt: skip
         gate_refused = str(self.store.get_replay(rid)["error"] or "").startswith("gate_refused")
@@ -4674,7 +4679,7 @@ class JobRunner:
             "id": row["id"], "kind": row["kind"], "job_id": row["job_id"],
             "base_sha": row["head"], "packet": row["prompt_version"], "status": row["status"],
             "cost_usd": row["cost_usd"], "error": row["error"], "provenance": row["provenance"],
-            **dict.fromkeys(("gate", "ac_coverage", "tokens", "base_source")),
+            **dict.fromkeys(("gate", "ac_coverage", "tokens", "base_source", "coord_route")),
             "packet_chars": 0,
             **json.loads(row["result"]),
         }  # fmt: skip
