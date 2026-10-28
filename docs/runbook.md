@@ -271,7 +271,7 @@ you. There is no timer and no launchd job.
   uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
   ```
 
-- **The `rebuilds-images` label.** CI's `image-key` job puts it on a PR that
+- **The `rebuilds-images` label.** CI's `image-key` workflow (`.github/workflows/image-key.yml`) puts it on a PR that
   changes an input of a dev-image key or of the executor layer: a repo's dev
   Dockerfile, vigil's `pyproject.toml` or `uv.lock`, a repo's `dev_suites` or
   `dev_image_tools`, anything under `images/claude-executor/`, the managed
