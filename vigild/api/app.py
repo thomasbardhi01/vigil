@@ -459,12 +459,11 @@ def get_session(request: Request, session_id: str) -> dict[str, Any]:
 def _log_mcp_call(store: Store, request: Request, status: int, body: bytes) -> None:
     """One small `mcp_call` event per call from the MCP server: which route, the item and
     job it named, the status. Never a body, a note or a header."""
-    route = request.scope.get("route")
     params = request.path_params
     data: dict[str, Any] = {
         "channel": "mcp",
         "method": request.method,
-        "route": getattr(route, "path", request.url.path),
+        "route": request.scope["route"].path,  # the template; never the caller's raw path
         "status": status,
     }
     if "item_id" in params:
@@ -501,15 +500,21 @@ def create_app(services: Services, *, ui: bool = False) -> FastAPI:
             )
         request.state.channel = channel
         response: Response = await call_next(request)
-        if channel != "mcp" or response.status_code in (401, 403):
+        route = request.scope.get("route")
+        if (
+            channel != "mcp"
+            or not getattr(request.state, "authed", False)
+            or not isinstance(getattr(route, "path", None), str)
+        ):
             return response
         body = b"".join([chunk async for chunk in response.body_iterator])  # type: ignore[attr-defined]
         await run_in_threadpool(_log_mcp_call, services.store, request, response.status_code, body)
-        return Response(
-            body,
-            status_code=response.status_code,
-            headers={k: v for k, v in response.headers.items() if k.lower() != "content-length"},
-        )
+        out = Response(body, status_code=response.status_code)
+        out.raw_headers = [
+            (k, v) for k, v in response.raw_headers if k.lower() != b"content-length"
+        ]
+        out.raw_headers.append((b"content-length", str(len(body)).encode()))
+        return out
 
     @app.exception_handler(KeyError)
     async def _missing(_: Request, exc: KeyError) -> JSONResponse:

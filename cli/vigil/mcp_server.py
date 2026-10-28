@@ -12,7 +12,9 @@ module of that name would shadow the SDK.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx2
 from mcp.server.mcpserver import MCPServer
@@ -21,6 +23,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 DEFAULT_URL = "http://127.0.0.1:8787"
 CHANNEL = ("X-Vigil-Channel", "mcp")
 TOOLS = ("submit_job", "job_status", "list_inbox", "inbox_act", "kill")
+# vigild's job ids: a short repo prefix, a dash, a counter (`pa-0007`)
+JOB_ID = re.compile(r"^[a-z0-9]{1,8}-[0-9]{1,9}$")
 Action = Literal["approve", "replan", "retry", "abandon", "reset"]
 
 
@@ -44,6 +48,17 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         except ValueError:
             return {"result": text[:2000]}
         return out if isinstance(out, dict) else {"result": out}
+
+    def job_path(job_id: str) -> str:
+        """The one place an id becomes a URL part: checked, then quoted."""
+        if not JOB_ID.fullmatch(job_id):
+            raise ToolError("job_id is not a job id (like pa-0007)")
+        return quote(job_id, safe="")
+
+    def item_path(item_id: int) -> str:
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id < 1:
+            raise ToolError("item_id must be a positive integer")
+        return str(item_id)
 
     def clean(out: Any) -> Any:
         if isinstance(out, str):
@@ -77,7 +92,7 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
     @mcp.tool()
     def job_status(job_id: str) -> dict[str, Any]:
         """A job's state and fields (GET /api/jobs/{id})."""
-        return clean(call("GET", f"/api/jobs/{job_id}"))  # type: ignore[no-any-return]
+        return clean(call("GET", f"/api/jobs/{job_path(job_id)}"))  # type: ignore[no-any-return]
 
     @mcp.tool()
     def list_inbox() -> dict[str, Any]:
@@ -94,6 +109,7 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
     ) -> dict[str, Any]:
         """Act on an inbox item: approve (optional `edits`), replan (`note` required), retry,
         abandon (optional `job_id` on a breaker's page) or reset."""
+        path = f"/api/inbox/{item_path(item_id)}/{action}"
         body: dict[str, Any] | None = None
         if action == "approve" and edits is not None:
             body = {"edits": edits}
@@ -102,13 +118,14 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
                 raise ToolError("replan needs a note")
             body = {"note": note}
         elif action == "abandon" and job_id:
+            job_path(job_id)
             body = {"job_id": job_id}
-        return clean(call("POST", f"/api/inbox/{item_id}/{action}", body))  # type: ignore[no-any-return]
+        return clean(call("POST", path, body))  # type: ignore[no-any-return]
 
     @mcp.tool()
     def kill(job_id: str) -> dict[str, Any]:
         """Stop a job cleanly and abandon it (POST /api/jobs/{id}/kill). Open PRs stay."""
-        return clean(call("POST", f"/api/jobs/{job_id}/kill", {"channel": "mcp"}))  # type: ignore[no-any-return]
+        return clean(call("POST", f"/api/jobs/{job_path(job_id)}/kill", {"channel": "mcp"}))  # type: ignore[no-any-return]
 
     return mcp
 

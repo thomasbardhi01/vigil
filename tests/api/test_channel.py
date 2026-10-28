@@ -104,3 +104,40 @@ def test_inbox_routes_log_the_item_by_its_route_template(
     [call] = _calls(store)
     assert call["route"] == "/api/inbox/{item_id}/abandon" and call["item_id"] == item.id
     assert call["status"] == 409
+
+
+def test_a_tokenless_mcp_request_writes_no_event(client: TestClient, store: Store) -> None:
+    junk = "/api/" + "x" * 5000
+    for method, path in (("GET", junk), ("GET", "/api/health"), ("POST", "/api/login"),
+                         ("GET", "/api/nope")):  # fmt: skip
+        r = client.request(method, path, headers={H: "mcp"}, json={} if method == "POST" else None)
+        assert r.status_code in (401, 404), (path, r.status_code)
+    assert _calls(store) == []
+
+
+def test_an_authed_mcp_request_to_an_unmatched_path_writes_no_event_and_no_raw_path(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    r = client.get("/api/" + "y" * 5000, headers={**auth(tokens.admin), H: "mcp"})
+    assert r.status_code == 404
+    assert _calls(store) == []
+    assert all("yyyy" not in str(e.data) for e in store.events())
+
+
+def test_repeated_response_headers_survive_the_mcp_logging(
+    client: TestClient, tokens: Tokens
+) -> None:
+    from fastapi.responses import JSONResponse
+
+    from vigild.api.app import READ
+
+    @client.app.get("/api/_two_cookies", dependencies=[READ])  # type: ignore[attr-defined]
+    def two() -> JSONResponse:
+        r = JSONResponse({"ok": True})
+        r.headers.append("set-cookie", "a=1")
+        r.headers.append("set-cookie", "b=2")
+        return r
+
+    r = client.get("/api/_two_cookies", headers={**auth(tokens.read), H: "mcp"})
+    assert r.status_code == 200, r.text
+    assert r.headers.get_list("set-cookie") == ["a=1", "b=2"]

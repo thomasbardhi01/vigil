@@ -122,6 +122,27 @@ async def test_replan_without_a_note_is_refused_before_any_call() -> None:
     assert r.is_error and seen.requests == []
 
 
+EVIL = ["a/../../inbox/1/dismiss", "../x", "pa-0001/kill", "pa-0001?x=1", "pa 0001", "", "%2e%2e"]
+
+
+@pytest.mark.parametrize("bad", EVIL)
+@pytest.mark.parametrize("tool", ["job_status", "kill"])
+async def test_a_traversal_job_id_is_refused_before_any_call(tool: str, bad: str) -> None:
+    seen = Seen()
+    r = await _call(seen, tool, {"job_id": bad})
+    assert r.is_error and seen.requests == []
+
+
+async def test_abandon_with_a_bad_job_id_and_a_bad_item_id_are_refused() -> None:
+    seen = Seen()
+    r = await _call(seen, "inbox_act", {"item_id": 4, "action": "abandon", "job_id": "../x"})
+    assert r.is_error
+    for item in (0, -1):
+        r = await _call(seen, "inbox_act", {"item_id": item, "action": "retry"})
+        assert r.is_error
+    assert seen.requests == []
+
+
 async def test_an_unknown_action_is_refused() -> None:
     seen = Seen()
     r = await _call(seen, "inbox_act", {"item_id": 4, "action": "merge"})
