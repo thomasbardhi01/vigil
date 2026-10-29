@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One line of a job's `decisions.jsonl` (ADR-0005 part 4). `by` says who wrote it;\nvigild sets it, whatever the coord's file says.",
+  "properties": {
+    "by": {
+      "enum": [
+        "coord",
+        "vigild"
+      ],
+      "title": "By",
+      "type": "string"
+    },
+    "kind": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+      "title": "Kind",
+      "type": "string"
+    },
+    "text": {
+      "maxLength": 300,
+      "title": "Text",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ts",
+    "by",
+    "kind",
+    "text"
+  ],
+  "title": "DecisionLine",
+  "type": "object"
+}

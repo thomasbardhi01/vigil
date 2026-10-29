@@ -11,7 +11,17 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from vigild.contract.models import Audit, BenchInfo, Event, Plan, Result, Review, Task, WorkerReport
+from vigild.contract.models import (
+    Audit,
+    BenchInfo,
+    DecisionLine,
+    Event,
+    Plan,
+    Result,
+    Review,
+    Task,
+    WorkerReport,
+)
 
 MODELS: dict[str, type[BaseModel]] = {
     "task.schema.json": Task,
@@ -22,6 +32,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "review.schema.json": Review,
     "audit.schema.json": Audit,
     "bench.schema.json": BenchInfo,
+    "decision.schema.json": DecisionLine,
 }
 
 
