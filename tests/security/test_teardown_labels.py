@@ -39,6 +39,8 @@ class FakeNetwork:
             raise NotFound(self.name)
 
     def disconnect(self, c: FakeContainer, force: bool = False) -> None:
+        if self.name not in self.client.nets or c not in self.members:
+            raise NotFound(c.name)
         self.members.remove(c)
         self.client.disconnected.append(c.name)
 
@@ -135,6 +137,45 @@ def test_name_match_without_label_survives() -> None:
     _teardown_run(c, session_ids=["s1"], run_id="run1")
     assert "vigil-s1" in c.containers_by_name
     assert "vigil-s1-extra" in c.nets
+
+
+def test_unlabelled_vigil_sid_network_and_container_survive() -> None:
+    c = FakeClient()
+    c.add_network("vigil-s1", {})
+    c.add_container("vigil-s1", {}, net="vigil-s1")
+    c.add_network("vigil-s1-other", {SESSION_LABEL: "s9"})
+    _teardown_run(c, session_ids=["s1"], run_id="run1")
+    assert "vigil-s1" in c.nets
+    assert "vigil-s1-other" in c.nets
+    assert "vigil-s1" in c.containers_by_name
+    assert c.removed == []
+
+
+class _Stale:
+    """list() returns a fixed snapshot, whatever happened since."""
+
+    def __init__(self, items: list[Any]) -> None:
+        self.items = items
+
+    def list(self, **_: Any) -> list[Any]:
+        return list(self.items)
+
+
+def test_stale_listings_raise_nothing_and_remove_nothing_extra() -> None:
+    c = _world()
+    shared = c.add_container("shared", {}, net="vigil-s1")
+    stale_containers = list(c.containers_by_name.values())
+    stale_nets = list(c.nets.values())
+    # everything vanishes between list and remove/disconnect/reload
+    c.containers_by_name.clear()
+    c.nets.clear()
+    for n in stale_nets:
+        n.members.append(shared)  # the stale net still shows the foreign member
+    c.containers = _Stale(stale_containers)  # type: ignore[assignment]
+    c.networks = _Stale(stale_nets)  # type: ignore[assignment]
+    _teardown_run(c, session_ids=["s1"], run_id="run1")
+    assert c.removed == []
+    assert c.disconnected == []
 
 
 def test_second_run_is_idempotent() -> None:
