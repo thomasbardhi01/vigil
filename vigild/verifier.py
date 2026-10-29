@@ -635,7 +635,9 @@ class Verifier:
         head_files = self.ws.tree_paths(repo, head)
         cfg = list(runner_config)
         overlap = sorted(set(runner_overlap))
-        pinned = self._pinned(base_files, head_files, cfg, test_cmd, overlap)
+        pinned = self._pinned(
+            base_files, head_files, cfg, [test_cmd, *(c for c, _ in ac_commands)], overlap
+        )
         changed = self.ws.changed(repo, base_sha, head)
         changed_paths = {path for _, path in changed}
         tests = sorted(
@@ -680,7 +682,9 @@ class Verifier:
             after["note"] = "no test report: that any test ran can't be confirmed"
         record["after"] = after
         record["ac"] = [
-            self._ac_run(repo, image, f"{task_id}-ac{i}", head, cmd, list(ids), pin, base_sha)
+            self._ac_entry(cmd, list(ids), after)  # the same command: the after run is its run
+            if cmd.strip() == test_cmd.strip()
+            else self._ac_run(repo, image, f"{task_id}-ac{i}", head, cmd, list(ids), pin, base_sha)
             for i, (cmd, ids) in enumerate(ac_commands, start=1)
         ]
         added = sorted(path for status, path in changed if status[:1] == "A")
@@ -743,14 +747,23 @@ class Verifier:
         if plan.problems:
             return {**entry, "outcome": "unknown", "selected": 0, "note": "; ".join(plan.problems)}
         run = self._run(repo, image, name, head, cmd, plan.command, [pin])
-        run.pop("_cases", None)
-        report = run.pop("_report", False)
+        return self._ac_entry(cmd, acs, run)
+
+    @staticmethod
+    def _ac_entry(cmd: str, acs: list[str], run: dict[str, Any]) -> dict[str, Any]:
+        """An AC's record from a run. `selected` counts the cases that executed:
+        passed or failed, never skipped or xfail. None (an empty or missing report,
+        pytest's exit 5, only skips) means the command tested nothing."""
+        cases = run.get("_cases") or []
+        executed = sum(1 for c in cases if c.status in ("pass", "failure", "error"))
         return {
-            **entry,
+            "command": cmd,
+            "acs": acs,
             "exit": run["exit"],
             "outcome": run["outcome"],
-            "selected": run["tests"],
-            "report": bool(report),
+            "selected": executed,
+            "skipped": len(cases) - executed,
+            "report": bool(run.get("_report")),
             "tail": run["tail"],
             **({"note": run["note"]} if "note" in run else {}),
         }
@@ -760,14 +773,14 @@ class Verifier:
         base_files: set[str],
         head_files: set[str],
         runner_config: list[str],
-        test_cmd: str,
+        cmds: Sequence[str],
         overlap: Sequence[str],
     ) -> list[str]:
         """The runner files that are the base's in every run (owner direction,
-        round 3): the repo's runner_config, and any script `test_cmd` runs that
-        the base has. Not the overlap, which is the head's."""
+        round 3): the repo's runner_config, and any script `test_cmd` or an AC
+        command (#136) runs that the base has. Not the overlap, which is the head's."""
         pinned = {p for p in base_files | head_files if in_scope(p, runner_config)} | {
-            p for p in invoked_scripts(test_cmd) if p in base_files
+            p for cmd in cmds for p in invoked_scripts(cmd) if p in base_files
         }
         return sorted(pinned - set(overlap))
 

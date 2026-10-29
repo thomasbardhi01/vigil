@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
-from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
+from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc, ac_refs
 from vigild.shellwords import Command, parse
 from vigild.verifier import ReadFile, plan_reports, runner_overlap
 
@@ -290,6 +290,19 @@ def check_job_spec(
             "parallel workers need their shared interfaces pinned in '## Interfaces': "
             "name the files, signatures or formats in backticks"
         )
+
+    # #136: with several workers each AC's test runs in the after run of the worker(s)
+    # that name it, so an AC no worker names has nobody answering for it.
+    if len(plan.workers) > 1:
+        named: set[str] = set()
+        for w in plan.workers:
+            named |= ac_refs(f"{w.why} {w.done_when}")
+        for c in spec.criteria:
+            if c.ident not in named:
+                errors.append(
+                    f"{c.ident} is named by no worker's why or done_when; "
+                    "name it in the worker whose branch holds its test"
+                )
 
     # The verification ladder: every criterion's level, and why not higher at 0.
     levels = {v.criterion: v for v in plan.verify}
