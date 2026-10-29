@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from tests.jobs.test_coord_loop import World, _approve, world  # noqa: F401
+from tests.conftest import auth
+from tests.jobs.test_coord_loop import World, _approve, _failure_item, world  # noqa: F401
 from tests.review.test_review_stage import CLEAN_REVIEW, MEDIUM, _rounds, _workers
+from vigild.jobs.model import Role
 from vigild.packets.assemble import FRESH_FINDINGS_CHARS, round_findings
 
 FIRST_CALL_TOKENS = 20_000
@@ -87,3 +89,28 @@ def test_older_rounds_are_listed_when_all_do_not_fit() -> None:
 def test_all_rounds_in_full_when_they_fit() -> None:
     text = round_findings([_round(1, 10), _round(2, 10)])
     assert "CLAIM-1 " in text and "CLAIM-2 " in text and "dropped" not in text
+
+
+def test_a_replan_after_review_rounds_sees_every_round(world: World) -> None:
+    """The vi-0003 shape: a `review_rounds` page, then the owner's replan."""
+    w = world
+    r3 = {**CLEAN_REVIEW, "verdict": "changes", "findings": [{**MEDIUM, "claim": "ROUND-3-MARK"}]}
+    w.standin.review = _rounds({"w1": [R1, R2, r3]})
+    job = _approve(w)
+    item = _failure_item(w, job, "review_rounds")
+    r = w.client.post(f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    second = [s for s in w.standin.specs if s.role is Role.COORD][-1]
+    assert second.resume is None
+    assert not w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
+    p = second.packet
+    assert "ROUND-ONE-CLAIM" in p and "ROUND-TWO-CLAIM" in p and "ROUND-3-MARK" in p
+    assert "<<<UNTRUSTED review-history" in p and f"{job}-w1" in p
+    assert len(p) / 4 < FIRST_CALL_TOKENS
+
+
+def test_the_newest_round_is_bounded_too() -> None:
+    big = _round(1, FRESH_FINDINGS_CHARS * 2)
+    text = round_findings([big])
+    assert len(text) <= FRESH_FINDINGS_CHARS + 200
+    assert "(truncated)" in text

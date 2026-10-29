@@ -1676,8 +1676,14 @@ class JobRunner:
         if replan:
             # vigild's summary goes in the contract; the failure details carry
             # worker and test output, so they go in the untrusted section
+            # a `review_rounds` page carries a finding count per task, not a dict
             request["replan"] = {
-                tid: {"title": t.get("title"), "state": t.get("state")} for tid, t in replan.items()
+                tid: (
+                    {"title": t.get("title"), "state": t.get("state")}
+                    if isinstance(t, dict)
+                    else {"findings": t}
+                )
+                for tid, t in replan.items()
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
         # A replan starts the coord fresh at every attempt (#78, #101, ADR-0005):
@@ -1692,6 +1698,12 @@ class JobRunner:
                 art = self.store.get_artifact(job_id, name)
                 if art is not None and not (name == "spec.md" and amend is not None):
                     untrusted[label] = art.content[:cap]
+            histories = []
+            for task in self.store.list_tasks(job_id):
+                if hist := self._findings_history(task, None):
+                    histories.append(f"Task {task.id}:\n{hist}")
+            if histories:  # the review rounds that led here (#101), every task's
+                untrusted["review history"] = "\n".join(histories)
         self.workspace.write_task(clone, request)
         # a fresh replan (#78) is not affected by the switch: it is always the classic one
         assemble = assemble_coord if fresh else COORD_PACKETS[self.cfg.routing.coord_packet]

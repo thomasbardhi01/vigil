@@ -301,7 +301,8 @@ stateDiagram-v2
   its packet holds spec.md (the amended baseline, or the current spec), the
   note, plan.md, spec_changelog.md, the failure reason and the verifier summary
   (all but the note and baseline fenced), no context pack, and no transcript is
-  resumed or forked at any attempt (#101).
+  resumed or forked at any attempt (#101). When tasks had review rounds, a fenced
+  `review history` holds every task's rounds (same bound as a worker's).
 - **Inside building.** Workers run as a dependency graph (decision `scheduler-fleet`): each starts
   once its own dependencies have published, up to three sessions at once
   across the fleet, each in its own container, clone and `vigil/<task>`

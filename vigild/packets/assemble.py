@@ -364,7 +364,10 @@ def round_findings(rounds: list[dict[str, Any]], cap: int = FRESH_FINDINGS_CHARS
                 out += f"- round {r.get('round')}:{i} {f.get('severity')}\n"
         out += "\n"
     for r in reversed(full):
-        out += f"Round {r.get('round')}:\n{json.dumps(r.get('findings') or [], indent=1)}\n\n"
+        body = json.dumps(r.get("findings") or [], indent=1)
+        if len(body) > cap:  # a hard bound: even the newest round is cut
+            body = body[:cap] + "\n(truncated)"
+        out += f"Round {r.get('round')}:\n{body}\n\n"
     return out
 
 
