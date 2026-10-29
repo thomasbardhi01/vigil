@@ -159,27 +159,18 @@ def test_reviewers_get_read_only_sessions_of_the_head(world: World) -> None:
     assert w.store.get_job(job).state.value == "ready"
 
 
-def test_an_escalated_attempt_forks_the_failed_attempts_whole_transcript(world: World) -> None:
-    """Plan 2a, item 2: the escalated attempt's first packet carries the prior
-    transcript (an SDK fork), not a summary."""
+def test_an_escalated_attempt_starts_fresh_and_forks_nothing(world: World) -> None:
+    """#101: rule 5 starts the worker fresh, like every fix round; only a crashed
+    session resumes (tests/jobs/test_resume.py)."""
     w = world
     w.standin.review = _rounds({"w1": [CHANGES, CHANGES]})
     job = _approve(w)
     assert w.store.get_job(job).state.value == "ready"
     first, second, escalated = _workers(w, "w1")
-    assert first.resume is None
-    # a fix round starts fresh (#78): no fork below the escalation attempt
-    assert second.resume is None
-    # the escalated attempt (rule 5) carries the whole failed attempt, history included
+    assert first.resume is None and second.resume is None
     assert w.store.get_task(f"{job}-w1").tier_reason.startswith("rule5")  # type: ignore[union-attr]
-    assert escalated.resume is not None and escalated.resume.from_session == second.session_id
-    sdk, stored = w.store.transcript(second.session_id)
-    assert escalated.resume.session_id == sdk == f"sdk-{second.session_id}"
-    assert escalated.resume.entries == stored
-    uuids = [e["uuid"] for e in escalated.resume.entries]
-    assert uuids == [f"u-{second.session_id}", f"a-{second.session_id}"]
-    forks = [e for e in w.store.events(job_id=job) if e.type == "fork"]
-    assert [f.data["escalated"] for f in forks] == [True]
+    assert escalated.resume is None
+    assert not [e for e in w.store.events(job_id=job) if e.type == "fork"]
 
 
 def test_a_finding_without_evidence_fails_the_review_like_a_malformed_review(world: World) -> None:
