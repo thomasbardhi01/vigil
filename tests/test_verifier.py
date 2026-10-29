@@ -1131,3 +1131,81 @@ def test_an_unknown_encoding_attribute_still_checks_out(ws: Workspace, tmp_path:
     src = ws.verify_checkout(REPO, "enc", sha)
     assert _g(src, "rev-parse", "HEAD^{tree}") == _g(ws.vault(REPO), "rev-parse", f"{sha}^{{tree}}")
     assert len(_history_facts(src)["commits"]) == 1
+
+
+# --- #31 items 4 and 7: vitest project dirs and case matching ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pnpm -C server exec vitest run x",
+        "pnpm --dir server exec vitest run x",
+        "cd server && pnpm exec vitest run x",
+        "cd . && pnpm -C server exec vitest run x",
+    ],
+)
+def test_pnpm_dir_flags_and_cd_give_the_vitest_dir(cmd: str) -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(cmd, None)
+    assert plan.problems == []
+    assert plan.vitest_dirs == ("server",) and plan.command_dirs == ("server",)
+    assert "--reporter=junit --outputFile.junit=/tmp/vigil-report/vitest-1.xml" in plan.command
+
+
+def test_cd_and_pnpm_dir_are_joined() -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports("cd apps && pnpm -C server exec vitest run", None)
+    assert plan.vitest_dirs == ("apps/server",)
+
+
+def test_a_vitest_case_belongs_to_its_own_project_only() -> None:
+    from vigild.verifier import UNKNOWN_PROJECT, Case, belongs
+
+    files = ["server/test/a.test.ts"]
+    assert not belongs(Case("test/a.test.ts::t", "test/a.test.ts", "pass", project="client"), files)
+    assert belongs(Case("test/a.test.ts::t", "test/a.test.ts", "pass", project="server"), files)
+    # no double prefix when the dir already leads the file
+    assert belongs(Case("x::t", "server/test/a.test.ts", "pass", project="server"), files)
+    assert belongs(Case("x::t", "server/test/a.test.ts", "pass", project=""), files)
+    assert belongs(Case("x::t", "test/a.test.ts", "pass", project="server"), files)
+    # an unknown project fails closed
+    assert not belongs(Case("x::t", "test/a.test.ts", "pass", project=UNKNOWN_PROJECT), files)
+
+
+def test_pytest_cases_keep_module_matching_with_no_project() -> None:
+    from vigild.verifier import Case, belongs, parse_junit
+
+    xml = b'<testsuite><testcase classname="tests.test_a.TestX" name="t"/></testsuite>'
+    (case,) = parse_junit(xml)
+    assert case.project is None
+    assert belongs(case, ["tests/test_a.py"])
+    assert belongs(Case("tests.test_a::t", "tests.test_a", "pass"), ["tests/test_a.py"])
+    assert not belongs(case, ["tests/test_b.py"])
+
+
+def test_a_two_project_command_maps_each_report_to_its_dir(tmp_path: Path) -> None:
+    from vigild.verifier import RunResult, Verifier, belongs
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="t"/></testsuite>'
+
+    class Runner:
+        def run(self, *a: Any, **k: Any) -> RunResult:
+            return RunResult(0, "", reports={"vitest-1.xml": xml, "vitest-2.xml": xml})
+
+    class Ws:
+        def verify_checkout(self, *a: Any, **k: Any) -> Path:
+            d = tmp_path / "co" / "src"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        def read_blob(self, *a: Any) -> str | None:
+            return None
+
+    cmd = "pnpm -C client exec vitest run && pnpm -C server exec vitest run"
+    v = Verifier(Ws(), Runner())  # type: ignore[arg-type]
+    run = v._run("r", "img", "n", "sha", cmd, cmd, [])
+    assert [c.project for c in run["_cases"]] == ["client", "server"]
+    assert [belongs(c, ["server/test/a.test.ts"]) for c in run["_cases"]] == [False, True]

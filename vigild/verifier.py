@@ -273,6 +273,7 @@ class ReportPlan:
     reports: int
     problems: list[str]
     vitest_dirs: tuple[str, ...] = ()  # repo-relative dirs of the vitest projects it runs
+    command_dirs: tuple[str, ...] = ()  # the dir of each vitest command; vitest-<n>.xml is [n-1]
 
 
 def _flags(n: int) -> str:
@@ -287,6 +288,15 @@ def _runs_vitest(c: Command) -> bool:
     return c.program == "vitest" or ("vitest" in c.args and "run" in c.args)
 
 
+def _pnpm_dir(args: Sequence[str], cwd: str) -> str:
+    """The dir a pnpm command runs in: its -C/--dir joined to any `cd` dir."""
+    where = cwd
+    for flag in ("-C", "--dir"):
+        if flag in args and args.index(flag) + 1 < len(args):
+            where = "/".join(x for x in (cwd, args[args.index(flag) + 1].strip("/")) if x)
+    return where
+
+
 def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
     """Resolve each command: pytest reports through PYTEST_ADDOPTS; a direct
     `vitest run` gets the reporter flags; `pnpm [-C dir] [run] <script> [args]`
@@ -297,6 +307,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
     problems: list[str] = []
     out, pos, n, reporting = [], 0, 0, 0
     vitest_dirs: list[str] = []
+    command_dirs: list[str] = []
     cwd = ""
     for c in parse(test_cmd).commands:
         if c.program == "cd" and c.args:
@@ -308,7 +319,9 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if _runs_vitest(c):
             n += 1
             reporting += 1
-            vitest_dirs.append(cwd)
+            where = _pnpm_dir(c.args, cwd) if c.program == "pnpm" else cwd
+            vitest_dirs.append(where)
+            command_dirs.append(where)
             end = c.start + len(c.text.rstrip())
             out.append(test_cmd[pos:end] + _flags(n))
             pos = end
@@ -364,6 +377,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
             continue  # PYTEST_ADDOPTS reaches it through pnpm
         n += 1
         vitest_dirs.append(where)
+        command_dirs.append(where)
         body = " ".join([script, *(shlex.quote(a) for a in extra)]) + _flags(n)
         lead = c.text[: len(c.text) - len(c.text.lstrip())]
         dir_opt = f"-C {shlex.quote(where)} " if where and where != cwd else ""
@@ -378,7 +392,13 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         problems.append(
             "runs no test runner vigil can read (pytest, vitest, or a pnpm script that runs one)"
         )
-    return ReportPlan("".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)))
+    return ReportPlan(
+        "".join(out),
+        reporting,
+        problems,
+        tuple(dict.fromkeys(vitest_dirs)),
+        tuple(command_dirs),
+    )
 
 
 def can_report(test_cmd: str, read: ReadFile | None = None) -> bool:
@@ -389,15 +409,21 @@ def with_reports(test_cmd: str, read: ReadFile | None = None) -> str:
     return plan_reports(test_cmd, read).command
 
 
+UNKNOWN_PROJECT = "\0unknown"
+
+
 @dataclass(frozen=True)
 class Case:
     id: str
     file: str
     status: str  # pass | failure | error | skipped | xfail
     assertion: bool = False  # a failure carrying the task's HMAC tag (hidden runs only)
+    # a vitest case's project dir (repo-relative, "" the root); None: not recorded, matched by
+    # path suffix as before; UNKNOWN_PROJECT: the report maps to no known dir, matches nothing
+    project: str | None = None
 
 
-def parse_junit(data: bytes, tag: str = "") -> list[Case]:
+def parse_junit(data: bytes, tag: str = "", project: str | None = None) -> list[Case]:
     if len(data) > MAX_REPORT or b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         return []
     try:
@@ -426,6 +452,7 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
                 tc.get("file") or classname,
                 status,
                 assertion,
+                project,
             )
         )
     return cases
@@ -434,6 +461,13 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
 def belongs(case: Case, files: Iterable[str]) -> bool:
     """Is a report's test case in one of these repo files? pytest names a
     module (`tests.test_a`); vitest a path relative to its project dir."""
+    if case.project is not None:
+        if case.project == UNKNOWN_PROJECT:
+            return False
+        full = case.file
+        if case.project and full != case.project and not full.startswith(case.project + "/"):
+            full = f"{case.project}/{full}"
+        return any(f == full for f in files)
     parts = case.file.split(".")
     # pytest: a module, or module.Class(.Nested): try each prefix as a .py path
     guesses = {case.file} | {"/".join(parts[:k]) + ".py" for k in range(1, len(parts) + 1)}
@@ -1191,7 +1225,14 @@ class Verifier:
             )
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)
-        cases = [c for data in r.reports.values() for c in parse_junit(data, tag)]
+        dirs = plan_reports(test_cmd, lambda path: self.ws.read_blob(repo, sha, path)).command_dirs
+        cases = []
+        for rname, data in r.reports.items():
+            project: str | None = None
+            if (m := re.fullmatch(r"vitest-(\d+)\.xml", rname)) is not None:
+                k = int(m.group(1)) - 1
+                project = dirs[k] if 0 <= k < len(dirs) else UNKNOWN_PROJECT
+            cases.extend(parse_junit(data, tag, project))
         got = judge(test_cmd, r.exit, r.timed_out, r.output)
         out: dict[str, Any] = {
             "sha": sha,
