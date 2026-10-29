@@ -486,7 +486,7 @@ def _m17_replay_kind(conn: sqlite3.Connection) -> None:
     )
 
 
-def _m17_call_key(conn: sqlite3.Connection) -> None:
+def _m18_call_key(conn: sqlite3.Connection) -> None:
     """vigild's own calls settle exactly once by call_key (#29): one row per key."""
     _add_columns(conn, "model_calls", {"call_key": "TEXT"})
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_call_key ON model_calls(call_key)")
@@ -510,7 +510,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m15_replays,
     _m16_batches,
     _m17_replay_kind,
-    _m17_call_key,
+    _m18_call_key,
 ]
 
 
