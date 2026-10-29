@@ -22,10 +22,11 @@ from tests.jobs.test_coord_loop import (  # noqa: F401
     _spend,
     world,
 )
-from tests.jobs.test_fix_with_findings import _fix, _ready, _workers
+from tests.jobs.test_fix_with_findings import _fix, _ready, _workers, seen
 from vigild.breakers import Kind
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.gateway.service import CHARS_PER_TOKEN, MIN_OUTPUT_TOKENS, worst_case_usd
+from vigild.jobs.fixfindings import selectable
 from vigild.jobs.model import Role
 from vigild.metering.prices import PriceTable
 
@@ -122,6 +123,16 @@ def test_a_fix_round_on_the_dregs_does_the_same(world: World) -> None:
     page = _out_of_cap_page(w, job)
     assert REASON in page["body"]["tasks"][task]["error"]
     assert _failures(w) == before
+
+
+def test_a_ready_job_has_its_audit_findings_whatever_ran_before(world: World) -> None:
+    """`_ready`'s audit stand-in counts calls in a module-level list; a fix-with-
+    findings test earlier on the same xdist worker must not leave it spent."""
+    w = world
+    seen.extend([1, 1])  # what two earlier audits of w1 leave behind
+    job, _ = _ready(w)
+    ids = [f["id"] for f in selectable(w.store, job, f"{job}-w1")]
+    assert "audit:0" in ids
 
 
 def test_with_enough_cap_the_run_goes_on_as_today(world: World) -> None:
