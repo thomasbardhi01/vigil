@@ -1026,3 +1026,108 @@ def test_no_hidden_or_flagged_checkout_carries_history(ws: Workspace, tmp_path: 
     assert len(probe.seen) >= 6
     for facts in probe.seen:
         _assert_one_tree_no_history(facts, gold)
+
+
+def _commit_on(
+    ws: Workspace, parent: str, entries: list[tuple[str, str, str, str]], drop: tuple[str, ...] = ()
+) -> str:
+    """A commit in the vault on `parent` with (mode, sha, path, _) index entries added or
+    `drop` paths removed, made with plumbing and a throwaway index."""
+    vault = ws.vault(REPO)
+    idx = vault / "tmp-index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+
+    def run(*args: str, stdin: str | None = None) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=vault,
+            env=env,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    run("read-tree", parent)
+    for mode, sha, path, _ in entries:
+        run("update-index", "--add", "--cacheinfo", f"{mode},{sha},{path}")
+    for path in drop:
+        run("update-index", "--index-info", stdin=f"0 {'0' * 40}\t{path}\n")
+    tree = run("write-tree")
+    idx.unlink()
+    new = _g(
+        vault,
+        "-c",
+        "user.name=g",
+        "-c",
+        "user.email=g@x",
+        "commit-tree",
+        tree,
+        "-p",
+        parent,
+        "-m",
+        "c",
+    )
+    _g(vault, "update-ref", f"refs/vigil/x-{new[:8]}", new)
+    return new
+
+
+def _blob(ws: Workspace, data: str) -> str:
+    return _g(ws.vault(REPO), "hash-object", "-w", "--stdin", stdin=data)
+
+
+def _base_commit(ws: Workspace, tmp_path: Path) -> str:
+    return _session(ws, tmp_path, _turn_on)[1]
+
+
+def test_gold_blob_in_the_ancestry_is_not_reachable(ws: Workspace, tmp_path: Path) -> None:
+    head = _base_commit(ws, tmp_path)
+    gold = _blob(ws, "GOLD = 'the answer'\n")
+    with_gold = _commit_on(ws, head, [("100644", gold, "gold.py", "")])
+    sha = _commit_on(ws, with_gold, [], drop=("gold.py",))
+    src = ws.verify_checkout(REPO, "gold", sha)
+    _assert_one_tree_no_history(_history_facts(src), gold)
+
+
+def test_the_gold_check_goes_red_without_the_single_commit(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = _base_commit(ws, tmp_path)
+    gold = _blob(ws, "GOLD = 'the answer'\n")
+    with_gold = _commit_on(ws, head, [("100644", gold, "gold.py", "")])
+    sha = _commit_on(ws, with_gold, [], drop=("gold.py",))
+    monkeypatch.setattr(Workspace, "_one_commit", lambda self, *a, **k: None)
+    src = ws.verify_checkout(REPO, "gold", sha)
+    assert gold in _history_facts(src)["objects"]  # the check can fail
+
+
+def test_the_checkout_tree_is_the_tree_under_test(ws: Workspace, tmp_path: Path) -> None:
+    head = _base_commit(ws, tmp_path)
+    crlf = _blob(ws, "a\r\nb\r\n")
+    exe = _blob(ws, "#!/bin/sh\n")
+    link = _blob(ws, "src/feature.py")
+    attrs = _blob(ws, "* text eol=lf\n")
+    sub = "1" * 40
+    sha = _commit_on(
+        ws,
+        head,
+        [
+            ("160000", sub, "sub", ""),
+            ("100644", crlf, "crlf.txt", ""),
+            ("100755", exe, "run.sh", ""),
+            ("120000", link, "link", ""),
+            ("100644", attrs, ".gitattributes", ""),
+        ],
+    )
+    src = ws.verify_checkout(REPO, "tree", sha)
+    assert _g(src, "rev-parse", "HEAD^{tree}") == _g(ws.vault(REPO), "rev-parse", f"{sha}^{{tree}}")
+    assert _g(src, "rev-list", "--count", "HEAD") == "1"
+
+
+def test_an_unknown_encoding_attribute_still_checks_out(ws: Workspace, tmp_path: Path) -> None:
+    head = _base_commit(ws, tmp_path)
+    attrs = _blob(ws, "src/feature.py working-tree-encoding=NOPE-ENC\n")
+    sha = _commit_on(ws, head, [("100644", attrs, ".gitattributes", "")])
+    src = ws.verify_checkout(REPO, "enc", sha)
+    assert _g(src, "rev-parse", "HEAD^{tree}") == _g(ws.vault(REPO), "rev-parse", f"{sha}^{{tree}}")
+    assert len(_history_facts(src)["commits"]) == 1

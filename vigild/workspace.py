@@ -345,26 +345,41 @@ class Workspace:
             dest = src / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(text)
-        self._one_commit(src)
+        self._one_commit(src, root)
         return src
 
-    def _one_commit(self, src: Path) -> None:
-        """ADR-0006 A1: the checkout carries no history. The fetch above brought
-        the whole ancestry of `sha` (and of each overlay commit), so the work
-        tree is kept and the `.git` is replaced by a new one holding a single
-        commit of this tree: no alternates, no other ref, no packed refs, no
-        reflog, no object from any other commit (a bench task's gold patch
-        is a later commit in the vault and can't be reached)."""
-        shutil.rmtree(src / ".git")
-        self._git(src, "init", "--quiet", ".")
-        self._git(src, "config", "core.hooksPath", "/dev/null")
-        self._git(src, "config", "core.fsmonitor", "false")
-        self._git(src, "config", "core.logAllRefUpdates", "false")
-        self._git(src, "add", "-A", "-f", "--", ".")
-        self._git(
+    def _one_commit(self, src: Path, root: Path) -> None:
+        """ADR-0006 A1: the checkout carries no history. The fetch brought the
+        whole ancestry of `sha` (and of each overlay commit), so the index's
+        exact tree (`sha` plus every `take` overlay: gitlinks, modes and blobs
+        as committed, nothing re-added or renormalised) becomes one parentless
+        commit. A new `.git` beside `src` fetches only that commit (its tree
+        and blobs; a gitlink is not followed) and replaces `src/.git`; the work
+        tree is untouched, so `put` files stay uncommitted changes. No remote,
+        alternates, other ref, packed refs, reflog or FETCH_HEAD, and no object
+        from any other commit (a bench task's gold patch is a later vault
+        commit and can't be reached). The commit's sha is new on every run (a
+        fresh timestamp): nothing may depend on it."""
+        tree = self._git(src, "write-tree")
+        one = self._git(
             src, "-c", "user.name=vigild", "-c", "user.email=vigild@localhost",
-            "commit", "--quiet", "--allow-empty", "--no-verify", "-m", "verifier checkout",
+            "commit-tree", tree, "-m", "verifier checkout",
         )  # fmt: skip
+        fresh = root / "onegit"
+        self._git(root, "init", "--quiet", "--bare", str(fresh))
+        self._git(fresh, "config", "core.bare", "false")
+        self._git(fresh, "config", "core.hooksPath", "/dev/null")
+        self._git(fresh, "config", "core.fsmonitor", "false")
+        self._git(fresh, "config", "core.logAllRefUpdates", "false")
+        self._git(src, "update-ref", "refs/vigil/one", one)
+        self._git(
+            fresh, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            str(src), f"+{one}:refs/heads/verify",
+        )  # fmt: skip
+        self._git(fresh, "symbolic-ref", "HEAD", "refs/heads/verify")
+        shutil.rmtree(src / ".git")
+        fresh.rename(src / ".git")
+        self._git(src, "reset", "--quiet")
 
     def keep_hidden_output(self, name: str, text: str) -> Path:
         """The full output of a hidden-test run, kept on the host (mode 600) in
