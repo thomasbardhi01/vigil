@@ -1,7 +1,8 @@
 """Stage 3 acceptance (design "Job execution protocol"), checked by vigild on
 the host, in the vault, after the worker container exits and before anything
 is pushed: must_fail_first observed, test_cmd passes, files changed inside
-scope, no test weakened, cost under the limit. Lint and types run in CI.
+scope, no test weakened, the completion-integrity rules
+(`jobs/integrity.py`), cost under the limit. Lint and types run in CI.
 
 Test results come only from vigild's verifier (owner direction, review round
 2; `vigild/verifier.py`): the worker report's test fields are ignored. It
@@ -11,11 +12,13 @@ outcome other than `fail` before and `pass` after is a rejection."""
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
+from vigild.jobs.integrity import Finding, blocking, check_integrity
 from vigild.verifier import TEST_FILE, invoked_scripts
 from vigild.workspace import Workspace
 
@@ -159,6 +162,7 @@ def check_worker(
     cost: float,
     runner_config: list[str] | tuple[str, ...] = (),
     session_base: str | None = None,
+    on_findings: Callable[[list[Finding]], None] | None = None,
 ) -> list[str]:
     spec = contract["spec"]
     errors: list[str] = []
@@ -191,6 +195,11 @@ def check_worker(
         errors.append(f"files changed outside scope: {outside}")
     for w in weakened_tests(ws, repo, base_sha, head):
         errors.append(f"test weakened: {w}")
+    # #104: rules only, never fixed; #131: report-only unless integrity.ENFORCE
+    found = check_integrity(ws, repo, base_sha, head, report)
+    if on_findings and found:
+        on_findings(found)
+    errors += [str(f) for f in blocking(found)]
     limit = float((contract.get("limits") or {}).get("max_cost_usd") or 0)
     if limit and cost > limit + 1e-9:
         errors.append(f"cost ${cost:.4f} is over the limit ${limit:.2f}")
