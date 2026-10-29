@@ -32,6 +32,7 @@ from vigild.hidden import public_view
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
+from vigild.jobs import decisions
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
@@ -1188,6 +1189,8 @@ class JobService:
                     job_id, "spec_previous.md", spec.content, Provenance(spec.provenance)
                 )
         self.store.add_event("replan", data, Provenance.HUMAN, job_id=job_id)
+        first = (note or "").strip().splitlines()
+        decisions.add(self.store, job_id, "vigild", "replan", first[0] if first else "no note")
 
     def abandon(self, item_id: int, job_id: str | None = None) -> Job:
         """Give the job up: nothing more runs; open PRs stay for you to close.

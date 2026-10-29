@@ -322,7 +322,9 @@ stateDiagram-v2
   the findings and the verifier summary (all but spec.md fenced), never the
   worker's transcript; a retry of a published task starts the same way. The
   fork stays for true escalation: rule 5 or attempt >=
-  `routing.escalate_attempt`; a crashed worker still resumes its own session. The job goes `ready` to `building`
+  `routing.escalate_attempt`; a crashed worker still resumes its own session.
+  Every such session (and the replan coord and the reviewer, not the auditor) also gets the
+  job's **decisions log** as a fenced `decisions` section (ADR-0005 part 4, below). The job goes `ready` to `building`
   (an FSM edge only that action may take), the task `reviewed` to `fix`, and the
   round counts in `review_rounds`; the verifier, a re-review and a re-audit follow,
   and `in_review` to `ready` files a new Ready to merge item. Only a `ready` job
@@ -362,6 +364,14 @@ flowchart TD
 - `events`: every state change, executor event (`tool_call`,
   `tool_result`, `state`, …), packet drop log, gateway refusal and page.
 - `artifacts`: every stage artifact by job and task, with its hash.
+  - `decisions.jsonl` (job level, append only): lines `{ts, by, kind, text}` (`DecisionLine`,
+    `text` <= 300 characters, every line through `redact`). The coord writes
+    `.vigil/<job>/decisions.jsonl` in its clone; vigild reads it as a vault blob, drops invalid
+    lines (counted in a `decisions` event), sets `by` to `coord`, and appends. vigild appends
+    `gate` (first error of a refused spec), `replan` (the note's first line, or "no note") and
+    `escalation` (the reason). A worker's copy is never read. The replan coord, worker, fix
+    round and reviewer packets carry the log fenced, newest last, at most 4,000 characters
+    (oldest dropped, with a note); the auditor's packet does not (`vigild/jobs/decisions.py`).
 - `inbox_items`: the three queues (`specs`, `ready`, `questions`);
   `approvals`: who approved what, from where, with which edits.
 - `model_calls`: one row per model call with tokens (in, out, cache read,
