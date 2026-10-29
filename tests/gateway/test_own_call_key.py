@@ -22,7 +22,7 @@ def _page(store: Any) -> Any:
     return page
 
 
-def test_failure_before_the_insert_books_the_reservation(cfg: Config, monkeypatch: Any) -> None:
+def test_failure_before_insert_books_the_reservation(cfg: Config, monkeypatch: Any) -> None:
     store, _b, gw, _s, _c = _setup(cfg, monkeypatch, Up())
 
     def boom(*a: Any, **k: Any) -> float:
@@ -36,7 +36,7 @@ def test_failure_before_the_insert_books_the_reservation(cfg: Config, monkeypatc
     assert _page(store).body["row_written"] is False
 
 
-def test_failure_after_the_commit_books_the_row_once(cfg: Config, monkeypatch: Any) -> None:
+def test_failure_after_commit_books_the_row_once(cfg: Config, monkeypatch: Any) -> None:
     store, _b, gw, _s, _c = _setup(cfg, monkeypatch, Up())
     real = gsvc.record_call
 
