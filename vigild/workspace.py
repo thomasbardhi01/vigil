@@ -198,6 +198,10 @@ class Workspace:
         self._git(clone, "commit", "-q", "--no-verify", "-m", message)
         return self._git(clone, "rev-parse", "HEAD")
 
+    def clone_head(self, clone: Path) -> str:
+        """A clone's HEAD, read before any session has touched it."""
+        return self._git(clone, "rev-parse", "HEAD")
+
     def write_task(self, clone: Path, contract: dict[str, Any]) -> Path:
         path = clone / ".vigil" / "task.json"
         path.parent.mkdir(parents=True, exist_ok=True)

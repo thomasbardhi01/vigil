@@ -56,6 +56,7 @@ from vigild.contract.models import (
     BLOCKING,
     Audit,
     AuditOutput,
+    ExecutorEvidence,
     Limits,
     Review,
     ReviewOutput,
@@ -84,6 +85,7 @@ from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
 from vigild.jobs.bench import TAGS as BENCH_TAGS
 from vigild.jobs.deps import infer_deps, is_lockfile
+from vigild.jobs.evidence import executor_block, failure_diagnostic, without_executor
 from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
@@ -2950,7 +2952,19 @@ class JobRunner:
             "vigil.attempt": int(contract.get("attempt", 1)),
         }
         self.store.update_session(
-            s.id, detail={"image": session_image, "session_base": session_base}
+            s.id,
+            detail={
+                "image": session_image,
+                "session_base": session_base,
+                # the executor evidence (#106): vigild's own record of the launch
+                "image_digest": session_image or image,
+                "base_sha": base_sha,
+                "launch_head": self.workspace.clone_head(clone),
+                "lineage": {
+                    "parent_session_id": prev.id if prev else None,
+                    "mode": "resume" if crashed else "fork" if resume is not None else "fresh",
+                },
+            },
         )
         out = self._run_session(s, spec, reservation, attrs)
         if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
@@ -2958,7 +2972,13 @@ class JobRunner:
             return False
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
-            self.store.update_session(s.id, status="crashed")
+            self.store.update_session(
+                s.id,
+                status="crashed",
+                detail={
+                    "failure_diagnostic": failure_diagnostic(out.status, out.exit_code, out.error)
+                },
+            )
             self.store.add_event(
                 "crashed", {"error": (out.error or "")[:500], "exit": out.exit_code},
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
@@ -2984,6 +3004,12 @@ class JobRunner:
         if hook:
             self.store.update_session(s.id, detail=hook)  # the Stop hook's record (item 6)
         if out.status != "done":
+            self.store.update_session(
+                s.id,
+                detail={
+                    "failure_diagnostic": failure_diagnostic(out.status, out.exit_code, out.error)
+                },
+            )
             return self._fail(
                 job_id,
                 s,
@@ -3033,7 +3059,7 @@ class JobRunner:
             )
         raw = self.workspace.read_blob(job.repo, head, f"{art_dir}/worker_report.json", 256 << 10)
         try:
-            report = WorkerReport.model_validate_json(raw or "")
+            report = WorkerReport.model_validate_json(without_executor(raw or ""))
         except ValidationError as e:
             return self._fail(
                 job_id,
@@ -3120,6 +3146,15 @@ class JobRunner:
             update={
                 "test_before": as_outcome((tests or {}).get("before")),
                 "test_after": as_outcome((tests or {}).get("after")),
+                # from vigild's records, never the worker's claims (#106); a failed
+                # earlier attempt's diagnostic rides on the next session's report
+                "executor": ExecutorEvidence.model_validate(
+                    executor_block(
+                        self.store.get_session(s.id).detail,
+                        head,
+                        prev.detail.get("failure_diagnostic") if prev else None,
+                    )
+                ),
             }
         )
         self.store.add_artifact(
