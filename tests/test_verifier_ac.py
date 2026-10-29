@@ -195,3 +195,14 @@ def test_an_ac_command_identical_to_test_cmd_reuses_the_after_run(
     rec = _verify(ws, base, head, [("pytest -q tests", ["AC1"])], again)
     assert len(again.calls) == len(plain.calls)
     assert rec["ac"][0]["selected"] == rec["after"]["tests"] and rec["ac"][0]["outcome"] == "pass"
+
+
+def test_a_script_only_an_ac_command_runs_is_in_the_overlap_when_scope_names_it() -> None:
+    """#139 round 2: acceptance lets a worker change an AC-invoked script its spec names by
+    exact path, so the verifier must run the head's copy (the overlap), as for test_cmd's."""
+    from vigild.verifier import runner_overlap
+
+    scope = ["tools/prep.py", "tests/test_x.py"]
+    assert runner_overlap(scope, [], "uv run pytest -q") == []
+    got = runner_overlap(scope, [], "uv run pytest -q", "python tools/prep.py && pytest -k x")
+    assert got == ["tools/prep.py"]

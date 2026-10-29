@@ -3086,10 +3086,16 @@ class JobRunner:
         test_cmd = str(contract["spec"].get("test_cmd") or "")
         # owner ruling, 2026-10-23: vigild computes the class itself; the contract's
         # marker is the durable copy, not the authority
+        ac_runs, ac_refused = (
+            self._ac_commands(job_id, job.repo, base_sha, contract)
+            if test_cmd.strip()
+            else ([], [])
+        )
         overlap = runner_overlap(
             contract["spec"].get("files_in_scope") or [],
             self.cfg.repo(job.repo).runner_config,
             test_cmd,
+            *(c for c, _ in ac_runs),
         )
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
@@ -3103,7 +3109,6 @@ class JobRunner:
             # without the key nothing hidden can count: escalate, never retry forever
             hidden_entry = {"status": "missing", "reason": "VIGIL_HOST_KEY is not set"}
         if test_cmd.strip():
-            ac_runs, ac_refused = self._ac_commands(job_id, job.repo, base_sha, contract)
             try:
                 with job_scope(job_id), halt_when(lambda: self._abandoned(job_id)):
                     tests = self.verifier.verify(

@@ -178,11 +178,17 @@ def runner_globs(runner_config: Iterable[str], test_cmd: str) -> list[str]:
     return [*runner_config, *invoked_scripts(test_cmd)]
 
 
-def runner_overlap(scope: Iterable[str], runner_config: Iterable[str], test_cmd: str) -> list[str]:
-    """The literal entries in a task's scope that the verifier pins to the base
-    (a glob in scope can't change a runner file: acceptance refuses a changed
-    runner file the spec doesn't name by its exact path)."""
-    globs = runner_globs(runner_config, test_cmd)
+def runner_overlap(
+    scope: Iterable[str], runner_config: Iterable[str], test_cmd: str, *ac_cmds: str
+) -> list[str]:
+    """The literal entries in a task's scope that name a runner file: the head's copy runs
+    in every run (a glob in scope can't change a runner file: acceptance refuses a changed
+    runner file the spec doesn't name by its exact path). `ac_cmds`: the scripts AC
+    commands run count too (#136), as acceptance lets the spec name them."""
+    globs = [
+        *runner_globs(runner_config, test_cmd),
+        *(s for c in ac_cmds for s in invoked_scripts(c)),
+    ]
     return sorted({f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)})
 
 

@@ -26,6 +26,10 @@ from vigild.jobs.artifacts import ac_refs, parse_plan, parse_spec
         ("AC1, 5 files", {"AC1"}),
         ("the extra doc", set()),
         ("BAC1 or AC", set()),
+        ("AC1 through AC3", {"AC1", "AC2", "AC3"}),  # #139 round 2
+        ("AC1..AC3", {"AC1", "AC2", "AC3"}),
+        ("AC-2 and AC#3", {"AC2", "AC3"}),
+        ("ac12b", set()),
     ],
 )
 def test_ac_refs(text: str, want: set[str]) -> None:

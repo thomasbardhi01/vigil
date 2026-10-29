@@ -128,10 +128,12 @@ TEST = re.compile(r"test:\s*`([^`]+)`")
 TICK = re.compile(r"`([^`]+)`")
 
 
+_SEP = r"[-\u2013\u2014]|\.\.|,|and\b|&|to\b|through\b"
+_ID = r"\s*[-#]?\s*"  # `AC2`, `AC 2`, `AC-2`, `AC#2`
 AC_REF = re.compile(
-    r"\b(ACs?)\s*(\d+)((?:\s*(?:[-\u2013\u2014]|,|and\b|&|to\b)\s*(?:ACs?\s*)?\d+)*)", re.I
+    rf"\b(ACs?){_ID}(\d+)(?!\w)((?:\s*(?:{_SEP})\s*(?:ACs?{_ID})?\d+(?!\w))*)", re.I
 )
-AC_TAIL = re.compile(r"\s*([-\u2013\u2014]|,|and\b|&|to\b)\s*(ACs?\s*)?(\d+)", re.I)
+AC_TAIL = re.compile(rf"\s*({_SEP})\s*(ACs?{_ID})?(\d+)", re.I)
 MAX_RANGE = 50
 
 
@@ -147,7 +149,7 @@ def ac_refs(text: str) -> set[str]:
         out.add(f"AC{prev}")
         for sep, prefix, num in AC_TAIL.findall(m.group(3)):
             n = int(num)
-            if sep.lower() in ("-", "\u2013", "\u2014", "to"):
+            if sep.lower() in ("-", "\u2013", "\u2014", "to", "..", "through"):
                 if prev < n <= prev + MAX_RANGE:
                     out.update(f"AC{i}" for i in range(prev, n + 1))
                 out.add(f"AC{n}")
