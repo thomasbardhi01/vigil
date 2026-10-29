@@ -57,7 +57,8 @@ def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
     assert kw["cap_drop"] == ["ALL"]
     assert sorted(kw["cap_add"]) == ["KILL", "SETGID", "SETUID"]
     assert "no-new-privileges" in kw["security_opt"]
-    assert kw["pids_limit"] == 512
+    assert kw["pids_limit"] == 512  # 512 holds: init reaps the orphans (#112)
+    assert kw["init"] is True  # tini is PID 1; the harness is its root child
     assert kw["mem_limit"] == "4g"
     assert set(kw["tmpfs"]) == {"/tmp", "/run/vigil"}
     assert kw["network"] == "vigil-s-abc123"
