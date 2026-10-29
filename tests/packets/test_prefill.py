@@ -173,7 +173,6 @@ def test_a_packet_without_a_prefill_is_unchanged(repo: Path) -> None:
     assert "3b. Prefill" not in text and "UNTRUSTED prefill" not in text
 
 
-DW38 = Path("/Users/thomasbardhi/vigil-data/coord/dogfood/dw-38.json")
 DW38_REQUEST = {
     "title": "Amended spec items show the worker-contract diff (#38)",
     "request": "Compute it in vigild/jobs/ownernote.py. (3) the coord prompt keeps every field "
@@ -204,14 +203,3 @@ def test_no_other_files_does_not_exclude_the_named_ones(repo: Path) -> None:
     pre = compute_prefill(repo, req, policy=policy(), money_globs=MONEY)
     assert pre.candidates == ["vigild/budget.py", "vigild/other.py"]
     assert pre.out_of_scope == []
-
-
-def test_the_real_dw_38_request(repo: Path) -> None:
-    import json
-
-    if not DW38.exists():
-        pytest.skip("dw-38.json is on the coordinator's machine")
-    (repo / "vigild/jobs/ownernote.py").write_text("Z = 1\n")
-    pre = compute_prefill(repo, json.loads(DW38.read_text()), policy=policy(), money_globs=MONEY)
-    assert "vigild/jobs/ownernote.py" in pre.candidates
-    assert "vigild/jobs/runner.py" in pre.out_of_scope
