@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -141,3 +142,9 @@ def test_the_same_call_key_recorded_twice_is_one_row(cfg: Config) -> None:
     again = record_call(store, pt, usage=CallUsage(tokens_in=5000, tokens_out=99), **kw)
     assert again == first > 0
     assert store.q("SELECT COUNT(*) n FROM model_calls WHERE call_key='k-1'")[0]["n"] == 1
+    # the unique index itself refuses a plain duplicate INSERT (not only record_call's fast path)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.x(
+            "INSERT INTO model_calls (purpose, provider, backend_preset, model, ts, call_key)"
+            " VALUES ('decider','anthropic','claude-haiku','claude-haiku-5-5','2026-01-01','k-1')"
+        )
