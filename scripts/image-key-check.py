@@ -100,6 +100,16 @@ def suite_run_args(tag: str, src: Path, cmd: str) -> list[str]:
     return run
 
 
+def export_head(src: Path) -> None:
+    """HEAD's tracked files into `src`, readable by the agent uid that runs the suites
+    (#123: a TemporaryDirectory is 0700 and owned by the runner, so `/src` was not)."""
+    archive = subprocess.run(
+        ["git", "archive", "HEAD"], cwd=ROOT, capture_output=True, check=True
+    ).stdout
+    subprocess.run(["tar", "-x", "-C", str(src)], input=archive, check=True)
+    src.chmod(0o755)
+
+
 def validate(cfg: Config, repo: str) -> int:
     """The dev image from the lockfiles alone, then each dev_suites command in it
     with no network, as the agent uid, on a clean export of HEAD (no .git, no .venv)."""
@@ -116,10 +126,7 @@ def validate(cfg: Config, repo: str) -> int:
             return 1
     failed = []
     with tempfile.TemporaryDirectory() as src:
-        archive = subprocess.run(
-            ["git", "archive", "HEAD"], cwd=ROOT, capture_output=True, check=True
-        ).stdout
-        subprocess.run(["tar", "-x", "-C", src], input=archive, check=True)
+        export_head(Path(src))
         for name, cmd in pol.dev_suites.items():
             print(f"::group::suite {name}: {cmd}", flush=True)
             rc = subprocess.run(suite_run_args(tag, Path(src), cmd), check=False).returncode
