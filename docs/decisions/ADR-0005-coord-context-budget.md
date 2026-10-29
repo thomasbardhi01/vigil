@@ -86,6 +86,7 @@ The single `coord: claude-opus` becomes rules, top to bottom, first match wins. 
   - **Each line:** `{ts, by: coord|vigild, kind, text}`, with `text` of at most 300 characters.
   - **Checks:** vigild validates each line against a pydantic model and runs it through `redact`.
   - **Use:** every later session of the job (replan coord, worker, fix round, reviewer) gets it in its packet, fenced as data.
+- **Built:** `decisions.jsonl`; the Explore subagent waits for the owner's gateway read. vigild appends `gate`, `replan` and `escalation` lines itself, the auditor gets no log, and the packet section is capped at 4,000 characters, oldest lines dropped with a note (`vigild/jobs/decisions.py`).
 
 ### 5. vigild pre-fills the mechanical parts
 Before the coord runs, vigild computes these and writes them into the spec and plan skeleton the coord receives:
