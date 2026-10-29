@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import contextlib
 import shutil
+import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,6 +40,9 @@ def runtime(cfg: Config) -> DockerRuntime:
             pytest.fail(f"{image} is not built; run scripts/build-images.py")
     return DockerRuntime(cfg, client)
 
+
+RUN_LABEL = "vigil.test-run"
+SESSION_LABEL = "dev.vigil.session"
 
 LAYERED = ("parkagent", "vigil")
 
@@ -80,6 +85,7 @@ def make_spec(
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     n = [0]
     made: list[str] = []
+    run_id = uuid.uuid4().hex
 
     def make(role: Role = Role.WORKER) -> SessionSpec:
         n[0] += 1
@@ -120,21 +126,31 @@ def make_spec(
         yield make
     finally:
         # a session id repeats from run to run, so a network a test left behind makes the
-        # next run's create fail with 409: remove each one this test made, containers too
-        _remove_session_networks(made)
+        # next run's create fail with 409: remove what this run made, by label
+        _teardown_run(_docker(), session_ids=made, run_id=run_id)
         shutil.rmtree(tmp_path / "data", ignore_errors=True)
 
 
-def _remove_session_networks(session_ids: list[str]) -> None:
-    client = _docker()
-    for sid in session_ids:
-        # `names` filters by substring: keep only the exact name
-        for net in client.networks.list(names=[f"vigil-{sid}"]):  # type: ignore[attr-defined]
-            if net.name != f"vigil-{sid}":
-                continue
-            net.reload()
-            for c in net.containers:
-                with contextlib.suppress(Exception):  # already gone
-                    c.remove(force=True)
+def _teardown_run(client: Any, *, session_ids: list[str], run_id: str) -> None:
+    """Remove only what this run made, selected by label (never by name or by
+    network membership). A container on a run network that lacks this run's
+    label is disconnected, not removed (Phase 1 finding #5)."""
+    selectors = [f"{SESSION_LABEL}={sid}" for sid in session_ids] + [f"{RUN_LABEL}={run_id}"]
+    mine = set(session_ids)
+
+    def is_mine(labels: dict[str, str] | None) -> bool:
+        labels = labels or {}
+        return labels.get(RUN_LABEL) == run_id or labels.get(SESSION_LABEL) in mine
+
+    for sel in selectors:
+        for c in client.containers.list(all=True, filters={"label": sel}):
+            with contextlib.suppress(Exception):  # NotFound: already gone
+                c.remove(force=True)
+    for sel in selectors:
+        for net in client.networks.list(filters={"label": sel}):
             with contextlib.suppress(Exception):
+                net.reload()
+                for c in list(net.containers):
+                    if not is_mine(c.labels):
+                        net.disconnect(c, force=True)
                 net.remove()
