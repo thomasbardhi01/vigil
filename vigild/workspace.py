@@ -345,7 +345,26 @@ class Workspace:
             dest = src / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(text)
+        self._one_commit(src)
         return src
+
+    def _one_commit(self, src: Path) -> None:
+        """ADR-0006 A1: the checkout carries no history. The fetch above brought
+        the whole ancestry of `sha` (and of each overlay commit), so the work
+        tree is kept and the `.git` is replaced by a new one holding a single
+        commit of this tree: no alternates, no other ref, no packed refs, no
+        reflog, no object from any other commit (a bench task's gold patch
+        is a later commit in the vault and can't be reached)."""
+        shutil.rmtree(src / ".git")
+        self._git(src, "init", "--quiet", ".")
+        self._git(src, "config", "core.hooksPath", "/dev/null")
+        self._git(src, "config", "core.fsmonitor", "false")
+        self._git(src, "config", "core.logAllRefUpdates", "false")
+        self._git(src, "add", "-A", "-f", "--", ".")
+        self._git(
+            src, "-c", "user.name=vigild", "-c", "user.email=vigild@localhost",
+            "commit", "--quiet", "--allow-empty", "--no-verify", "-m", "verifier checkout",
+        )  # fmt: skip
 
     def keep_hidden_output(self, name: str, text: str) -> Path:
         """The full output of a hidden-test run, kept on the host (mode 600) in

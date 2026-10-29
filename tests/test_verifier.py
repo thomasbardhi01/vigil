@@ -935,3 +935,94 @@ def test_mff_off_without_a_second_base_report_settles_nothing() -> None:
     base = [Case("test/a.test.ts::row 111", "test/a.test.ts", "pass")]
     ids = Verifier._ids_after({"_report": True, "_cases": cases}, ["test/a.test.ts"], base, None)
     assert not ids["checked"] and "second base run" in ids["note"]
+
+
+# --- no history in a checkout (ADR-0006 A1) ---------------------------------------------------
+
+
+def _g(cwd: Path, *args: str, stdin: str | None = None) -> str:
+    """Plain git, only ever inside the test's own temp checkout or vault."""
+    return subprocess.run(
+        ["git", *args], cwd=cwd, input=stdin, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _history_facts(src: Path) -> dict[str, Any]:
+    objs = _g(src, "cat-file", "--batch-all-objects", "--batch-check").splitlines()
+    git_dir = src / ".git"
+    return {
+        "log": _g(src, "log", "--all", "--format=%H").splitlines(),
+        "revs": _g(src, "rev-list", "--all").splitlines(),
+        "objects": [o.split()[0] for o in objs],
+        "commits": [o for o in objs if o.split()[1] == "commit"],
+        "alternates": (git_dir / "objects" / "info" / "alternates").exists(),
+        "packed_refs": (git_dir / "packed-refs").exists(),
+        "reflogs": (git_dir / "logs").exists() and any((git_dir / "logs").rglob("*")),
+        "refs": _g(src, "for-each-ref", "--format=%(refname)").splitlines(),
+    }
+
+
+class HistoryProbe(LocalTestRunner):
+    """Records what each checkout's .git holds at the moment the tests run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[dict[str, Any]] = []
+
+    def run(self, image: str, source: Path, command: str, **kw: Any) -> Any:
+        self.seen.append(_history_facts(source))
+        if kw.get("subject"):
+            self.seen.append(_history_facts(kw["subject"]))
+        return super().run(image, source, command, **kw)
+
+
+def _gold_blob(ws: Workspace, head: str) -> str:
+    """A stand-in for the gold patch: a blob in a commit that is in the vault,
+    after `head`, and is not the commit under test."""
+    vault = ws.vault(REPO)
+    blob = _g(vault, "hash-object", "-w", "--stdin", stdin="GOLD = 'the answer'\n")
+    tree = _g(vault, "mktree", stdin=f"100644 blob {blob}\tgold.py\n")
+    later = _g(
+        vault,
+        "-c",
+        "user.name=g",
+        "-c",
+        "user.email=g@x",
+        "commit-tree",
+        tree,
+        "-p",
+        head,
+        "-m",
+        "gold",
+    )
+    _g(vault, "update-ref", "refs/vigil/gold", later)
+    return blob
+
+
+def _assert_one_tree_no_history(f: dict[str, Any], gold: str) -> None:
+    assert len(f["commits"]) <= 1, f
+    assert len(f["log"]) <= 1 and len(f["revs"]) <= 1, f
+    assert not f["alternates"] and not f["packed_refs"] and not f["reflogs"], f
+    assert len(f["refs"]) <= 1, f
+    assert gold not in f["objects"], "the gold blob is reachable"
+
+
+def test_no_checkout_carries_history_or_the_gold_blob(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _session(ws, tmp_path, _turn_on)
+    gold = _gold_blob(ws, head)
+    probe = HistoryProbe()
+    _verify(ws, base, head, runner=probe)
+    assert len(probe.seen) == 4  # base twice, before, after
+    for facts in probe.seen:
+        _assert_one_tree_no_history(facts, gold)
+
+
+def test_no_hidden_or_flagged_checkout_carries_history(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _session(ws, tmp_path, _runner_edit)
+    suite = _hidden_suite(ws, tmp_path)
+    gold = _gold_blob(ws, head)
+    probe = HistoryProbe()
+    _verify_flagged(ws, base, head, suite, probe)
+    assert len(probe.seen) >= 6
+    for facts in probe.seen:
+        _assert_one_tree_no_history(facts, gold)

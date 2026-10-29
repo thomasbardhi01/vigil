@@ -27,6 +27,7 @@ G is docs only and can be done any time. H waits for the bench freeze to lift.
    - The verifier's checkouts carry no `.git` history: a bare tree, or a shallow export with a new `.git`. Nothing reachable in them goes past the commit under test: no objects, no alternates, no refs.
    - Today the checkout already gets "a new `.git`" (`vigild/verifier.py`). A1 confirms that no history object is reachable, and adds the test.
    - **For bench tasks this is mandatory:** the gold patch must never be reachable from the checkout's history.
+   - **Built:** the fetch pulled the whole ancestry, so it did not hold. `Workspace.verify_checkout` now replaces the `.git` with a new one holding one commit of the tree; tests cover base, before, after and hidden, and a stand-in gold blob in the vault.
    - **Test:** in each of the after, before and hidden runs, `git log`, `git cat-file --batch-all-objects`, `git rev-list --all` and the alternates file show nothing beyond the one tree. For a bench task, the gold patch's blob ids are absent.
 2. **Gold-gated mutation strengthening of acceptance tests.**
    - A local model on the tower generates mutants of the gold patch (bench) or the merged patch (vigil's own tasks).
