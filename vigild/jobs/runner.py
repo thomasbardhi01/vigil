@@ -33,6 +33,7 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import hashlib
 import json
@@ -44,7 +45,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -136,7 +137,7 @@ from vigild.router.rules import CoordShape, RoutingError, request_paths, route, 
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import Halted, Verifier, halt_when, runner_like, runner_overlap
+from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -2188,6 +2189,25 @@ class JobRunner:
 
     # --- stages 2-3: planning and building -----------------------------------------------
 
+    def _has_existing_tests(self, repo: str, base: str, files: list[str]) -> bool:
+        """Is there a test for this scope at the base branch (as last mirrored)? An in-scope
+        path that is a test file, or the packet assembler's related test: a path under
+        tests/ named test_<stem>*.py for a scope entry without `*`. Rules 4 and 6 read it."""
+        paths = self.workspace.mirror_paths(repo, base)
+        for f in files:
+            if "*" in f:
+                continue
+            if TEST_FILE.search(f) and self.workspace.mirror_file(repo, base, f) is not None:
+                return True
+            stem = PurePosixPath(f).stem
+            if any(
+                p.startswith("tests/")
+                and fnmatch.fnmatchcase(PurePosixPath(p).name, f"test_{stem}*.py")
+                for p in paths
+            ):
+                return True
+        return False
+
     def _task(self, job_id: str, repo: str, base: str, source: str, w: WorkerContract) -> Task:
         cap = (
             self.cfg.budgets.bench_task_usd if source == "bench" else self.cfg.budgets.per_task_usd
@@ -2216,6 +2236,7 @@ class JobRunner:
             depends_on=w.depends_on,
             labels=w.labels,
             size=w.size,
+            has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
             runner_file_change=runner_overlap(
                 w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd
             ),

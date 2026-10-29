@@ -582,7 +582,9 @@ your Max plan and aren't counted.
   - bearer scopes, and the UI's login cookie (P7 no).
 - **Routing and decider:**
   - rules 1–9 and presets; rule 3 fires on the `architecture` and
-    `migration` labels only, never on a path in scope (#61);
+    `migration` labels only, never on a path in scope (#61); rules 4 and 6 read
+    `Task.has_existing_tests`, which `JobRunner._task` sets at task build from the
+    base mirror (an in-scope test file, or a related `tests/test_<stem>*.py`), never None;
   - the private-repo rule (Q2);
   - the decider with Haiku through the gateway, and Jev on fixtures.
 - **Gateway, budgets, metering (P1):**

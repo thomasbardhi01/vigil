@@ -166,3 +166,45 @@ def test_ladder_pinned_paths_do_not_change_routing(cfg: Config) -> None:
     cfg.repo(vigil).ladder_pinned_paths = []
     assert route(t, cfg) == before
     assert before.tier != "claude-opus" or "rule2" not in before.tier_reason
+
+
+def _built(files: dict[str, str], scope: list[str], **kw: Any) -> Task:
+    """A task as `JobRunner._task` builds it from a fake base mirror."""
+    from vigild.contract.models import WorkerContract
+    from vigild.jobs.runner import JobRunner
+
+    class Mirror:
+        def mirror_file(self, repo: str, branch: str, path: str) -> str | None:
+            return files.get(path)
+
+        def mirror_paths(self, repo: str, branch: str) -> set[str]:
+            return set(files)
+
+    r = object.__new__(JobRunner)
+    r.cfg = _load()
+    r.workspace = Mirror()  # type: ignore[assignment]
+    w = WorkerContract.model_validate({
+        "task_id": "vi-1-w1", "goal": "g", "why": "w", "value": 3, "risk": 2,
+        "test_cmd": "pytest -q", "done_when": "green", "files_in_scope": scope, **kw,
+    })  # fmt: skip
+    return r._task("vi-1", "thomasbardhi01/vigil", "main", "human", w)
+
+
+def _load() -> Config:
+    from vigild import config as config_mod
+
+    return config_mod.load()
+
+
+def test_a_built_task_with_vi_0004s_shape_routes_to_the_tower() -> None:
+    files = {"vigild/workspace.py": "x", "tests/test_workspace.py": "x"}
+    t = _built(files, ["vigild/workspace.py", "tests/jobs/test_new.py"], labels=["tests"], size="S")
+    r = route(t, _load())
+    assert r.tier_reason.startswith("rule6") and r.preset == "tower-qwen"
+
+
+def test_a_built_feature_task_with_no_test_at_the_base_is_rule4() -> None:
+    t = _built(
+        {"vigild/a.py": "x"}, ["vigild/a.py", "tests/test_a.py"], labels=["feature"], size="M"
+    )
+    assert route(t, _load()).tier_reason == "rule4:new-feature-no-tests"
