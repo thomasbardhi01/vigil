@@ -318,7 +318,11 @@ stateDiagram-v2
   (decision `vault-host-git`), reads `worker_report.json` from there, checks stage-3 acceptance
   (decision `reading-session-files`; it includes the rules-only completion-integrity
   check, `vigild/jobs/integrity.py`: added TODOs and skips with no reason, stubs, self-referential
-  report text and deleted guards page the job like a weakened test), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
+  report text and deleted guards; report-only since the owner's ruling of 2026-10-29: each
+  finding is an `integrity_finding` event and an advisory fenced section of the reviewer's
+  packet, never an acceptance error, until `ENFORCE` in `vigild/jobs/integrity.py` is flipped
+  to True by a one-line PR carrying the false-positive count; enforcing, findings page the job
+  like a weakened test, but `self-referential-evidence` alone never does), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
   instead files a question for its coord and your inbox, and its task
   waits. Work that can't start (a dependency failed or waits, or the repo
   is at its WIP limit) pages you and blocks the job.

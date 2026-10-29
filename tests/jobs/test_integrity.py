@@ -197,3 +197,12 @@ def test_self_referential_evidence_ignores_questions_and_named_tests() -> None:
     r = _report(summary="ok")
     r2 = r.model_copy(update={"open_questions": ["is it manually verified?"]})
     assert report_findings(r2) == []
+
+
+def test_finding_id_is_stable_and_names_job_task_rule_and_place() -> None:
+    from vigild.jobs.integrity import Finding, finding_id
+
+    f = Finding("stub", "a.py", 3, "x")
+    assert finding_id("j", "t", f) == finding_id("j", "t", Finding("stub", "a.py", 3, "other"))
+    assert finding_id("j", "t", f) != finding_id("j", "t2", f)
+    assert finding_id("j", "t", f) != finding_id("j", "t", Finding("stub", "a.py", 4, "x"))

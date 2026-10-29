@@ -2,8 +2,11 @@
 
 Pure functions over the task's diff (unified-diff text vigild read from its
 vault through `Workspace.diff`) and over the worker report. A finding names
-its rule and file:line and pages the job like "test weakened"; nothing is
-auto-fixed. Every snippet from the diff or the report is untrusted, so it goes
+its rule and file:line; nothing is auto-fixed. While `ENFORCE` is False
+(report-only) findings are an `integrity_finding` event and a section of the
+reviewer's packet, never an acceptance error; with it True they page the job
+like "test weakened", except that `self-referential-evidence` alone never does.
+Every snippet from the diff or the report is untrusted, so it goes
 through `redact` and is cut short; findings that reach a packet are fenced by
 the packet builder (`packets.fence`).
 
@@ -13,6 +16,7 @@ than noise."""
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -23,6 +27,11 @@ from vigild.contract.models import WorkerReport
 from vigild.redact import redact
 from vigild.verifier import TEST_FILE
 from vigild.workspace import Workspace, WorkspaceError
+
+# Report-only for two weeks (owner, 2026-10-29): findings go to the review packet and an
+# `integrity_finding` event, never to acceptance errors. Enforcing is turned on later by a
+# one-line PR flipping this to True, carrying the false-positive count from the morning report.
+ENFORCE = False
 
 # Rule 4: kept small. Matched case-insensitively in the report's free text.
 SELF_REFERENTIAL = (
@@ -84,6 +93,21 @@ class Finding:
     def __str__(self) -> str:
         where = f"{self.path}:{self.line}" if self.line else self.path
         return f"completion integrity: {self.rule} {where}: {self.snippet}"
+
+
+def finding_id(job_id: str, task_id: str, f: Finding) -> str:
+    """Stable across reruns of the same finding: hash of job, task, rule, file and line."""
+    key = "\0".join([job_id, task_id, f.rule, f.path, str(f.line or "")])
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def blocking(findings: list[Finding]) -> list[Finding]:
+    """What fails the task: nothing while report-only. Enforcing, every finding, but
+    `self-referential-evidence` only when another rule fired on the task too."""
+    if not ENFORCE:
+        return []
+    others = [f for f in findings if f.rule != "self-referential-evidence"]
+    return findings if others else []
 
 
 def _snippet(text: str) -> str:
@@ -292,8 +316,8 @@ def report_findings(report: WorkerReport) -> list[Finding]:
 
 def check_integrity(
     ws: Workspace, repo: str, base_sha: str, head: str, report: WorkerReport
-) -> list[str]:
-    """The acceptance hook: finding messages, the way "test weakened" reports."""
+) -> list[Finding]:
+    """The acceptance hook: every finding for the task (`blocking` says which fail it)."""
     paths = sorted({p for _, p in ws.changed(repo, base_sha, head)})
     diffs = {p: ws.diff(repo, base_sha, head, p) for p in paths}
 
@@ -303,4 +327,4 @@ def check_integrity(
         except WorkspaceError:
             return None
 
-    return [str(f) for f in [*check(diffs, full), *report_findings(report)]]
+    return [*check(diffs, full), *report_findings(report)]

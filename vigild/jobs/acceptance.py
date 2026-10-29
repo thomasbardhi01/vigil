@@ -12,12 +12,13 @@ outcome other than `fail` before and `pass` after is a rejection."""
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
-from vigild.jobs.integrity import check_integrity
+from vigild.jobs.integrity import Finding, blocking, check_integrity
 from vigild.verifier import TEST_FILE, invoked_scripts
 from vigild.workspace import Workspace
 
@@ -161,6 +162,7 @@ def check_worker(
     cost: float,
     runner_config: list[str] | tuple[str, ...] = (),
     session_base: str | None = None,
+    on_findings: Callable[[list[Finding]], None] | None = None,
 ) -> list[str]:
     spec = contract["spec"]
     errors: list[str] = []
@@ -193,7 +195,11 @@ def check_worker(
         errors.append(f"files changed outside scope: {outside}")
     for w in weakened_tests(ws, repo, base_sha, head):
         errors.append(f"test weakened: {w}")
-    errors += check_integrity(ws, repo, base_sha, head, report)  # #104: rules only, never fixed
+    # #104: rules only, never fixed; #131: report-only unless integrity.ENFORCE
+    found = check_integrity(ws, repo, base_sha, head, report)
+    if on_findings and found:
+        on_findings(found)
+    errors += [str(f) for f in blocking(found)]
     limit = float((contract.get("limits") or {}).get("max_cost_usd") or 0)
     if limit and cost > limit + 1e-9:
         errors.append(f"cost ${cost:.4f} is over the limit ${limit:.2f}")
