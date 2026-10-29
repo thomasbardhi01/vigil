@@ -62,6 +62,7 @@ from vigild.contract.models import (
     ReviewOutput,
     Size,
     Spec,
+    StoredAudit,
     Task,
     TestOutcome,
     Verify,
@@ -98,6 +99,8 @@ from vigild.packets.assemble import (
     assemble_hidden_test_author,
     assemble_review,
     assemble_worker,
+    joined_histories,
+    round_findings,
 )
 from vigild.packets.fence import fence
 from vigild.packets.prefill import Prefill, compute_prefill
@@ -1688,12 +1691,9 @@ class JobRunner:
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
         untrusted |= decisions.section(self.store, job_id)  # ADR-0005 part 4: fenced data
-        # A replan starts the coord fresh (#78, ADR-0005): spec.md, plan.md,
-        # spec_changelog.md, the note, the failures. The fork is for true escalation,
-        # attempt >= escalate_attempt, where attempt is 1 + the replans so far.
-        fresh = (
-            bool(replan or amend) and self._job_attempt(job_id) < self.cfg.routing.escalate_attempt
-        )
+        # A replan starts the coord fresh at every attempt (#78, #101, ADR-0005):
+        # spec.md, plan.md, spec_changelog.md, the note, the failures. Nothing is forked.
+        fresh = bool(replan or amend)
         if fresh:
             for name, label, cap in (
                 ("plan.md", "plan.md (the previous plan)", 12000),
@@ -1703,6 +1703,12 @@ class JobRunner:
                 art = self.store.get_artifact(job_id, name)
                 if art is not None and not (name == "spec.md" and amend is not None):
                     untrusted[label] = art.content[:cap]
+            histories = []
+            for task in self.store.list_tasks(job_id):
+                if hist := self._findings_history(task, None):
+                    histories.append(f"Task {task.id}:\n{hist}")
+            if histories:  # the review rounds that led here (#101), every task's
+                untrusted["review history"] = joined_histories(histories)
         pre = compute_prefill(
             clone,
             request,
@@ -1727,23 +1733,7 @@ class JobRunner:
             skeleton=skeleton,
             fresh=fresh,
         )
-        # Re-plan (item 3): the coord resumes its own last session, its whole
-        # context, with the failures in this packet, unless it starts fresh.
         resume = None
-        if replan and not fresh:
-            prior = [
-                x
-                for x in self.store.list_sessions(job_id)
-                if x.role is Role.COORD and x.id != coord.id
-            ]
-            resume = self._resume_from(prior[-1].id) if prior else None
-            if resume is not None:
-                self.store.add_event(
-                    "fork",
-                    {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
-                     "entries": len(resume.entries), "replan": True},
-                    Provenance.HUMAN, job_id=job_id, session_id=coord.id,
-                )  # fmt: skip
         self.store.add_event(
             "packet",
             {"role": "coord", "attempt": attempt, "dropped": packet.dropped, "base_sha": base_sha},
@@ -2864,18 +2854,14 @@ class JobRunner:
         edits = json.loads(approval.content).get("edits") if approval else None
         # A fix round or a retry of a published task starts fresh (#78, ADR-0005):
         # spec.md, plan.md, spec_changelog.md, the PR diff, the findings and the
-        # verifier's summary, never the worker's transcript. The fork is for true
-        # escalation (rule 5, or attempt >= routing.escalate_attempt). A crashed worker
-        # still resumes its own session (item 3); a landed dependency is in the work
-        # tree already, so that worker starts fresh too.
+        # verifier's summary, never the worker's transcript. An escalation (rule 5, or
+        # attempt >= routing.escalate_attempt) starts fresh too (#101), with every
+        # round's findings. Only a crashed worker resumes its own session (item 3); a
+        # landed dependency is in the work tree already, so that worker starts fresh too.
         escalated = str(t.tier_reason or "").startswith("rule5")
         fix_round = self._fix_round(t)
         attempt = int(contract.get("attempt") or 1)
-        forks = (
-            escalated
-            or crashed
-            or (bool(published) and attempt >= self.cfg.routing.escalate_attempt)
-        )
+        forks = crashed
         fresh_fix: dict[str, str] | None = None
         if published and not forks:
             spec_art = self.store.get_artifact(job_id, "spec.md")
@@ -2889,6 +2875,8 @@ class JobRunner:
                 "plan": plan_art.content if plan_art else "",
                 "changelog": log_art.content if log_art else "",
             }
+            if escalated or attempt >= self.cfg.routing.escalate_attempt:
+                fresh_fix["history"] = self._findings_history(t, fix_round)
         packet = assemble_worker(
             clone, contract, untrusted=decisions.section(self.store, job_id),
             approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
@@ -3651,6 +3639,25 @@ class JobRunner:
                 out["note"] = json.loads(note.content)["note"]
         return out
 
+    def _findings_history(self, t: Any, fix_round: dict[str, Any] | None) -> str:
+        """Every review round's findings for a task (findings.json is append-only), as
+        text for an escalation's packet (#101). The round in `fix_round` is already
+        in the packet in full, so it is left out here."""
+        rows = self.store.q(
+            "SELECT content FROM artifacts WHERE job_id=? AND task_id=? AND name='findings.json'"
+            " ORDER BY id",
+            (t.job_id, t.id),
+        )
+        by_round: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            try:
+                doc = json.loads(r["content"])
+                by_round[int(doc["round"])] = doc
+            except ValueError, KeyError, TypeError:
+                continue
+        skip = int(fix_round["round"]) if fix_round else None
+        return round_findings([d for n, d in by_round.items() if n != skip])
+
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
         """Why the owner's fix can't start because of GitHub's live view of the task's
         PR (merged or closed since vigild's poll), if it can't. This is a network
@@ -4042,7 +4049,7 @@ class JobRunner:
             rv = self.store.get_artifact(job_id, "review.json", t.id)
             au = self.store.get_artifact(job_id, "audit.json", t.id)
             review = json.loads(rv.content) if rv else {}
-            audit = Audit.model_validate_json(au.content) if au else None
+            audit = StoredAudit.model_validate_json(au.content) if au else None
             prs.append(
                 {
                     "task_id": t.id,

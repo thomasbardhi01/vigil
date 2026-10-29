@@ -96,3 +96,13 @@ def test_a_changed_claude_mods_sha_is_an_input() -> None:
     assert got == ["configs/vigild.yaml: github.claude_mods_sha"]
     same = {"github": {"claude_mods_sha": "a" * 40, "other": 2}}
     assert ik.changed_inputs(cfg, REPO, ["configs/vigild.yaml"], REPOS, REPOS, base, same) == []
+
+
+def test_the_head_export_is_readable_by_the_agent_uid(tmp_path: Path) -> None:
+    """#123: the suites run as uid 10001 against a bind-mounted export; a 0700
+    TemporaryDirectory made `/src` unreadable to it (`cp: cannot stat '/src/.'`)."""
+    src = tmp_path / "src"
+    src.mkdir(mode=0o700)
+    ik.export_head(src)
+    assert src.stat().st_mode & 0o777 == 0o755
+    assert (src / "pyproject.toml").stat().st_mode & 0o004  # others can read the files

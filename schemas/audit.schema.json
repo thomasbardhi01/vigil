@@ -10,6 +10,15 @@
           "title": "Claim",
           "type": "string"
         },
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "evidence": {
+          "$ref": "#/$defs/Evidence"
+        },
         "file": {
           "maxLength": 500,
           "minLength": 1,
@@ -56,9 +65,39 @@
         "severity",
         "file",
         "claim",
-        "fix"
+        "fix",
+        "evidence",
+        "confidence"
       ],
       "title": "AuditFinding",
+      "type": "object"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "description": "What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,\n`path:line`, an AC id (`AC3`) or a log excerpt id.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "test",
+            "diff_line",
+            "spec_criterion",
+            "runtime_log"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "ref": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "title": "Evidence",
       "type": "object"
     },
     "Provenance": {

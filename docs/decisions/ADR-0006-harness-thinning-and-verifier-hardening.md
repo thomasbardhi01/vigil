@@ -27,6 +27,7 @@ G is docs only and can be done any time. H waits for the bench freeze to lift.
    - The verifier's checkouts carry no `.git` history: a bare tree, or a shallow export with a new `.git`. Nothing reachable in them goes past the commit under test: no objects, no alternates, no refs.
    - Today the checkout already gets "a new `.git`" (`vigild/verifier.py`). A1 confirms that no history object is reachable, and adds the test.
    - **For bench tasks this is mandatory:** the gold patch must never be reachable from the checkout's history.
+   - **Built:** the fetch pulled the whole ancestry, so it did not hold. `Workspace.verify_checkout` now takes the index's exact tree (the commit plus its overlays; gitlinks, modes and blobs unchanged, no `add`), makes one parentless commit of it, and replaces the `.git` with a new one that fetched only that commit. `put` files stay uncommitted work-tree changes. The one commit's sha is new on every run (fresh timestamp); tests must not depend on it. Tests cover base, before, after and hidden; a stand-in gold blob in an ancestor of the commit under test (the same check goes red with the single commit mutated out); tree equality with a gitlink, CRLF, exec bit and symlink; and an unknown `working-tree-encoding`.
    - **Test:** in each of the after, before and hidden runs, `git log`, `git cat-file --batch-all-objects`, `git rev-list --all` and the alternates file show nothing beyond the one tree. For a bench task, the gold patch's blob ids are absent.
 2. **Gold-gated mutation strengthening of acceptance tests.**
    - A local model on the tower generates mutants of the gold patch (bench) or the merged patch (vigil's own tasks).
@@ -52,6 +53,7 @@ G is docs only and can be done any time. H waits for the bench freeze to lift.
 - **Evidence:** each finding in `review.json` carries `evidence: test | diff_line | spec_criterion | runtime_log`, plus that evidence's locator: a test id, a file:line, an AC id, or a log excerpt id. A finding without evidence is refused at parse, and the reviewer is told why.
 - **Confidence:** `confidence` (0–1), as already relayed (omp research item A6).
 - **Packaging:** one PR, one schema change, `schemas/*.json` regenerated. Phase 7's auditor match rate gains confidence as a second dimension.
+- **Built (part):** #105. `Finding` has `evidence: {kind, ref}` and `confidence`; a finding without them, a `diff_line` ref that is not `path:line`, or a `spec_criterion` ref that is not an AC id is refused at parse. There is no re-ask loop for a malformed review, so it fails the stage gate (retry or abandon). The auditor's match rate is not built.
 
 ### D. Deny-and-continue
 - **The worker continues:** when the guard plugin refuses a tool call, the worker is told the call was refused and to find another route, and it carries on.

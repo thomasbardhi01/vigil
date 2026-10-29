@@ -1,8 +1,7 @@
 """A replan with a note starts the coord fresh (#78, owner, 2026-10-28).
 
 The packet carries spec.md, plan.md, the owner's note, the failure reason and the
-verifier summary, and no transcript is resumed or forked. The fork stays for true
-escalation: attempt >= routing.escalate_attempt (attempt = 1 + replans so far)."""
+verifier summary, and no transcript is resumed or forked. No attempt forks (#101); only a crashed session resumes."""
 
 # ruff: noqa: F811  (fixtures imported from the modules that define them)
 
@@ -52,13 +51,16 @@ def test_the_fresh_packet_carries_the_note_the_failure_and_the_plan(world: World
     assert "## docs/" not in packet and "## README.md" not in packet  # no context pack
 
 
-def test_the_fork_stays_for_escalation_at_the_configured_attempt(world: World) -> None:
+def test_an_escalated_replan_starts_fresh_too(world: World) -> None:
+    """#101: attempt >= routing.escalate_attempt no longer forks the coord."""
     w = world
     w.runner.cfg.routing.escalate_attempt = 2  # the replan is attempt 2 here
     job, coords = _replanned(w)
-    first, second = coords[0], coords[-1]
-    assert second.resume is not None and second.resume.from_session == first.session_id
-    assert w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
+    second = coords[-1]
+    assert second.resume is None
+    assert not w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
+    assert NOTE in second.packet and "## Workers" in second.packet
+    assert len(second.packet) / 4 < FIRST_CALL_TOKENS
 
 
 def test_the_fresh_packet_carries_the_spec_changelog(world: World) -> None:
