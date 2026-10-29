@@ -309,8 +309,8 @@ stateDiagram-v2
   its packet holds spec.md (the amended baseline, or the current spec), the
   note, plan.md, spec_changelog.md, the failure reason and the verifier summary
   (all but the note and baseline fenced), no context pack, and no transcript is
-  resumed or forked. The attempt is 1 plus the replans so far; the fork stays
-  only at attempt >= `routing.escalate_attempt` (3).
+  resumed or forked at any attempt (#101). When tasks had review rounds, a fenced
+  `review history` holds every task's rounds (same bound as a worker's).
 - **Inside building.** Workers run as a dependency graph (decision `scheduler-fleet`): each starts
   once its own dependencies have published, up to three sessions at once
   across the fleet, each in its own container, clone and `vigil/<task>`
@@ -328,9 +328,11 @@ stateDiagram-v2
   to the task's worker as the same fix round, **started fresh** (#78): a new
   session whose packet holds spec.md, plan.md, spec_changelog.md, the PR diff,
   the findings and the verifier summary (all but spec.md fenced), never the
-  worker's transcript; a retry of a published task starts the same way. The
-  fork stays for true escalation: rule 5 or attempt >=
-  `routing.escalate_attempt`; a crashed worker still resumes its own session.
+  worker's transcript; a retry of a published task starts the same way. An
+  escalation (rule 5, or attempt >= `routing.escalate_attempt`) starts fresh
+  too (#101), its packet adding a fenced `review history` of every round's findings
+  (the newest in full up to 16k characters, older rounds listed by round, index and
+  severity under a dropped note). Only a crashed worker resumes its own session; nothing else forks.
   Every such session (and the replan coord and the reviewer, not the auditor) also gets the
   job's **decisions log** as a fenced `decisions` section (ADR-0005 part 4, below). The job goes `ready` to `building`
   (an FSM edge only that action may take), the task `reviewed` to `fix`, and the

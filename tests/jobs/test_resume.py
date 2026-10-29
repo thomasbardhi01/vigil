@@ -149,17 +149,18 @@ def test_a_restart_requeues_the_safe_job_and_blocks_the_unsafe_one(world: World)
     assert {s.resume.from_session for s in resumed if s.resume} == {s.id for s in crashed}
 
 
-def test_a_replan_forks_the_coord_only_at_the_escalation_attempt(world: World) -> None:
+def test_a_replan_never_forks_the_coord_even_at_the_escalation_attempt(world: World) -> None:
+    """#101: the coord's replan starts fresh at every attempt; only a crash resumes."""
     w = world
-    w.runner.cfg.routing.escalate_attempt = 2  # below it a replan starts fresh (#78)
+    w.runner.cfg.routing.escalate_attempt = 2
     w.standin.worker_edit = _flaky({"w1"})
     job = _approve(w)
     item = _failure_item(w, job)
     r = w.client.post(f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     first, second = [s for s in w.standin.specs if s.role is Role.COORD]
-    assert first.resume is None
-    assert second.resume is not None and second.resume.from_session == first.session_id
+    assert first.resume is None and second.resume is None
+    assert not w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
     assert "outside scope" in second.packet  # the failure, in the new packet
 
 
