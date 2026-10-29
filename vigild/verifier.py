@@ -192,6 +192,15 @@ def runner_overlap(
     return sorted({f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)})
 
 
+def runner_class(
+    scope: Iterable[str], runner_config: Iterable[str], test_cmd: str, ac_cmds: Iterable[str]
+) -> list[str]:
+    """The one runner-file classification (#142): a task's scope entries that name a
+    runner file, counting the scripts its `test_cmd` and the approved spec's AC commands
+    run. Plan time, the inbox, hidden-test authoring and verify all call this."""
+    return runner_overlap(scope, runner_config, test_cmd, *ac_cmds)
+
+
 @dataclass(frozen=True)
 class HiddenSuite:
     """A task's hidden tests: files in a vault commit that is on no pushed

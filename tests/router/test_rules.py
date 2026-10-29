@@ -183,6 +183,7 @@ def _built(files: dict[str, str], scope: list[str], **kw: Any) -> Task:
     r = object.__new__(JobRunner)
     r.cfg = _load()
     r.workspace = Mirror()  # type: ignore[assignment]
+    r.store = _NoArtifacts()  # type: ignore[assignment]
     w = WorkerContract.model_validate({
         "task_id": "vi-1-w1", "goal": "g", "why": "w", "value": 3, "risk": 2,
         "test_cmd": "pytest -q", "done_when": "green", "files_in_scope": scope, **kw,
@@ -217,3 +218,13 @@ def test_a_built_task_with_vi_0004s_exact_shape_routes_to_the_tower() -> None:
     assert t.has_existing_tests is True
     r = route(t, _load())
     assert r.tier_reason.startswith("rule6") and r.preset == "tower-qwen"
+
+
+class _NoArtifacts:
+    """`_task` reads the job's spec and plan for #144's runner class; a bare runner has none."""
+
+    def get_artifact(self, job_id: str, name: str, task_id: str | None = None) -> None:
+        return None
+
+    def get_job(self, job_id: str) -> Any:
+        return type("Job", (), {"base": "main"})()

@@ -89,6 +89,7 @@ from vigild.jobs.acceptance import (
     contract_text,
     escalates,
     live_workers,
+    plan_runner_class,
     worker_acs,
 )
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec, render
@@ -137,7 +138,7 @@ from vigild.router.rules import CoordShape, RoutingError, request_paths, route, 
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_like, runner_overlap
+from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_class, runner_like
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -2251,9 +2252,22 @@ class JobRunner:
             labels=w.labels,
             size=w.size,
             has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
-            runner_file_change=runner_overlap(
-                w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd
-            ),
+            runner_file_change=self._plan_runner_files(job_id, repo, w),
+        )
+
+    def _plan_runner_files(self, job_id: str, repo: str, w: WorkerContract) -> list[str]:
+        """The task's runner files, counting the approved spec's AC commands (#142)."""
+        art = self.store.get_artifact(job_id, "spec.md")
+        plan = self.store.get_artifact(job_id, "plan.md")
+        workers = parse_plan(plan.content).workers if plan else [w]
+        classes = plan_runner_class(
+            art.content if art else "",
+            workers,
+            self.cfg.repo(repo).runner_config,
+            self.base_reader(repo, self.store.get_job(job_id).base),
+        )
+        return classes.get(w.task_id) or runner_class(
+            w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd, ()
         )
 
     def build(self, job_id: str) -> None:
@@ -2539,6 +2553,24 @@ class JobRunner:
         )
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
+
+    def _overlap(
+        self, repo: str, contract: dict[str, Any], ac_runs: list[tuple[str, list[str]]]
+    ) -> list[str]:
+        """A task's runner files at verify time (#142, #144): the one classification,
+        over the AC commands the verifier will run."""
+        spec = contract["spec"]
+        return runner_class(
+            spec.get("files_in_scope") or [],
+            self.cfg.repo(repo).runner_config,
+            str(spec.get("test_cmd") or ""),
+            [c for c, _ in ac_runs],
+        )
+
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
+        """Reads a file at the base branch's tip from vigild's mirror (never a session
+        clone): plan time's reader, as verify's is the vault blob at the base sha."""
+        return lambda path: self.workspace.mirror_file(repo, base, path)
 
     def _ac_commands(
         self, job_id: str, repo: str, base_sha: str, contract: dict[str, Any]
@@ -3152,12 +3184,7 @@ class JobRunner:
             if test_cmd.strip()
             else ([], [])
         )
-        overlap = runner_overlap(
-            contract["spec"].get("files_in_scope") or [],
-            self.cfg.repo(job.repo).runner_config,
-            test_cmd,
-            *(c for c, _ in ac_runs),
-        )
+        overlap = self._overlap(job.repo, contract, ac_runs)
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
         hidden_on = (

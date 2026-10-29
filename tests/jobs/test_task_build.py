@@ -32,10 +32,21 @@ class FakeWorkspace:
         return set(self.files)
 
 
+class _NoArtifacts:
+    """`_task` reads the job's spec and plan for #144's runner class; a bare runner has none."""
+
+    def get_artifact(self, job_id: str, name: str, task_id: str | None = None) -> None:
+        return None
+
+    def get_job(self, job_id: str) -> Any:
+        return type("Job", (), {"base": "main"})()
+
+
 def _runner(files: dict[str, str]) -> JobRunner:
     r = object.__new__(JobRunner)
     r.cfg = config_mod.load()
     r.workspace = FakeWorkspace(files)  # type: ignore[assignment]
+    r.store = _NoArtifacts()  # type: ignore[assignment]
     return r
 
 
