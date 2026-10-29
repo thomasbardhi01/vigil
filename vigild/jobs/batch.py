@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from vigild.db import Store
+from vigild.metering.calls import unmetered_sessions
 
 MAX_JOBS = 10
 
@@ -48,6 +49,7 @@ def batch_view(store: Store, batch_id: str) -> dict[str, Any]:
                 "spent_usd": round(spent, 6),
                 "held_usd": round(held, 6),
                 "total_usd": round(spent + held, 6),
+                "cost_unknown_sessions": unmetered_sessions(store, job_id),
             }
         )
     spent = sum(j["spent_usd"] for j in jobs)
@@ -61,5 +63,6 @@ def batch_view(store: Store, batch_id: str) -> dict[str, Any]:
             "spent_usd": round(spent, 6),
             "held_usd": round(held, 6),
             "total_usd": round(spent + held, 6),
+            "cost_unknown_sessions": [m for j in jobs for m in j["cost_unknown_sessions"]],
         },
     }

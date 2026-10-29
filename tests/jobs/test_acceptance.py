@@ -372,3 +372,55 @@ def test_mff_off_unsettled_ids_are_refused_with_the_reason() -> None:
           "ids": {"checked": True, "worker_ran": 0, "not_passing_after": []}}  # fmt: skip
     errors = check_tests({"test_cmd": "pytest -q", "must_fail_first": False}, ok)
     assert any("new test id" in e for e in errors), errors
+
+
+# --- #131: the integrity check is report-only until the owner turns it on ----------------
+
+
+def _todo(c: Path) -> None:
+    (c / "new_mod.py").write_text("# TODO make this stricter\n")
+
+
+WIDE = {
+    **CONTRACT,
+    "spec": {**CONTRACT["spec"], "files_in_scope": ["docs/feature-map.md", "new_mod.py"]},
+}
+
+
+SELF_REF = _report(summary="Done; it works as expected.")
+
+
+def test_integrity_findings_never_fail_a_task_while_report_only(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    seen: list[Any] = []
+    base, head = _result(ws, tmp_path, _todo)
+    errors = check_worker(
+        ws, REPO, base, head, WIDE, SELF_REF, TESTS_OK, cost=0.2, on_findings=seen.extend
+    )
+    assert errors == []
+    assert {f.rule for f in seen} == {"todo-without-issue", "self-referential-evidence"}
+
+
+def test_enforcing_fails_a_bare_todo(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vigild.jobs.integrity.ENFORCE", True)
+    errors = _check(ws, *_result(ws, tmp_path, _todo), contract=WIDE)
+    assert any("todo-without-issue" in e for e in errors)
+
+
+def test_enforcing_never_fails_on_self_referential_evidence_alone(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vigild.jobs.integrity.ENFORCE", True)
+    assert _check(ws, *_result(ws, tmp_path), report=SELF_REF) == []
+
+
+def test_enforcing_fails_self_referential_evidence_with_another_rule(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vigild.jobs.integrity.ENFORCE", True)
+    errors = _check(ws, *_result(ws, tmp_path, _todo), contract=WIDE, report=SELF_REF)
+    assert any("todo-without-issue" in e for e in errors)
+    assert any("self-referential-evidence" in e for e in errors)
