@@ -466,3 +466,115 @@ def test_a_pr_that_cannot_be_cleaned_pages_with_retry_and_abandon(world: World) 
     r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert w.store.get_job(job).state is S.READY
+
+
+# --- a branch moved on the remote (#32): replan or abandon, never retry ------------------------
+
+
+def _outside_commit(bare: Path, branch: str) -> str:
+    """Someone else's commit on the remote branch (or a new branch off main)."""
+    tip = (
+        git(bare, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}")
+        if (git(bare, "for-each-ref", f"refs/heads/{branch}"))
+        else git(bare, "rev-parse", "main")
+    )
+    sha = git(
+        bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+        git(bare, "rev-parse", f"{tip}^{{tree}}"), "-p", tip, "-m", "owner's own fix",
+    )  # fmt: skip
+    git(bare, "update-ref", f"refs/heads/{branch}", sha)
+    return sha
+
+
+def test_a_foreign_tip_raises_branch_moved_and_pushes_nothing(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    from vigild.github.publish import BranchMoved
+
+    bare = fixture_repo["bare"]
+    head = _session(ws, tmp_path, bare, "# Map\none\n")
+    base = ws.base_sha(TID)
+    foreign = _outside_commit(bare, BRANCH)
+    with pytest.raises(BranchMoved, match="branch moved on the remote"):
+        _pub(ws, head, base, Pulls())
+    assert git(bare, "rev-parse", BRANCH) == foreign
+    assert ws.published_sha(REPO, BRANCH) is None
+
+
+def test_a_push_failure_that_is_not_a_moved_branch_stays_a_plain_publish_error(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    from vigild.github.publish import BranchMoved
+
+    bare = fixture_repo["bare"]
+    ws2 = Workspace(tmp_path / "data2", remote_url=lambda r: str(bare))
+    head = _session(ws2, tmp_path, bare, "# Map\none\n")
+    base = ws2.base_sha(TID)
+    ws2.remote_url = lambda r: str(tmp_path / "nowhere.git")
+    with pytest.raises(PublishError) as e:
+        _pub(ws2, head, base, Pulls())
+    assert not isinstance(e.value, BranchMoved)
+
+
+def test_an_outside_commit_in_a_wave_pages_replan_and_abandon_only(world: World) -> None:
+    w = world
+    real = w.publisher.publish
+    seen: dict[str, str] = {}
+
+    def outside_first(**kw: Any) -> str:
+        if kw["branch"].endswith("-w1") and not seen:
+            seen[kw["branch"]] = _outside_commit(w.bare, kw["branch"])
+        return real(**kw)
+
+    w.publisher.publish = outside_first  # type: ignore[method-assign]
+    job = _approve(w)
+    ((branch, sha),) = seen.items()
+    item = _failure_item(w, job, "branch_moved")
+    assert item["body"]["actions"] == ["replan", "abandon"]
+    assert item["body"]["branch"] == branch and not item["body"].get("resumable")
+    assert git(w.bare, "rev-parse", branch) == sha
+
+
+def test_an_outside_commit_before_the_ready_resend_pages_replan_and_abandon(
+    world: World,
+) -> None:
+    w = world
+    job = _held_in_review(w)
+    ws = w.runner.workspace
+    moved: dict[str, str] = {}
+    for t in w.store.list_tasks(job):  # the record is behind: the branch is sent again
+        ev = _latest(w, t.id)
+        ws.record_published(REPO, ev["branch"], ev["base_sha"])
+        moved[ev["branch"]] = _outside_commit(w.bare, ev["branch"])
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.BLOCKED
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in qs if q["job_id"] == job and q["body"].get("kind") == "vigil_in_pr"]
+    assert item["body"]["actions"] == ["replan", "abandon"] and not item["body"]["resumable"]
+    assert "branch moved on the remote" in json.dumps(item["body"])
+    assert {b: git(w.bare, "rev-parse", b) for b in moved} == moved
+
+
+def test_lost_record_retry_sends_the_same_sha_and_the_job_moves_on(world: World) -> None:
+    w = world
+    real = w.publisher.publish
+    ws = w.runner.workspace
+    sent: dict[str, str] = {}
+
+    def lose_record(**kw: Any) -> str:
+        url = real(**kw)
+        branch = kw["branch"]
+        if branch not in sent:  # the first push landed; its record is lost, then a retry
+            sent[branch] = str(ws.published_sha(REPO, branch))
+            git(ws.vault(REPO), "update-ref", "-d", ws._pub_ref(branch))
+            url = real(**kw)  # a first publish retried: no PR is known yet
+            assert ws.published_sha(REPO, branch) == sent[branch]
+            assert git(w.bare, "rev-parse", branch) == sent[branch]
+        return url
+
+    w.publisher.publish = lose_record  # type: ignore[method-assign]
+    job = _approve(w)
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert sent and w.store.get_job(job).state is S.READY, json.dumps(qs)[:1500]
+    for t in w.store.list_tasks(job):  # each task reached pr_open on the sent sha
+        assert _latest(w, t.id)["published"] == sent[_latest(w, t.id)["branch"]]

@@ -75,7 +75,13 @@ from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.executors.hosts import HostRefused
 from vigild.executors.runtime import job_scope
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
-from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
+from vigild.github.publish import (
+    BranchMoved,
+    LegacyBranch,
+    PublishError,
+    artifact_paths,
+    vigild_paths,
+)
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
@@ -2583,6 +2589,9 @@ class JobRunner:
                 lefts.append(left)
         # retry is offered while every task it would run has budget left
         can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
+        moved = {tid: t["branch"] for tid, t in tasks.items() if t.get("kind") == "branch_moved"}
+        if moved:
+            can_retry = False  # an outside commit: a retry can only fail again
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
             # item 5: a child deps job; this job resumes on its own when it merges
@@ -2625,9 +2634,12 @@ class JobRunner:
             job_id,
             f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300],
             {
-                "kind": "escalated" if escalated else "worker_failed",
+                "kind": "branch_moved"
+                if moved
+                else ("escalated" if escalated else "worker_failed"),
                 "tasks": tasks,
                 "actions": actions,
+                **({"branches": moved, "branch": sorted(moved.values())[0]} if moved else {}),
             },
             resumable=can_retry,
         )
@@ -3263,7 +3275,10 @@ class JobRunner:
                 existing=pr_url,
             )
         except PublishError as e:
-            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+            moved = {"kind": "branch_moved", "branch": branch} if isinstance(e, BranchMoved) else {}
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e), **moved}
+            )
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
         # #34: the state and the event with its URL land together, or neither does
@@ -3646,7 +3661,7 @@ class JobRunner:
                                *vigild_paths(job.id)],
                     )  # fmt: skip
                     facts = self._pub_facts(job.repo, data["branch"], base_sha)
-            except LegacyBranch as e:
+            except (LegacyBranch, BranchMoved) as e:
                 left[tid] = str(e)[:300]
                 legacy.add(tid)
                 continue
@@ -3963,7 +3978,12 @@ class JobRunner:
             body: dict[str, Any] = {"kind": "vigil_in_pr", "tasks": left}
             if legacy:  # retry can't help: the branch predates stripping
                 body["actions"] = ["replan", "abandon"]
-                body["next"] = "the branch predates artifact stripping and needs the owner's hand"
+                body["next"] = (
+                    "the branch moved on the remote (an outside commit) and vigild never "
+                    "overwrites it; replan or abandon"
+                    if any("branch moved on the remote" in left[t] for t in legacy)
+                    else "the branch predates artifact stripping and needs the owner's hand"
+                )
             else:
                 body["actions"] = ["retry", "abandon"]
             self._page(

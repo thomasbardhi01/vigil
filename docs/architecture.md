@@ -372,6 +372,17 @@ flowchart TD
   PUB --> T[tree: GET /api/jobs/id/tree]
 ```
 
+**A branch that moved on the remote (`BranchMoved`, #32).** Before it pushes, `publish`
+reads the remote tip of the `vigil/*` branch (`Workspace.remote_tip`, `ls-remote` through
+`vigild/gitsafe.py`). A tip that is neither the `refs/vigil/pub/*` record nor an ancestor of
+the commit being sent is someone else's commit: `publish` raises `BranchMoved` (a
+`PublishError`) and neither pushes nor records, because vigild only fast-forwards and never
+overwrites. A first publish retried after a lost record sends the same sha, so its tip is an
+ancestor and it goes on. In a wave, the failed-wave page for a `BranchMoved` task has kind
+`branch_moved`, the branch name, and only replan and abandon; at the ready gate
+(`_unstripped`) the "branch moved on the remote" page offers the same two. Any other push
+failure (auth, network) stays a plain `PublishError` with the retry page.
+
 ## Data (SQLite)
 
 - `jobs`: one row per job: state, `blocked_from`, `parent_job_id` and

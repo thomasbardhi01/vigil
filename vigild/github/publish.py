@@ -41,6 +41,11 @@ class LegacyBranch(PublishError):
     `.vigil/` and vigild has no record of sending it. Only the owner can fix it."""
 
 
+class BranchMoved(PublishError):
+    """The remote's `vigil/*` branch holds a commit vigild did not send. vigild only
+    fast-forwards, so a retry can never help: replan or abandon."""
+
+
 class Pulls(Protocol):
     def create_pull(
         self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
@@ -179,6 +184,16 @@ def publish(
         if outside:
             raise PublishError(f"files in the commit sent are outside the scope: {outside}")
         if push:
+            tip = ws.remote_tip(repo, branch, token)
+            if (
+                tip is not None
+                and tip != ws.published_sha(repo, branch)
+                and not ws.is_ancestor(repo, tip, send)
+            ):
+                raise BranchMoved(
+                    f"branch moved on the remote: {branch} is at {tip[:12]}, a commit vigild "
+                    "did not send; vigild never overwrites it"
+                )
             ws.push(repo, send, branch, token)
         ws.record_published(repo, branch, send)
     except WorkspaceError as e:

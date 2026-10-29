@@ -647,6 +647,21 @@ class Workspace:
             f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
 
+    def remote_tip(self, repo: str, branch: str, token: str | None) -> str | None:
+        """The sha of `refs/heads/<branch>` on the remote (ls-remote, through gitsafe),
+        or None when the branch is not there or the repo is a bench repo."""
+        if is_bench_repo(repo) or not BRANCH_NAME.match(branch):
+            return None
+        out = self._git(
+            self.vault(repo), "ls-remote", self.remote_url(repo), f"refs/heads/{branch}",
+            token=token,
+        )  # fmt: skip
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref == f"refs/heads/{branch}" and SHA.match(sha):
+                return sha
+        return None
+
     # --- what reaches the target repo (Tier 1: `.vigil/` stays in the vault) ---------------
 
     def _vigil_entries(self, repo: str, sha: str) -> list[str]:
