@@ -28,7 +28,7 @@ from vigild.intake.paths import in_scope, matches_any, scope_entry_error
 from vigild.packets.fence import fence
 from vigild.packets.related_tests import BLIND_SPOTS, is_test_file, load_py, related_tests
 from vigild.router.rules import request_paths
-from vigild.verifier import runner_overlap
+from vigild.verifier import runner_class
 
 TODO = "TODO(coord)"
 MAX_CANDIDATES = 40
@@ -250,6 +250,6 @@ def compute_prefill(
     pre.test_cmds = list(dict.fromkeys(cmds))
     runner: set[str] = set()
     for cmd in pre.test_cmds or [""]:
-        runner |= set(runner_overlap(pre.candidates, policy.runner_config, cmd))
+        runner |= set(runner_class(pre.candidates, policy.runner_config, cmd, ()))
     pre.runner_files = [c for c in pre.candidates if c in runner]
     return pre

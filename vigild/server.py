@@ -67,6 +67,9 @@ class NullRunner:
     def busy(self, job_id: str) -> bool:
         return False
 
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
+        return lambda path: None
+
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
         return None
 
