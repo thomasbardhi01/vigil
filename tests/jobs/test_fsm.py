@@ -151,7 +151,15 @@ def test_in_review_to_ready_needs_clean_reviews(store: Store) -> None:
     store.add_artifact(jid, "review.json", "{}", Provenance.CLAUDE, task_id=tid)
     with pytest.raises(TransitionError, match=r"review\.json is invalid"):
         transition(store, jid, S.READY, Actor.VIGILD)
-    medium = {"severity": "medium", "file": "a.py", "line": 1, "claim": "c", "fix": "f"}
+    medium = {
+        "severity": "medium",
+        "file": "a.py",
+        "line": 1,
+        "claim": "c",
+        "fix": "f",
+        "evidence": {"kind": "diff_line", "ref": "a.py:1"},
+        "confidence": 0.9,
+    }
     store.add_artifact(
         jid, "review.json", _review(tid, jid, verdict="changes", findings=[medium]),
         Provenance.CLAUDE, task_id=tid,

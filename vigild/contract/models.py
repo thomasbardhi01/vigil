@@ -306,12 +306,37 @@ CHECKLIST = (
 )
 
 
+EvidenceKind = Literal["test", "diff_line", "spec_criterion", "runtime_log"]
+_DIFF_LINE = re.compile(r"^\S.*:\d+$")
+_AC_ID = re.compile(r"^AC\d+$")
+
+
+class Evidence(Strict):
+    """What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,
+    `path:line`, an AC id (`AC3`) or a log excerpt id."""
+
+    kind: EvidenceKind
+    ref: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _locator(self) -> Evidence:
+        if not self.ref.strip():
+            raise ValueError("evidence ref is empty")
+        if self.kind == "diff_line" and not _DIFF_LINE.match(self.ref):
+            raise ValueError("a diff_line evidence ref must look like path:line")
+        if self.kind == "spec_criterion" and not _AC_ID.match(self.ref):
+            raise ValueError("a spec_criterion evidence ref must be an AC id like AC3")
+        return self
+
+
 class Finding(Strict):
     severity: Severity
     file: str = Field(min_length=1, max_length=500)
     line: int | None = Field(default=None, ge=0)
     claim: str = Field(min_length=1, max_length=4000)
     fix: str = Field(min_length=1, max_length=4000)
+    evidence: Evidence
+    confidence: float = Field(ge=0, le=1)
 
 
 class Checklist(Strict):

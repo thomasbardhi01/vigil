@@ -16,6 +16,10 @@ Check, in order:
    the AC id, what is missing, file:line.
 
 End with structured output: `{"verdict": "clean" | "changes", "findings": [{"severity":
-"low|medium|high", "file", "line", "claim", "fix"}], "checklist": {...}}`. Every finding
-names a file and line and says how to fix it. `clean` means zero findings of severity
+"low|medium|high", "file", "line", "claim", "fix", "evidence": {"kind", "ref"},
+"confidence"}], "checklist": {...}}`. Every finding names a file and line and says how to
+fix it. Every finding also carries `evidence`: `kind` is `test` (ref: a test id),
+`diff_line` (ref: `path:line`), `spec_criterion` (ref: an AC id such as `AC3`) or
+`runtime_log` (ref: a log excerpt id), and `confidence` is a number from 0 to 1. A finding
+with no evidence, or a ref that does not fit its kind, makes the whole review invalid. `clean` means zero findings of severity
 medium or higher. Answer every checklist item. An answer without the checklist fails.

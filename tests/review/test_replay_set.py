@@ -28,7 +28,15 @@ FIRST, FIX = "c902b32b3f9f252f325f1c8d1738cd031f019790", "5e57b155fdef46d266fd76
 def _finding(
     claim: str, *, file: str = "src/x.test.ts", line: int | None = 10, severity: str = "medium"
 ) -> dict[str, Any]:
-    return {"severity": severity, "file": file, "line": line, "claim": claim, "fix": "x"}
+    return {
+        "severity": severity,
+        "file": file,
+        "line": line,
+        "claim": claim,
+        "fix": "x",
+        "evidence": {"kind": "diff_line", "ref": f"{file}:{line or 1}"},
+        "confidence": 0.9,
+    }
 
 
 # --- the fixtures ---------------------------------------------------------------------

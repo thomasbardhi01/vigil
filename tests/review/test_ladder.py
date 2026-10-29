@@ -16,11 +16,30 @@ from vigild.review.ladder import Ladder, classify_shape
 
 def _audit(shape: Shape, rung: int, *, missed: str | None = None, n: int = 2) -> Audit:
     found: list[dict[str, Any]] = [
-        {"severity": "medium", "file": "a.py", "line": i, "claim": "x", "fix": "y", "matched": i}
+        {
+            "severity": "medium",
+            "file": "a.py",
+            "line": i,
+            "claim": "x",
+            "fix": "y",
+            "matched": i,
+            "evidence": {"kind": "diff_line", "ref": "a.py:1"},
+            "confidence": 0.9,
+        }
         for i in range(n)
     ]
     if missed:
-        found.append({"severity": missed, "file": "b.py", "line": 9, "claim": "z", "fix": "w"})
+        found.append(
+            {
+                "severity": missed,
+                "file": "b.py",
+                "line": 9,
+                "claim": "z",
+                "fix": "w",
+                "evidence": {"kind": "diff_line", "ref": "b.py:9"},
+                "confidence": 0.9,
+            }
+        )
     return Audit(
         task_id="t-w1",
         job_id="t",
