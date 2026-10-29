@@ -81,8 +81,16 @@ from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load
 from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs import decisions
-from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
-from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
+from vigild.jobs.acceptance import (
+    NO_HIDDEN,
+    ac_plan,
+    check_worker,
+    contract_text,
+    escalates,
+    live_workers,
+    worker_acs,
+)
+from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
 from vigild.jobs.bench import TAGS as BENCH_TAGS
 from vigild.jobs.deps import infer_deps, is_lockfile
@@ -2497,6 +2505,28 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def _ac_commands(
+        self, job_id: str, repo: str, base_sha: str, contract: dict[str, Any]
+    ) -> tuple[list[tuple[str, list[str]]], list[str]]:
+        """(runs, refusals) of the job's approved spec.md AC test commands (#136): the
+        vault's artifact, never the worker's tree or report. A job with one live worker
+        runs them all; with several, a worker answers for the ACs its `why` or
+        `done_when` names (its branch doesn't hold the others' tests), and for any AC
+        no live worker names."""
+        art = self.store.get_artifact(job_id, "spec.md")
+        if art is None:
+            return [], []
+        live = live_workers(self.store.list_tasks(job_id))
+        idents = [c.ident for c in parse_spec(art.content).criteria]
+        only = worker_acs(
+            idents, [contract_text(t.contract) for t in live], contract_text(contract)
+        )
+
+        def read(path: str) -> str | None:
+            return self.workspace.read_blob(repo, base_sha, path)
+
+        return ac_plan(art.content, read, only)
+
     def _needs_deps(
         self, repo: str, base_sha: str, head: str, report: WorkerReport
     ) -> dict[str, Any] | None:
@@ -3082,10 +3112,16 @@ class JobRunner:
         test_cmd = str(contract["spec"].get("test_cmd") or "")
         # owner ruling, 2026-10-23: vigild computes the class itself; the contract's
         # marker is the durable copy, not the authority
+        ac_runs, ac_refused = (
+            self._ac_commands(job_id, job.repo, base_sha, contract)
+            if test_cmd.strip()
+            else ([], [])
+        )
         overlap = runner_overlap(
             contract["spec"].get("files_in_scope") or [],
             self.cfg.repo(job.repo).runner_config,
             test_cmd,
+            *(c for c, _ in ac_runs),
         )
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
@@ -3113,6 +3149,7 @@ class JobRunner:
                         runner_overlap=overlap,
                         hidden=entry_suite(hidden_entry),
                         scope=list(contract["spec"].get("files_in_scope") or []),
+                        ac_commands=ac_runs,
                     )
             except Halted:
                 self._close_killed(job_id)
@@ -3127,6 +3164,8 @@ class JobRunner:
                 return self._fail(
                     job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
                 )
+            if ac_refused:
+                tests["ac_refused"] = ac_refused  # never skipped: it fails the task
             if overlap and not hidden_on:
                 tests["hidden_disabled"] = True
             elif overlap and "hidden" not in tests:

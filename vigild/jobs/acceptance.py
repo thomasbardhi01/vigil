@@ -12,14 +12,16 @@ outcome other than `fail` before and `pass` after is a rejection."""
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import Any
 
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
+from vigild.intake.spec_gate import test_cmd_problem
+from vigild.jobs.artifacts import ac_refs, parse_spec
 from vigild.jobs.integrity import Finding, blocking, check_integrity
-from vigild.verifier import TEST_FILE, invoked_scripts
+from vigild.verifier import TEST_FILE, ReadFile, invoked_scripts
 from vigild.workspace import Workspace
 
 ASSERT = re.compile(r"\b(assert|expect|should|XCTAssert)")
@@ -76,6 +78,79 @@ def hidden_errors(tests: dict[str, Any]) -> list[str]:
     return errors
 
 
+def ac_plan(
+    spec_md: str, read: ReadFile | None = None, only: Collection[str] | None = None
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """(runs, refusals) for the approved spec.md's AC test commands (#136). `runs` is
+    (command, AC ids) for each distinct command, in first-seen order; never the
+    worker's. A command the spec gate refuses now (a spec approved before a gate rule)
+    is never skipped: it is a refusal that fails the task, naming the AC and why.
+    `only` limits it to those AC ids (a worker of several answers for the ACs it
+    names, and for those no worker names)."""
+    found: dict[str, list[str]] = {}
+    refused: list[str] = []
+    for c in parse_spec(spec_md).criteria:
+        cmd = (c.test_cmd or "").strip()
+        if only is not None and c.ident not in only:
+            continue
+        if not cmd:
+            continue
+        why = test_cmd_problem(cmd, read)
+        if why is None:
+            found.setdefault(cmd, []).append(c.ident)
+        else:
+            refused.append(f"{c.ident}: `{cmd}` is not a runnable test command ({why})")
+    return list(found.items()), refused
+
+
+def ac_commands(
+    spec_md: str, read: ReadFile | None = None, only: Collection[str] | None = None
+) -> list[tuple[str, list[str]]]:
+    """The runnable part of `ac_plan`."""
+    return ac_plan(spec_md, read, only)[0]
+
+
+def live_workers(tasks: Iterable[Any]) -> list[Any]:
+    """The job's tasks that still answer for its ACs: not re-planned away or
+    abandoned, and not a dependency job (#136)."""
+    return [
+        t
+        for t in tasks
+        if t.state not in ("superseded", "abandoned") and t.contract.get("shape") != "deps"
+    ]
+
+
+def contract_text(contract: dict[str, Any]) -> str:
+    """What a worker contract says about its ACs: `why` and `done_when`."""
+    return f"{contract.get('why') or ''} {(contract.get('spec') or {}).get('done_when') or ''}"
+
+
+def worker_acs(idents: Iterable[str], live_texts: Sequence[str], mine: str) -> set[str] | None:
+    """The AC ids one worker's after run answers for (#136), or None for all. A
+    one-worker job answers for every AC. With several, a worker answers for the ACs
+    its own text names, and for those no live worker names (the fail-safe for a job
+    approved before the spec gate checked that), since no branch is better placed."""
+    if len(live_texts) <= 1:
+        return None
+    named: set[str] = set()
+    for t in live_texts:
+        named |= ac_refs(t)
+    return ac_refs(mine) | (set(idents) - named)
+
+
+def ac_errors(tests: dict[str, Any]) -> list[str]:
+    """A stage-3 error for each AC command that selected no test or didn't pass."""
+    errors: list[str] = [str(e) for e in tests.get("ac_refused") or []]
+    for run in tests.get("ac") or []:
+        who = "/".join(run.get("acs") or []) or "AC"
+        cmd = run.get("command")
+        if not run.get("selected") or not run.get("report"):
+            errors.append(f"{who}: `{cmd}` selected 0 tests")
+        elif run.get("outcome") != "pass":
+            errors.append(f"{who}: `{cmd}` did not pass (the verifier saw {run.get('outcome')})")
+    return errors
+
+
 def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]:
     if not str(spec.get("test_cmd") or "").strip():
         return ["the contract has no test_cmd, so nothing can be accepted"]
@@ -129,7 +204,7 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
             f"missing ids {ran.get('missing_ids')}, missing files {ran.get('missing_files')}, "
             f"skipped {ran.get('skipped')}, xfail {ran.get('xfail')}"
         )
-    return [*errors, *hidden_errors(tests)]
+    return [*errors, *ac_errors(tests), *hidden_errors(tests)]
 
 
 def runner_config_changes(
@@ -139,11 +214,16 @@ def runner_config_changes(
     head: str,
     contract: dict[str, Any],
     runner_config: list[str] | tuple[str, ...],
+    ac_cmds: Iterable[str] = (),
 ) -> tuple[list[str], list[str]]:
     """(refused, allowed): changed files that decide how tests run (round 3,
-    F1). Allowed only when the spec names the exact path, not a glob."""
+    F1). Allowed only when the spec names the exact path, not a glob. The scripts
+    an AC command runs count as `test_cmd`'s do (#136)."""
     spec = contract["spec"]
-    globs = [*runner_config, *invoked_scripts(str(spec.get("test_cmd") or ""))]
+    scripts = [
+        s for cmd in [str(spec.get("test_cmd") or ""), *ac_cmds] for s in invoked_scripts(cmd)
+    ]
+    globs = [*runner_config, *scripts]
     named = set(spec.get("files_in_scope") or [])
     changed = sorted({path for _, path in ws.changed(repo, base_sha, head)})
     hits = [p for p in changed if in_scope(p, globs)]
@@ -172,7 +252,8 @@ def check_worker(
     if vendored:
         # round 4, item 5: installed packages are the image's, never the worker's
         errors.append(f"node_modules is never committed: {vendored[:20]}")
-    refused, _ = runner_config_changes(ws, repo, base_sha, head, contract, runner_config)
+    ac_cmds = [str(r.get("command") or "") for r in (tests or {}).get("ac") or []]
+    refused, _ = runner_config_changes(ws, repo, base_sha, head, contract, runner_config, ac_cmds)
     if refused:
         errors.append(
             f"changes how tests run: {refused}; the approved spec must name each of these "

@@ -178,11 +178,17 @@ def runner_globs(runner_config: Iterable[str], test_cmd: str) -> list[str]:
     return [*runner_config, *invoked_scripts(test_cmd)]
 
 
-def runner_overlap(scope: Iterable[str], runner_config: Iterable[str], test_cmd: str) -> list[str]:
-    """The literal entries in a task's scope that the verifier pins to the base
-    (a glob in scope can't change a runner file: acceptance refuses a changed
-    runner file the spec doesn't name by its exact path)."""
-    globs = runner_globs(runner_config, test_cmd)
+def runner_overlap(
+    scope: Iterable[str], runner_config: Iterable[str], test_cmd: str, *ac_cmds: str
+) -> list[str]:
+    """The literal entries in a task's scope that name a runner file: the head's copy runs
+    in every run (a glob in scope can't change a runner file: acceptance refuses a changed
+    runner file the spec doesn't name by its exact path). `ac_cmds`: the scripts AC
+    commands run count too (#136), as acceptance lets the spec name them."""
+    globs = [
+        *runner_globs(runner_config, test_cmd),
+        *(s for c in ac_cmds for s in invoked_scripts(c)),
+    ]
     return sorted({f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)})
 
 
@@ -620,8 +626,13 @@ class Verifier:
         runner_overlap: Sequence[str] = (),
         hidden: HiddenSuite | None = None,
         scope: Sequence[str] | None = None,
+        ac_commands: Sequence[tuple[str, Sequence[str]]] = (),
     ) -> dict[str, Any]:
         """`test_cmd` is the approved spec's, never the worker's tree's.
+
+        `ac_commands` is (command, AC ids) for each distinct acceptance-criterion
+        test command of the approved spec.md (#136); each runs once in the head
+        checkout, as its own run, and the record's `ac` lists what it selected.
 
         `runner_overlap` is the runner files the task's scope names (owner
         ruling, 2026-10-23): those, and only those, are the head's in every
@@ -630,7 +641,9 @@ class Verifier:
         head_files = self.ws.tree_paths(repo, head)
         cfg = list(runner_config)
         overlap = sorted(set(runner_overlap))
-        pinned = self._pinned(base_files, head_files, cfg, test_cmd, overlap)
+        pinned = self._pinned(
+            base_files, head_files, cfg, [test_cmd, *(c for c, _ in ac_commands)], overlap
+        )
         changed = self.ws.changed(repo, base_sha, head)
         changed_paths = {path for _, path in changed}
         tests = sorted(
@@ -674,6 +687,12 @@ class Verifier:
             after["outcome"] = "unknown"
             after["note"] = "no test report: that any test ran can't be confirmed"
         record["after"] = after
+        record["ac"] = [
+            self._ac_entry(cmd, list(ids), after)  # the same command: the after run is its run
+            if cmd.strip() == test_cmd.strip()
+            else self._ac_run(repo, image, f"{task_id}-ac{i}", head, cmd, list(ids), pin, base_sha)
+            for i, (cmd, ids) in enumerate(ac_commands, start=1)
+        ]
         added = sorted(path for status, path in changed if status[:1] == "A")
         if not after["_report"]:
             record["ran"] = {"checked": False, "note": "no report from the head run"}
@@ -715,19 +734,59 @@ class Verifier:
                 run.pop("_report", None)
         return record
 
+    def _ac_run(
+        self,
+        repo: str,
+        image: str,
+        name: str,
+        head: str,
+        cmd: str,
+        acs: list[str],
+        pin: tuple[str, list[str]],
+        base_sha: str,
+    ) -> dict[str, Any]:
+        """One AC test command in the head checkout, planned and judged like the
+        after run's `test_cmd`. `selected` is the testcases in its JUnit report:
+        none (an empty or missing report, pytest's exit 5) means it ran nothing."""
+        entry: dict[str, Any] = {"command": cmd, "acs": acs}
+        plan = plan_reports(cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        if plan.problems:
+            return {**entry, "outcome": "unknown", "selected": 0, "note": "; ".join(plan.problems)}
+        run = self._run(repo, image, name, head, cmd, plan.command, [pin])
+        return self._ac_entry(cmd, acs, run)
+
+    @staticmethod
+    def _ac_entry(cmd: str, acs: list[str], run: dict[str, Any]) -> dict[str, Any]:
+        """An AC's record from a run. `selected` counts the cases that executed:
+        passed or failed, never skipped or xfail. None (an empty or missing report,
+        pytest's exit 5, only skips) means the command tested nothing."""
+        cases = run.get("_cases") or []
+        executed = sum(1 for c in cases if c.status in ("pass", "failure", "error"))
+        return {
+            "command": cmd,
+            "acs": acs,
+            "exit": run["exit"],
+            "outcome": run["outcome"],
+            "selected": executed,
+            "skipped": len(cases) - executed,
+            "report": bool(run.get("_report")),
+            "tail": run["tail"],
+            **({"note": run["note"]} if "note" in run else {}),
+        }
+
     @staticmethod
     def _pinned(
         base_files: set[str],
         head_files: set[str],
         runner_config: list[str],
-        test_cmd: str,
+        cmds: Sequence[str],
         overlap: Sequence[str],
     ) -> list[str]:
         """The runner files that are the base's in every run (owner direction,
-        round 3): the repo's runner_config, and any script `test_cmd` runs that
-        the base has. Not the overlap, which is the head's."""
+        round 3): the repo's runner_config, and any script `test_cmd` or an AC
+        command (#136) runs that the base has. Not the overlap, which is the head's."""
         pinned = {p for p in base_files | head_files if in_scope(p, runner_config)} | {
-            p for p in invoked_scripts(test_cmd) if p in base_files
+            p for cmd in cmds for p in invoked_scripts(cmd) if p in base_files
         }
         return sorted(pinned - set(overlap))
 
