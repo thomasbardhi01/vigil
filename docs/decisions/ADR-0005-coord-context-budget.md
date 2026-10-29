@@ -95,6 +95,8 @@ Before the coord runs, vigild computes these and writes them into the spec and p
 
 The coord writes the goal, the acceptance criteria and the risks. The spec gate is unchanged: it still checks everything, including what vigild filled in.
 
+**Built** (`vigild/packets/prefill.py`, 2026-10-28): candidates are the router's `request_paths` over the title, request, notes and issue, kept if the file exists at `base_sha`; runner files by `runner_overlap` over the repo's `runner_config`, money paths by guard's `matches`, pinned paths by strict `in_scope`. All packets carry a fenced `prefill` part; a first draft also gets a skeleton `spec.md` and `plan.md` in its clone. A replan, an amendment and a retry after a gate refusal get the part but no skeleton, so the coord never starts over a spec it already has.
+
 ### 6. Compaction thresholds in the executor image
 CLI 2.1.306 was checked, by reading its binary in `vigil-session/vigil:4abf8a55`.
 - **Compaction can be set:**

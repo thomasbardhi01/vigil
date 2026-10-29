@@ -31,6 +31,7 @@ from vigild.jobs.model import Role
 from vigild.jobs.ownernote import spec_body as spec_text
 from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
+from vigild.packets.prefill import Prefill
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 DEFAULT_BUDGET_CHARS = 120_000
@@ -40,6 +41,7 @@ TITLES = {
     "context_pack": "2. Context pack",
     "contract": "3. Contract",
     "feature_index": "1a. Feature-map index (one line per row)",
+    "prefill": "3b. Prefill (vigild's own computation, paths read at base_sha)",
     "owner": "3a. Owner's amendment (from the owner, not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
@@ -608,6 +610,8 @@ def _assemble_coord(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -621,7 +625,10 @@ def _assemble_coord(
     3. the job: the contract, the notes, gate errors, untrusted text, the schema.
 
     `extra_paths` is the hook for vigild's pre-fill (part 5): paths it found
-    that the request doesn't name. `fresh` is a replan that starts the coord from
+    that the request doesn't name. `prefill` is that pre-fill, which every
+    variant carries as its own fenced part (`skeleton`: the coord's clone holds a
+    spec.md and plan.md skeleton, true on a first draft only).
+    `fresh` is a replan that starts the coord from
     nothing (#78): the stable block (so the cached prefix is shared) but no
     scope excerpts, only the contract, the owner's note and spec (`amend`) and
     the untrusted failures and plan.md the caller passes. `amend` is (the spec to
@@ -669,6 +676,7 @@ def _assemble_coord(
         **({"feature_index": index} if lean else {}),
         "context_pack": pack,
         "contract": contract,
+        **({"prefill": prefill.section(job_id, skeleton=skeleton)} if prefill else {}),
     }
     if amend is not None:
         previous, baseline, owner_notes = amend
@@ -720,6 +728,8 @@ def assemble_coord_classic(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -733,6 +743,8 @@ def assemble_coord_classic(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
         budget_chars=budget_chars,
     )
@@ -746,6 +758,8 @@ def assemble_coord_lean(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
 ) -> Packet:
     """The lean coord packet (ADR-0005 part 1)."""
@@ -757,6 +771,8 @@ def assemble_coord_lean(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
     )
 

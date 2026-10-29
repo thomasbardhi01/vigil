@@ -97,6 +97,7 @@ from vigild.packets.assemble import (
     assemble_worker,
 )
 from vigild.packets.fence import fence
+from vigild.packets.prefill import Prefill, compute_prefill
 from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import (
@@ -1694,11 +1695,29 @@ class JobRunner:
                 art = self.store.get_artifact(job_id, name)
                 if art is not None and not (name == "spec.md" and amend is not None):
                     untrusted[label] = art.content[:cap]
+        pre = compute_prefill(
+            clone,
+            request,
+            policy=self.cfg.repo(job.repo),
+            money_globs=self.cfg.routing.money_paths,
+            issue=issue or "",
+        )
+        skeleton = not (fresh or amend or replan or previous or gate_errors)
+        if skeleton:
+            self._write_skeleton(clone, job_id, job.title, pre)
         self.workspace.write_task(clone, request)
         # a fresh replan (#78) is not affected by the switch: it is always the classic one
         assemble = assemble_coord if fresh else COORD_PACKETS[self.cfg.routing.coord_packet]
         packet = assemble(
-            clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend, fresh=fresh
+            clone,
+            request,
+            untrusted=untrusted,
+            gate_errors=gate_errors,
+            amend=amend,
+            extra_paths=pre.candidates,
+            prefill=pre,
+            skeleton=skeleton,
+            fresh=fresh,
         )
         # Re-plan (item 3): the coord resumes its own last session, its whole
         # context, with the failures in this packet, unless it starts fresh.
@@ -1799,6 +1818,14 @@ class JobRunner:
             if missing:
                 return [missing], drafts
         return self.jobs.file_for_approval(job_id), drafts
+
+    def _write_skeleton(self, clone: Path, job_id: str, title: str, pre: Prefill) -> None:
+        """A first draft starts from vigild's skeleton (ADR-0005 part 5), written into
+        the coord's own fresh clone."""
+        d = clone / ".vigil" / job_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "spec.md").write_text(pre.spec_md(title))
+        (d / "plan.md").write_text(pre.plan_md(job_id))
 
     def _store_amendment(
         self, job: Any, head: str, amended: str, baseline: str = "approved"

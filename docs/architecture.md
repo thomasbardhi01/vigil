@@ -278,7 +278,15 @@ stateDiagram-v2
   `plan.md`: one session and one fresh clone per draft. vigild runs the spec
   gate; on a refusal the coord gets the errors and its previous draft and
   drafts again, up to three drafts, then you are paged (resumable). The
-  spec gate **refuses a worker id that already exists in the job**
+  **Before each coord starts, vigild pre-fills the mechanical parts** (ADR-0005 part 5,
+  `vigild/packets/prefill.py`): the repo paths the request, notes and issue name that
+  exist at `base_sha` (the router's scope-hint extraction), which of them are runner,
+  money (guard's loose match) or pinned (strict) paths, the scope rules as text, and
+  `test_cmd` candidates (the repo's `dev_suites` and the test files named for each
+  file's stem). Every coord packet (classic, lean, fresh replan) carries them as a
+  fenced `prefill` part; a first draft also finds a skeleton `spec.md` and `plan.md` in its
+  clone with those fields filled and the goal, criteria and risks `TODO(coord)`. The
+  gate is unchanged and checks what vigild filled in.   spec gate **refuses a worker id that already exists in the job**
   (merged, failed or superseded) and one repeated in the plan; a new worker
   may list an existing id in `depends_on`. It also **refuses a scope entry
   that is an existing directory at the base without `/**`** ("use dir/** (a
