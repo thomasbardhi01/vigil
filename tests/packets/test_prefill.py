@@ -22,10 +22,10 @@ FILES = {
     "vigild/jobs/runner.py": "X = 1\n",
     "vigild/budget.py": "CAP = 1\n",
     "vigild/other.py": "Y = 1\n",
-    "tests/jobs/test_runner.py": "def test_a(): ...\n",
-    "tests/jobs/test_runner_more.py": "def test_b(): ...\n",
+    "tests/jobs/test_runner.py": "import vigild.jobs.runner\n",
+    "tests/jobs/test_runner_more.py": "from vigild.jobs import runner\n",
     "tests/jobs/test_round2_runner.py": "def test_c(): ...\n",
-    "tests/test_budget.py": "def test_d(): ...\n",
+    "tests/test_budget.py": "from vigild import budget\n",
 }
 
 
@@ -68,6 +68,7 @@ def test_runner_and_money_files_are_listed_by_the_policy(repo: Path) -> None:
     assert "uv run --offline pytest -q tests/jobs/test_runner_more.py" in pre.test_cmds
     assert "uv run --offline pytest -q tests/test_budget.py" in pre.test_cmds
     assert not [c for c in pre.test_cmds if "round2" in c]  # not test_runner*
+    assert pre.related and "Blind spots" in pre.body()
 
 
 def test_a_file_is_a_runner_file_only_if_the_policy_says_so(repo: Path) -> None:
