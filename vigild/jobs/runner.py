@@ -4489,12 +4489,18 @@ class JobRunner:
         ]  # fmt: skip
         if early:
             return early[-1], "packet_event"
-        n = len(
-            [x for x in self.store.list_sessions(job_id)
-             if x.role is Role.COORD and str(x.created_at) <= approved_at]
-        )  # fmt: skip
+        # Clone ids are per coord attempt and reused (coord1, coord2, coord1), so a count of
+        # sessions names no clone: the record is the approved draft's own clone's, the last
+        # coord session that finished before the approval.
+        drafts = [
+            x for x in self.store.list_sessions(job_id)
+            if x.role is Role.COORD and x.clone_path and x.status == "done"
+            and str(x.created_at) <= approved_at
+        ]  # fmt: skip
         try:
-            return self.workspace.base_sha(f"{job_id}-coord{max(n, 1)}"), "clone_record"
+            if not drafts:
+                raise WorkspaceError(f"no finished coord draft of {job_id} before its approval")
+            return self.workspace.base_sha(Path(str(drafts[-1].clone_path)).name), "clone_record"
         except (OSError, ValueError, KeyError, WorkspaceError) as e:
             raise ReplayInvalid(f"no record of the base {job_id}'s spec was drafted on") from e
 
