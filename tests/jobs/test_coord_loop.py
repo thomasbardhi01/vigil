@@ -682,6 +682,26 @@ def test_out_of_scope_worker_is_not_published(world: World) -> None:
     assert any("acceptance" in p["title"] for p in pages)
 
 
+def test_a_bare_todo_pages_the_job_and_is_not_published(world: World) -> None:  # #104
+    w = world
+
+    def todo(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        test = spec.clone / TESTS[f][0]
+        test.write_text(test.read_text() + "\n# TODO make this stricter\n")
+
+    w.standin.worker_edit = todo
+    job = _approve(w)
+    assert w.publisher.prs == []
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("acceptance" in p["title"] for p in pages)
+    detail = json.dumps(pages)
+    assert "todo-without-issue" in detail and ".py:" in detail
+
+
 def test_a_session_without_guard_fails_closed(world: World) -> None:
     w = world
 

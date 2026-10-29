@@ -1,7 +1,8 @@
 """Stage 3 acceptance (design "Job execution protocol"), checked by vigild on
 the host, in the vault, after the worker container exits and before anything
 is pushed: must_fail_first observed, test_cmd passes, files changed inside
-scope, no test weakened, cost under the limit. Lint and types run in CI.
+scope, no test weakened, the completion-integrity rules
+(`jobs/integrity.py`), cost under the limit. Lint and types run in CI.
 
 Test results come only from vigild's verifier (owner direction, review round
 2; `vigild/verifier.py`): the worker report's test fields are ignored. It
@@ -16,6 +17,7 @@ from typing import Any
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
+from vigild.jobs.integrity import check_integrity
 from vigild.verifier import TEST_FILE, invoked_scripts
 from vigild.workspace import Workspace
 
@@ -191,6 +193,7 @@ def check_worker(
         errors.append(f"files changed outside scope: {outside}")
     for w in weakened_tests(ws, repo, base_sha, head):
         errors.append(f"test weakened: {w}")
+    errors += check_integrity(ws, repo, base_sha, head, report)  # #104: rules only, never fixed
     limit = float((contract.get("limits") or {}).get("max_cost_usd") or 0)
     if limit and cost > limit + 1e-9:
         errors.append(f"cost ${cost:.4f} is over the limit ${limit:.2f}")

@@ -316,7 +316,9 @@ stateDiagram-v2
   across the fleet, each in its own container, clone and `vigil/<task>`
   branch. After a worker exits, vigild imports its result into the vault
   (decision `vault-host-git`), reads `worker_report.json` from there, checks stage-3 acceptance
-  (decision `reading-session-files`), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
+  (decision `reading-session-files`; it includes the rules-only completion-integrity
+  check, `vigild/jobs/integrity.py`: added TODOs and skips with no reason, stubs, self-referential
+  report text and deleted guards page the job like a weakened test), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
   instead files a question for its coord and your inbox, and its task
   waits. Work that can't start (a dependency failed or waits, or the repo
   is at its WIP limit) pages you and blocks the job.
