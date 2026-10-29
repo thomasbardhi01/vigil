@@ -620,8 +620,13 @@ class Verifier:
         runner_overlap: Sequence[str] = (),
         hidden: HiddenSuite | None = None,
         scope: Sequence[str] | None = None,
+        ac_commands: Sequence[tuple[str, Sequence[str]]] = (),
     ) -> dict[str, Any]:
         """`test_cmd` is the approved spec's, never the worker's tree's.
+
+        `ac_commands` is (command, AC ids) for each distinct acceptance-criterion
+        test command of the approved spec.md (#136); each runs once in the head
+        checkout, as its own run, and the record's `ac` lists what it selected.
 
         `runner_overlap` is the runner files the task's scope names (owner
         ruling, 2026-10-23): those, and only those, are the head's in every
@@ -674,6 +679,10 @@ class Verifier:
             after["outcome"] = "unknown"
             after["note"] = "no test report: that any test ran can't be confirmed"
         record["after"] = after
+        record["ac"] = [
+            self._ac_run(repo, image, f"{task_id}-ac{i}", head, cmd, list(ids), pin, base_sha)
+            for i, (cmd, ids) in enumerate(ac_commands, start=1)
+        ]
         added = sorted(path for status, path in changed if status[:1] == "A")
         if not after["_report"]:
             record["ran"] = {"checked": False, "note": "no report from the head run"}
@@ -714,6 +723,37 @@ class Verifier:
                 run.pop("_cases", None)
                 run.pop("_report", None)
         return record
+
+    def _ac_run(
+        self,
+        repo: str,
+        image: str,
+        name: str,
+        head: str,
+        cmd: str,
+        acs: list[str],
+        pin: tuple[str, list[str]],
+        base_sha: str,
+    ) -> dict[str, Any]:
+        """One AC test command in the head checkout, planned and judged like the
+        after run's `test_cmd`. `selected` is the testcases in its JUnit report:
+        none (an empty or missing report, pytest's exit 5) means it ran nothing."""
+        entry: dict[str, Any] = {"command": cmd, "acs": acs}
+        plan = plan_reports(cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        if plan.problems:
+            return {**entry, "outcome": "unknown", "selected": 0, "note": "; ".join(plan.problems)}
+        run = self._run(repo, image, name, head, cmd, plan.command, [pin])
+        run.pop("_cases", None)
+        report = run.pop("_report", False)
+        return {
+            **entry,
+            "exit": run["exit"],
+            "outcome": run["outcome"],
+            "selected": run["tests"],
+            "report": bool(report),
+            "tail": run["tail"],
+            **({"note": run["note"]} if "note" in run else {}),
+        }
 
     @staticmethod
     def _pinned(

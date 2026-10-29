@@ -11,12 +11,15 @@ outcome other than `fail` before and `pass` after is a rejection."""
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 from vigild.contract.models import WorkerReport
 from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
-from vigild.verifier import TEST_FILE, invoked_scripts
+from vigild.intake.spec_gate import test_cmd_problem
+from vigild.jobs.artifacts import parse_spec
+from vigild.verifier import TEST_FILE, ReadFile, invoked_scripts
 from vigild.workspace import Workspace
 
 ASSERT = re.compile(r"\b(assert|expect|should|XCTAssert)")
@@ -73,6 +76,36 @@ def hidden_errors(tests: dict[str, Any]) -> list[str]:
     return errors
 
 
+def ac_commands(
+    spec_md: str, read: ReadFile | None = None, only: Collection[str] | None = None
+) -> list[tuple[str, list[str]]]:
+    """(command, AC ids) for each distinct AC test command of the approved
+    spec.md (#136), in first-seen order. Never the worker's: a command the spec
+    gate refuses is skipped (the gate already refused it at approval). `only`
+    limits it to those AC ids (a worker of several answers for the ACs it names)."""
+    found: dict[str, list[str]] = {}
+    for c in parse_spec(spec_md).criteria:
+        cmd = (c.test_cmd or "").strip()
+        if only is not None and c.ident not in only:
+            continue
+        if cmd and test_cmd_problem(cmd, read) is None:
+            found.setdefault(cmd, []).append(c.ident)
+    return list(found.items())
+
+
+def ac_errors(tests: dict[str, Any]) -> list[str]:
+    """A stage-3 error for each AC command that selected no test or didn't pass."""
+    errors: list[str] = []
+    for run in tests.get("ac") or []:
+        who = "/".join(run.get("acs") or []) or "AC"
+        cmd = run.get("command")
+        if not run.get("selected") or not run.get("report"):
+            errors.append(f"{who}: `{cmd}` selected 0 tests")
+        elif run.get("outcome") != "pass":
+            errors.append(f"{who}: `{cmd}` did not pass (the verifier saw {run.get('outcome')})")
+    return errors
+
+
 def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]:
     if not str(spec.get("test_cmd") or "").strip():
         return ["the contract has no test_cmd, so nothing can be accepted"]
@@ -126,7 +159,7 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
             f"missing ids {ran.get('missing_ids')}, missing files {ran.get('missing_files')}, "
             f"skipped {ran.get('skipped')}, xfail {ran.get('xfail')}"
         )
-    return [*errors, *hidden_errors(tests)]
+    return [*errors, *ac_errors(tests), *hidden_errors(tests)]
 
 
 def runner_config_changes(

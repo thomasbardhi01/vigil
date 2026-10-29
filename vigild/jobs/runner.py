@@ -37,6 +37,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -80,7 +81,7 @@ from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load
 from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs import decisions
-from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
+from vigild.jobs.acceptance import NO_HIDDEN, ac_commands, check_worker, escalates
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
 from vigild.jobs.bench import TAGS as BENCH_TAGS
@@ -2494,6 +2495,27 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def _ac_commands(
+        self, job_id: str, repo: str, base_sha: str, contract: dict[str, Any]
+    ) -> list[tuple[str, list[str]]]:
+        """The AC test commands of the job's approved spec.md (#136): the vault's
+        artifact, never the worker's tree or report. A job with one worker runs
+        them all; with several, a worker answers for the ACs its `why` or
+        `done_when` names (its branch doesn't hold the others' tests)."""
+        art = self.store.get_artifact(job_id, "spec.md")
+        if art is None:
+            return []
+        workers = [t for t in self.store.list_tasks(job_id) if t.contract.get("shape") != "deps"]
+        only: set[str] | None = None
+        if len(workers) > 1:
+            text = f"{contract.get('why') or ''} {(contract.get('spec') or {}).get('done_when')}"
+            only = set(re.findall(r"\bAC\d+\b", text))
+
+        def read(path: str) -> str | None:
+            return self.workspace.read_blob(repo, base_sha, path)
+
+        return ac_commands(art.content, read, only)
+
     def _needs_deps(
         self, repo: str, base_sha: str, head: str, report: WorkerReport
     ) -> dict[str, Any] | None:
@@ -3080,6 +3102,7 @@ class JobRunner:
                         runner_overlap=overlap,
                         hidden=entry_suite(hidden_entry),
                         scope=list(contract["spec"].get("files_in_scope") or []),
+                        ac_commands=self._ac_commands(job_id, job.repo, base_sha, contract),
                     )
             except Halted:
                 self._close_killed(job_id)
