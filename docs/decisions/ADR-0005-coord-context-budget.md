@@ -98,6 +98,8 @@ The coord writes the goal, the acceptance criteria and the risks. The spec gate 
 
 **Built** (`vigild/packets/prefill.py`, 2026-10-28): candidates are the router's `request_paths` over the title, request, notes and issue, kept if the file exists at `base_sha`; runner files by `runner_overlap` over the repo's `runner_config`, money paths by guard's `matches`, pinned paths by strict `in_scope`. All packets carry a fenced `prefill` part; a first draft also gets a skeleton `spec.md` and `plan.md` in its clone. A path whose every mention sits in a sentence that rules it out (starts with Not, or says out of scope, not, never or don't touch before the path) goes to `## Files out of scope`, not the candidates. A replan, an amendment and a retry after a gate refusal get the part but no skeleton, so the coord never starts over a spec it already has.
 
+**Related tests (#107, ADR-0005 work):** the test files in these candidates, and the worker packet's related tests, come from a reverse import graph (stdlib `ast`, depth 3) instead of the `tests/test_<stem>*.py` name; the name stays for non-Python files.
+
 ### 6. Compaction thresholds in the executor image
 CLI 2.1.306 was checked, by reading its binary in `vigil-session/vigil:4abf8a55`.
 - **Compaction can be set:**

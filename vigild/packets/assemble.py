@@ -32,9 +32,11 @@ from vigild.jobs.ownernote import spec_body as spec_text
 from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
 from vigild.packets.prefill import Prefill
+from vigild.packets.related_tests import BLIND_SPOTS, load_py, related_tests
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 DEFAULT_BUDGET_CHARS = 120_000
+MAX_RELATED = 6
 PARTS = ("role_and_rules", "context_pack", "contract", "untrusted", "output_schema", "self_check")
 TITLES = {
     "role_and_rules": "1. Role and rules",
@@ -158,6 +160,7 @@ def _context_pack(
     if fix_context and fix_context.get("parent_diff"):
         items.append((l6, "parent diff (fix job)", fix_context["parent_diff"]))
     needles = files + [Path(f).name for f in files]
+    related: set[str] = set()
     for layer, doc in (
         ("layer 3 (feature map)", "docs/feature-map.md"),
         ("layer 2 (architecture)", "docs/architecture.md"),
@@ -172,14 +175,21 @@ def _context_pack(
             continue
         text = _read(repo, f)
         items.append(("files in scope", f, text if text is not None else "(does not exist yet)"))
-        stem = Path(f).stem
-        tests_dir = repo / "tests"
-        for t in sorted(tests_dir.rglob(f"test_{stem}*.py"))[:3] if tests_dir.is_dir() else []:
-            rel = str(t.relative_to(repo))
-            if rel not in files:
-                body = _read(repo, rel)
-                if body is not None:
-                    items.append(("related tests", f"{rel} (related test)", body))
+        if not f.endswith(".py"):  # the name heuristic still serves non-Python files
+            tests_dir = repo / "tests"
+            pat = f"test_{Path(f).stem}*.py"
+            found = sorted(tests_dir.rglob(pat)) if tests_dir.is_dir() else []
+            related.update(str(t.relative_to(repo)) for t in found[:3])
+    py_files = [f for f in files if "*" not in f and f.endswith(".py")]
+    if py_files:
+        py = load_py(repo)
+        related.update(related_tests(py, py_files)[:MAX_RELATED])
+    for rel in sorted(related - set(files)):
+        body = _read(repo, rel)
+        if body is not None:
+            items.append(("related tests", f"{rel} (related test)", body))
+    if related:
+        items.append(("related tests", "blind spots of the related-tests list", BLIND_SPOTS))
     log = _git_log(repo, [f for f in files if "*" not in f])
     if log:
         items.append(("history", "last commits touching these files", log))
