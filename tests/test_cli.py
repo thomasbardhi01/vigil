@@ -295,3 +295,31 @@ def test_a_build_failure_names_the_build_stage(world: Any, monkeypatch: pytest.M
     assert "build" in out.output and "docker build died" in out.output
     assert "no record was written" in out.output
     assert images.store.q("SELECT * FROM dev_images") == []
+
+
+def test_cli_with_session_images_and_rebuild_builds_the_dev_image_once(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import types
+
+    import vigild.server as server
+
+    images, _, _, _, _ = _cli_world(world, monkeypatch)
+    runner = server.build_runner(None, None)  # type: ignore[arg-type]
+    calls: list[str] = []
+    real = images.ensure_fresh
+
+    def dev(repo: str, sha: str, **kw: Any) -> str:
+        calls.append("dev")
+        return real(repo, sha, **kw)
+
+    def session(repo: str, sha: str, **kw: Any) -> str:
+        calls.append("session")
+        return dev(repo, sha, **kw)  # SessionImages.ensure_fresh builds the dev image itself
+
+    monkeypatch.setattr(images, "ensure_fresh", dev)
+    runner.session_images = types.SimpleNamespace(ensure_fresh=session)
+    out = CliRunner().invoke(app, ["dev-image", "--repo", "o/fixture", "--rebuild"])
+    assert out.exit_code == 0, out.output
+    assert calls == ["session", "dev"]
+    assert len(images.store.q("SELECT * FROM dev_images WHERE repo=?", ("o/fixture",))) == 1
