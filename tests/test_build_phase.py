@@ -75,7 +75,7 @@ def test_the_scan_sees_a_build_call(tmp_path: Path) -> None:
 
 def test_resolve_never_builds_and_names_the_build(world: Any) -> None:
     images, docker, _, _, base, ctx = world
-    with pytest.raises(StaleDevImage, match=r"build vigil-dev/fixture:.* first"):
+    with pytest.raises(StaleDevImage, match=r"build vigil-dev-\w+/fixture:.* first"):
         images.resolve(REPO, base)
     assert docker.builds == []
     assert ctx["pages"] and ctx["pages"][0]["stage"] == "missing"  # paged once, with a rebuild

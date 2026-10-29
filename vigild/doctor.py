@@ -121,9 +121,10 @@ def backup_freshness_check(
 def stale_image_checks(dev: Any, sessions: Any, repo: str, tip: str) -> list[Check]:
     """Is the newest validated image the one main's tip needs? The key at `tip`,
     computed as `ensure_fresh` does, against the newest validated record; a
-    mismatch fails (#75: "pass" on a stale image). The session image likewise."""
+    mismatch fails (#75: "pass" on a stale image). The tag's image id must also be the
+    record's (#128). The session image likewise."""
 
-    def one(name: str, key: str, stages: tuple[str, ...]) -> Check:
+    def one(name: str, key: str, tag: str, stages: tuple[str, ...]) -> Check:
         rec = dev.newest_validated(repo, stages)
         if rec is None:
             return Check(
@@ -138,14 +139,19 @@ def stale_image_checks(dev: Any, sessions: Any, repo: str, tip: str) -> list[Che
                 f"{name} stale: key at main {key[:12]}, newest validated {rec['key'][:12]}; "
                 f"run `vigil dev-image --repo {repo}`",
             )
+        current = dev.docker.image_id_of(tag)  # the id, as `status()` compares it
+        if current is None:
+            return Check(f"{name} fresh: {repo}", False, f"{tag} is not present")
+        if current != rec["image_id"]:
+            return Check(f"{name} fresh: {repo}", False, f"{tag} changed since it was validated")
         return Check(f"{name} fresh: {repo}", True, key[:12])
 
     dev_key = dev.key(repo, tip)
-    out = [one("dev image", dev_key, ("validate",))]
+    dev_tag = dev.tag(repo, dev_key)
+    out = [one("dev image", dev_key, dev_tag, ("validate",))]
     if sessions is not None:
-        out.append(
-            one("session image", sessions.key(dev.tag(repo, dev_key)), ("session-validate",))
-        )
+        skey = sessions.key(dev_tag)
+        out.append(one("session image", skey, sessions.tag(repo, skey), ("session-validate",)))
     return out
 
 

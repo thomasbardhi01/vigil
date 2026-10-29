@@ -1628,9 +1628,9 @@ def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: Wor
     job = _approve(w)
     assert w.store.get_job(job).state.value == "ready"
     assert {r for r, _ in seen} == {"coord", "worker", "reviewer", "auditor"}
-    assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
+    assert all(img and img.startswith("vigil-session-") for _, img in seen), seen
     images = {c["image"] for c in w.tests.calls}
-    assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
+    assert images and all(i.startswith("vigil-dev-") for i in images), images
 
 
 def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  # round 4, item 7

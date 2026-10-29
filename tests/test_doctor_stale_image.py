@@ -12,9 +12,22 @@ from vigild.doctor import stale_image_checks
 REPO = "thomasbardhi01/vigil"
 
 
+class FakeDocker:
+    def __init__(self, ids: dict[str, str] | None = None) -> None:
+        self.ids = ids
+
+    def image_id_of(self, image: str) -> str | None:
+        if self.ids is None:  # default: every tag is present and matches its record
+            return "id"
+        return self.ids.get(image)
+
+
 class FakeDev:
-    def __init__(self, rows: list[dict[str, Any]], key: str = "a" * 64) -> None:
+    def __init__(
+        self, rows: list[dict[str, Any]], key: str = "a" * 64, docker: FakeDocker | None = None
+    ) -> None:
         self.rows, self._key = rows, key
+        self.docker = docker or FakeDocker()
 
     def key(self, repo: str, sha: str, source: str = "mirror") -> str:
         return self._key
@@ -34,9 +47,12 @@ class FakeSessions:
     def key(self, dev_tag: str) -> str:
         return self._key
 
+    def tag(self, repo: str, key: str) -> str:
+        return f"vigil-session/vigil:{key[:16]}"
+
 
 def _row(key: str, stage: str = "validate", ok: bool = True) -> dict[str, Any]:
-    return {"key": key, "stage": stage, "ok": ok}
+    return {"key": key, "stage": stage, "ok": ok, "image_id": "id"}
 
 
 def test_a_stale_dev_image_fails_naming_both_keys() -> None:
@@ -94,3 +110,30 @@ def test_devimages_newest_validated_reads_the_table(tmp_path: Path, cfg: Any) ->
     dev = DevImages(cfg, store, None, None, None)  # type: ignore[arg-type]
     assert dev.newest_validated(REPO, ("validate",))["key"] == "k1"  # type: ignore[index]
     assert dev.newest_validated(REPO, ("session-validate",))["key"] == "k3"  # type: ignore[index]
+
+
+def test_a_changed_image_id_fails() -> None:
+    dev = FakeDev([_row("a" * 64)], docker=FakeDocker({"vigil-dev/vigil:" + "a" * 16: "other"}))
+    out = stale_image_checks(dev, None, REPO, "tip")
+    assert out[0].ok is False and "changed since it was validated" in out[0].note
+
+
+def test_a_missing_tag_fails() -> None:
+    dev = FakeDev([_row("a" * 64)], docker=FakeDocker({}))
+    out = stale_image_checks(dev, None, REPO, "tip")
+    assert out[0].ok is False and "not present" in out[0].note
+
+
+def test_matching_tag_and_record_pass_for_both_images() -> None:
+    ids = {"vigil-dev/vigil:" + "a" * 16: "id", "vigil-session/vigil:" + "c" * 16: "id"}
+    dev = FakeDev([_row("a" * 64), _row("c" * 64, "session-validate")], docker=FakeDocker(ids))
+    out = stale_image_checks(dev, FakeSessions(dev, "c" * 64), REPO, "tip")  # type: ignore[arg-type]
+    assert [c.ok for c in out] == [True, True]
+
+
+def test_the_session_image_id_is_compared_too() -> None:
+    ids = {"vigil-dev/vigil:" + "a" * 16: "id", "vigil-session/vigil:" + "c" * 16: "x"}
+    dev = FakeDev([_row("a" * 64), _row("c" * 64, "session-validate")], docker=FakeDocker(ids))
+    out = stale_image_checks(dev, FakeSessions(dev, "c" * 64), REPO, "tip")  # type: ignore[arg-type]
+    assert [c.ok for c in out] == [True, False]
+    assert "changed since it was validated" in out[1].note
