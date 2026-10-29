@@ -23,6 +23,7 @@ BASE = {"bash", "sh", "chmod", "grep", "python", "python3", "uv", "uvx"}
 NOT_IN_DEV_IMAGE = {
     "docker": "host side only: vigild drives Docker; `docker` suites are dev_excluded",
     "node": "looked up with shutil.which; the tests that need it skip without it",
+    "tar": "CI runner only: scripts/image-key-check.py --validate exports the PR head with git archive | tar",
 }
 
 

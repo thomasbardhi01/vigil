@@ -37,7 +37,9 @@ def _plan_of(job: str, *ids_goals: tuple[str, str]) -> str:
     by_id = {w["task_id"]: w for w in doc["workers"]}
     workers = []
     for tid, goal in ids_goals:
-        base = by_id.get(tid) or by_id[f"{job}-w2"]
+        base = (
+            by_id.get(tid) or by_id[f"{job}-w1"]
+        )  # a fresh id replaces w1, which names AC1 (#136)
         workers.append({**base, "task_id": tid, "goal": goal})
     head = plan(job).split("```json\n")[0]
     return (

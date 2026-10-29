@@ -26,7 +26,8 @@ from vigild.executors.base import SessionSpec
 from vigild.jobs.model import JobState, Role
 
 LOW_A = {"severity": "low", "file": "docs/feature-map.md", "line": 3,
-         "claim": "the unit is missing from the row", "fix": "say req/min"}  # fmt: skip
+         "claim": "the unit is missing from the row", "fix": "say req/min",
+         "evidence": {"kind": "diff_line", "ref": "docs/feature-map.md:3"}, "confidence": 0.9}  # fmt: skip
 LOW_B = {**LOW_A, "line": 9, "claim": "the heading is out of order", "fix": "move it up"}
 NOTE = "Keep the change to the docs; leave the code alone."
 

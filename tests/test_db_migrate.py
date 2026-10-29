@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -226,7 +227,7 @@ def test_one_live_job_per_issue_is_a_unique_index(tmp_path: Path) -> None:
 def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
     """Batch (#54): the step is appended last, adds `jobs.batch_id` and the batches table to
     a database from before, keeps its rows, and runs twice."""
-    assert db.MIGRATIONS[15].__name__ == "_m16_batches"
+    assert "_m16_batches" in [m.__name__ for m in db.MIGRATIONS]
     path = tmp_path / "batch.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
@@ -243,20 +244,30 @@ def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
 
 
 def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
-    """#29: the step is appended last, adds `model_calls.call_key` and a unique index."""
+    """#29: the step is last in MIGRATIONS; on a database built from the schema of the step
+    before it, it adds `model_calls.call_key` and a unique index, and two more runs change
+    nothing."""
     assert db.MIGRATIONS[-1].__name__ == "_m17_call_key"
     path = tmp_path / "ck.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
-    for step in db.MIGRATIONS[:16]:
+    for step in db.MIGRATIONS[:-1]:
         step(conn)
-    conn.execute("DROP INDEX IF EXISTS calls_call_key")
     conn.commit()
+    assert "call_key" not in {r[1] for r in conn.execute("PRAGMA table_info(model_calls)")}
+    assert not [r for r in conn.execute("PRAGMA index_list(model_calls)") if "call_key" in r[1]]
     conn.close()
     store = Store.open(path)
-    db.migrate(store.conn)
-    db.migrate(store.conn)
     assert "call_key" in _cols(store, "model_calls")
     uniq = {r["name"] for r in store.q("PRAGMA index_list(model_calls)") if r["unique"]}
     assert "calls_call_key" in uniq
+    assert [r["name"] for r in store.q("PRAGMA index_info(calls_call_key)")] == ["call_key"]
+
+    def shape() -> list[Any]:
+        return [tuple(r) for r in store.q("SELECT type, name, sql FROM sqlite_master ORDER BY 2")]
+
+    before = shape()
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert shape() == before
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

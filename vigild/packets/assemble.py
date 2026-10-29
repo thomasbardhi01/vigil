@@ -31,15 +31,19 @@ from vigild.jobs.model import Role
 from vigild.jobs.ownernote import spec_body as spec_text
 from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
+from vigild.packets.prefill import Prefill
+from vigild.packets.related_tests import BLIND_SPOTS, load_py, related_tests
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 DEFAULT_BUDGET_CHARS = 120_000
+MAX_RELATED = 6
 PARTS = ("role_and_rules", "context_pack", "contract", "untrusted", "output_schema", "self_check")
 TITLES = {
     "role_and_rules": "1. Role and rules",
     "context_pack": "2. Context pack",
     "contract": "3. Contract",
     "feature_index": "1a. Feature-map index (one line per row)",
+    "prefill": "3b. Prefill (vigild's own computation, paths read at base_sha)",
     "owner": "3a. Owner's amendment (from the owner, not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
@@ -156,6 +160,7 @@ def _context_pack(
     if fix_context and fix_context.get("parent_diff"):
         items.append((l6, "parent diff (fix job)", fix_context["parent_diff"]))
     needles = files + [Path(f).name for f in files]
+    related: set[str] = set()
     for layer, doc in (
         ("layer 3 (feature map)", "docs/feature-map.md"),
         ("layer 2 (architecture)", "docs/architecture.md"),
@@ -170,14 +175,21 @@ def _context_pack(
             continue
         text = _read(repo, f)
         items.append(("files in scope", f, text if text is not None else "(does not exist yet)"))
-        stem = Path(f).stem
-        tests_dir = repo / "tests"
-        for t in sorted(tests_dir.rglob(f"test_{stem}*.py"))[:3] if tests_dir.is_dir() else []:
-            rel = str(t.relative_to(repo))
-            if rel not in files:
-                body = _read(repo, rel)
-                if body is not None:
-                    items.append(("related tests", f"{rel} (related test)", body))
+        if not f.endswith(".py"):  # the name heuristic still serves non-Python files
+            tests_dir = repo / "tests"
+            pat = f"test_{Path(f).stem}*.py"
+            found = sorted(tests_dir.rglob(pat)) if tests_dir.is_dir() else []
+            related.update(str(t.relative_to(repo)) for t in found[:3])
+    py_files = [f for f in files if "*" not in f and f.endswith(".py")]
+    if py_files:
+        py = load_py(repo)
+        related.update(related_tests(py, py_files)[:MAX_RELATED])
+    for rel in sorted(related - set(files)):
+        body = _read(repo, rel)
+        if body is not None:
+            items.append(("related tests", f"{rel} (related test)", body))
+    if related:
+        items.append(("related tests", "blind spots of the related-tests list", BLIND_SPOTS))
     log = _git_log(repo, [f for f in files if "*" not in f])
     if log:
         items.append(("history", "last commits touching these files", log))
@@ -282,6 +294,8 @@ def assemble_worker(
             untrusted["plan.md"] = fresh_fix["plan"][:FRESH_PLAN_CHARS]
         if fresh_fix.get("changelog"):
             untrusted["spec_changelog.md"] = fresh_fix["changelog"][:FRESH_CHANGELOG_CHARS]
+        if fresh_fix.get("history"):  # an escalation: every round, not just the latest
+            untrusted["review history"] = fresh_fix["history"]
     if fix_round:
         contract_part += (
             f"\n**Fix round {fix_round['round']}.** Your branch already holds your earlier "
@@ -306,7 +320,9 @@ def assemble_worker(
     if fix_context and fix_context.get("failure_log"):
         untrusted["failure-log"] = fix_context["failure_log"]
     report = artifact_path(Path("."), contract["job_id"], "worker_report.json", contract["task_id"])
-    schema = json.dumps(WorkerReport.model_json_schema(), indent=1, sort_keys=True)
+    schema_doc = WorkerReport.model_json_schema()
+    schema_doc["properties"].pop("executor", None)  # vigild's own field; a worker never writes it
+    schema = json.dumps(schema_doc, indent=1, sort_keys=True)
     output = (
         f"End by writing `{report.as_posix()}` (relative to the repo root), valid against this "
         f"schema, with `provenance` set to `claude`. Then commit.\n\n```json\n{schema}\n```\n\n"
@@ -337,6 +353,43 @@ FRESH_DIFF_CHARS = 30_000
 FRESH_VERIFIER_CHARS = 6_000
 FRESH_PLAN_CHARS = 12_000
 FRESH_CHANGELOG_CHARS = 6_000
+FRESH_FINDINGS_CHARS = 16_000
+
+
+def round_findings(rounds: list[dict[str, Any]], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every review round's findings, oldest first (#101). The newest rounds are in full
+    up to `cap` characters (the newest always is); older ones are listed by round, index
+    and severity under a dropped note."""
+    ordered = sorted(rounds, key=lambda r: int(r.get("round") or 0))
+    full: list[dict[str, Any]] = []
+    used = 0
+    for r in reversed(ordered):
+        size = len(json.dumps(r.get("findings") or [], indent=1))
+        if full and used + size > cap:
+            break
+        full.append(r)
+        used += size
+    dropped = ordered[: len(ordered) - len(full)]
+    out = ""
+    if dropped:
+        out += "Older rounds, dropped to keep this packet small (round:index severity):\n"
+        for r in dropped:
+            for i, f in enumerate(r.get("findings") or []):
+                out += f"- round {r.get('round')}:{i} {f.get('severity')}\n"
+        out += "\n"
+    for r in reversed(full):
+        body = json.dumps(r.get("findings") or [], indent=1)
+        if len(body) > cap:  # a hard bound: even the newest round is cut
+            body = body[:cap] + "\n(truncated)"
+        out += f"Round {r.get('round')}:\n{body}\n\n"
+    return out
+
+
+def joined_histories(parts: list[str], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every task's review history for the replan coord (#101). Each part is bounded by
+    `round_findings`; the join is bounded too, at `cap` characters."""
+    text = "\n".join(parts)
+    return text if len(text) <= cap else text[:cap] + "\n(truncated)"
 
 
 def _review_parts(
@@ -580,7 +633,9 @@ def _coord_context(
 
 def _classic_context(repo: Path, budget_chars: int) -> tuple[str, list[str]]:
     """Today's coord context: README.md, the whole feature map and the whole
-    architecture doc, whichever fit the budget."""
+    architecture doc, in that order. A doc that doesn't fit is cut at a line to what is
+    left of the budget (#131 grew the feature map past it, and dropping it whole left the
+    coord with none); the cut is listed."""
     items: list[str] = []
     dropped: list[str] = []
     used = 0
@@ -590,8 +645,13 @@ def _classic_context(repo: Path, budget_chars: int) -> tuple[str, list[str]]:
             continue
         block = _wrap(doc, text)
         if used + len(block) > budget_chars:
-            dropped.append(f"{doc} ({len(text)} chars)")
-            continue
+            room = budget_chars - used - len(_wrap(doc, ""))
+            kept = text[: max(room, 0)].rsplit("\n", 1)[0] if room > 0 else ""
+            if not kept.strip():
+                dropped.append(f"{doc} ({len(text)} chars)")
+                continue
+            dropped.append(f"{doc} (cut at {len(kept)} of {len(text)} chars)")
+            block = _wrap(doc, kept)
         items.append(block)
         used += len(block)
     if dropped:
@@ -608,6 +668,8 @@ def _assemble_coord(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -621,7 +683,10 @@ def _assemble_coord(
     3. the job: the contract, the notes, gate errors, untrusted text, the schema.
 
     `extra_paths` is the hook for vigild's pre-fill (part 5): paths it found
-    that the request doesn't name. `fresh` is a replan that starts the coord from
+    that the request doesn't name. `prefill` is that pre-fill, which every
+    variant carries as its own fenced part (`skeleton`: the coord's clone holds a
+    spec.md and plan.md skeleton, true on a first draft only).
+    `fresh` is a replan that starts the coord from
     nothing (#78): the stable block (so the cached prefix is shared) but no
     scope excerpts, only the contract, the owner's note and spec (`amend`) and
     the untrusted failures and plan.md the caller passes. `amend` is (the spec to
@@ -669,6 +734,7 @@ def _assemble_coord(
         **({"feature_index": index} if lean else {}),
         "context_pack": pack,
         "contract": contract,
+        **({"prefill": prefill.section(job_id, skeleton=skeleton)} if prefill else {}),
     }
     if amend is not None:
         previous, baseline, owner_notes = amend
@@ -720,6 +786,8 @@ def assemble_coord_classic(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -733,6 +801,8 @@ def assemble_coord_classic(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
         budget_chars=budget_chars,
     )
@@ -746,6 +816,8 @@ def assemble_coord_lean(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
 ) -> Packet:
     """The lean coord packet (ADR-0005 part 1)."""
@@ -757,6 +829,8 @@ def assemble_coord_lean(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
     )
 

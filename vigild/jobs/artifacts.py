@@ -128,6 +128,37 @@ TEST = re.compile(r"test:\s*`([^`]+)`")
 TICK = re.compile(r"`([^`]+)`")
 
 
+_SEP = r"[-\u2013\u2014]|\.\.|,|and\b|&|to\b|through\b"
+_ID = r"\s*[-#]?\s*"  # `AC2`, `AC 2`, `AC-2`, `AC#2`
+AC_REF = re.compile(
+    rf"\b(ACs?){_ID}(\d+)(?!\w)((?:\s*(?:{_SEP})\s*(?:ACs?{_ID})?\d+(?!\w))*)", re.I
+)
+AC_TAIL = re.compile(rf"\s*({_SEP})\s*(ACs?{_ID})?(\d+)", re.I)
+MAX_RANGE = 50
+
+
+def ac_refs(text: str) -> set[str]:
+    """The acceptance-criterion ids a text names (#136), case-insensitively: `AC2`,
+    `ac2`, `AC1-AC3` / `AC1\u2013AC3` / `ACs 1-2` (ranges), `ACs 1, 3`, `AC1 and AC2`. A list
+    continues past a comma or `and` only after `ACs` or with an `AC` prefix on the next
+    number, so `AC1, 5 files` names AC1 alone."""
+    out: set[str] = set()
+    for m in AC_REF.finditer(text):
+        plural = m.group(1).lower() == "acs"
+        prev = int(m.group(2))
+        out.add(f"AC{prev}")
+        for sep, prefix, num in AC_TAIL.findall(m.group(3)):
+            n = int(num)
+            if sep.lower() in ("-", "\u2013", "\u2014", "to", "..", "through"):
+                if prev < n <= prev + MAX_RANGE:
+                    out.update(f"AC{i}" for i in range(prev, n + 1))
+                out.add(f"AC{n}")
+            elif plural or prefix:
+                out.add(f"AC{n}")
+            prev = n
+    return out
+
+
 @dataclass
 class Criterion:
     ident: str

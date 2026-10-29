@@ -22,6 +22,11 @@ def _page(store: Any) -> Any:
     return page
 
 
+def _failed_event(store: Any) -> dict[str, Any]:
+    (ev,) = [e for e in store.events() if e.type == "metering_failed"]
+    return dict(ev.data)
+
+
 def test_failure_before_insert_books_the_reservation(cfg: Config, monkeypatch: Any) -> None:
     store, _b, gw, _s, _c = _setup(cfg, monkeypatch, Up())
 
@@ -33,7 +38,14 @@ def test_failure_before_insert_books_the_reservation(cfg: Config, monkeypatch: A
     reserved = store.q("SELECT amount_usd a FROM reservations")[0]["a"]
     assert _booked(store) == pytest.approx(reserved)
     assert _metered(store) == 0
-    assert _page(store).body["row_written"] is False
+    ev = _failed_event(store)
+    assert ev["row_written"] is False
+    assert ev["booked_usd"] == pytest.approx(reserved)
+    key = ev["call_key"]
+    assert store.q("SELECT COUNT(*) n FROM model_calls WHERE call_key=?", (key,))[0]["n"] == 0
+    page = _page(store)
+    assert page.body["row_written"] is False
+    assert page.body["call_key"] == key
 
 
 def test_failure_after_commit_books_the_row_once(cfg: Config, monkeypatch: Any) -> None:
@@ -49,7 +61,17 @@ def test_failure_after_commit_books_the_row_once(cfg: Config, monkeypatch: Any) 
     assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 1
     assert _metered(store) > 0
     assert _booked(store) == pytest.approx(_metered(store))
-    assert _page(store).body["row_written"] is True
+    (row,) = store.q("SELECT call_key, cost_usd FROM model_calls")
+    settles = [r["amount_usd"] for r in store.q("SELECT amount_usd FROM ledger")]
+    assert settles == [pytest.approx(row["cost_usd"])]  # one settle, at the row's cost
+    reserved = store.q("SELECT amount_usd a FROM reservations")[0]["a"]
+    assert row["cost_usd"] < reserved  # the row's cost was booked, not the reservation
+    ev = _failed_event(store)
+    assert ev["row_written"] is True and ev["call_key"] == row["call_key"]
+    assert ev["booked_usd"] == pytest.approx(row["cost_usd"])
+    page = _page(store)
+    assert page.body["row_written"] is True and page.body["call_key"] == row["call_key"]
+    assert "after the record was written" in page.title
 
 
 def test_concurrent_own_calls_are_each_counted_once(cfg: Config, monkeypatch: Any) -> None:
@@ -71,4 +93,5 @@ def test_concurrent_own_calls_are_each_counted_once(cfg: Config, monkeypatch: An
     assert not errors
     assert store.q("SELECT COUNT(DISTINCT call_key) n FROM model_calls")[0]["n"] == n
     assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == n
+    assert store.q("SELECT COUNT(*) n FROM model_calls WHERE call_key IS NULL")[0]["n"] == 0
     assert _booked(store) == pytest.approx(_metered(store))

@@ -38,6 +38,131 @@
       "title": "DepRequest",
       "type": "object"
     },
+    "ExecutorEvidence": {
+      "additionalProperties": false,
+      "description": "What vigild knows of the session that wrote the report, from its own\nrecords (#106). Every field is optional so older reports still load.",
+      "properties": {
+        "base_head": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Head"
+        },
+        "end_head": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End Head"
+        },
+        "image_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Digest"
+        },
+        "launch_head": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Launch Head"
+        },
+        "lineage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Lineage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "prior_failure_diagnostic": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Screened output of an EARLIER session's failure, carried forward; it is not this session's own outcome. `prior_failure_session_id` names that session.",
+          "title": "Prior Failure Diagnostic"
+        },
+        "prior_failure_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The session whose failure `prior_failure_diagnostic` describes.",
+          "title": "Prior Failure Session Id"
+        }
+      },
+      "title": "ExecutorEvidence",
+      "type": "object"
+    },
+    "Lineage": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "fork",
+            "fresh",
+            "resume"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Session Id"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "Lineage",
+      "type": "object"
+    },
     "Provenance": {
       "enum": [
         "claude",
@@ -99,6 +224,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "executor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutorEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "files_changed": {
       "items": {
         "type": "string"

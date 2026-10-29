@@ -1,4 +1,4 @@
-"""The Claude executor's harness: PID 1 in the container, as root.
+"""The Claude executor's harness: root in the container, under tini (PID 1).
 
 Protocol with vigild:
 - stdin, one JSON line: {"gateway_token": "..."}. Never in the environment
@@ -13,9 +13,10 @@ Protocol with vigild:
 Two users (review round 2, N1 and N11). The harness is root, with only the
 capabilities to change uid and to kill. Everything that runs code from the
 repo or the model runs as the agent uid (10001) with no capabilities: the CLI
-(through /opt/vigil/agent-cli) and git. The agent uid can't signal PID 1, read
-its memory or write its stdout (/proc/1/fd/1), so every line vigild reads from
-the container is the harness's own.
+(through /opt/vigil/agent-cli) and git. Docker's tini is PID 1 (`init: true`)
+and reaps orphans (#112); the harness is its child. The agent uid can't signal
+the harness, read its memory or write its stdout (/proc/<harness>/fd/1), so
+every line vigild reads from the container is the harness's own.
 
 The harness runs no tests: test results come only from vigild's verifier,
 which runs test_cmd in fresh containers on commits taken from the vault (owner
@@ -103,8 +104,10 @@ def as_agent() -> dict[str, Any]:
 
 
 def kill_strays() -> None:
-    """As PID 1, signal every other process in the container."""
-    if os.getpid() == 1:
+    """As the container's root harness (tini's child, or PID 1 without tini),
+    signal every other process in the container. kill(-1) spares the caller
+    and PID 1. Outside a container nothing is signalled."""
+    if os.getpid() == 1 or (os.getppid() == 1 and os.getuid() == 0):
         with contextlib.suppress(ProcessLookupError):
             os.kill(-1, signal.SIGKILL)
         time.sleep(0.2)
@@ -320,7 +323,7 @@ UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 
 class TranscriptStore:
     """The SDK's session store (phase 2a, items 2-3), for mirroring only:
-    every transcript line the CLI writes goes out on PID 1's stdout,
+    every transcript line the CLI writes goes out on the harness's stdout,
     redacted, so vigild keeps each session's transcript as it happens, even
     when the container is killed. It never loads: a store-backed resume would
     write the transcript into a root-only temp dir the CLI (the agent uid)

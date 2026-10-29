@@ -1,8 +1,7 @@
 """A replan with a note starts the coord fresh (#78, owner, 2026-10-28).
 
 The packet carries spec.md, plan.md, the owner's note, the failure reason and the
-verifier summary, and no transcript is resumed or forked. The fork stays for true
-escalation: attempt >= routing.escalate_attempt (attempt = 1 + replans so far)."""
+verifier summary, and no transcript is resumed or forked. No attempt forks (#101); only a crashed session resumes."""
 
 # ruff: noqa: F811  (fixtures imported from the modules that define them)
 
@@ -52,13 +51,16 @@ def test_the_fresh_packet_carries_the_note_the_failure_and_the_plan(world: World
     assert "## docs/" not in packet and "## README.md" not in packet  # no context pack
 
 
-def test_the_fork_stays_for_escalation_at_the_configured_attempt(world: World) -> None:
+def test_an_escalated_replan_starts_fresh_too(world: World) -> None:
+    """#101: attempt >= routing.escalate_attempt no longer forks the coord."""
     w = world
     w.runner.cfg.routing.escalate_attempt = 2  # the replan is attempt 2 here
     job, coords = _replanned(w)
-    first, second = coords[0], coords[-1]
-    assert second.resume is not None and second.resume.from_session == first.session_id
-    assert w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
+    second = coords[-1]
+    assert second.resume is None
+    assert not w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
+    assert NOTE in second.packet and "## Workers" in second.packet
+    assert len(second.packet) / 4 < FIRST_CALL_TOKENS
 
 
 def test_the_fresh_packet_carries_the_spec_changelog(world: World) -> None:
@@ -84,3 +86,43 @@ def test_a_plain_replan_at_attempt_two_starts_fresh_too(world: World) -> None:
     assert not w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
     assert "outside scope" in second.packet and "## Workers" in second.packet
     assert len(second.packet) / 4 < FIRST_CALL_TOKENS
+
+
+def _errors(w: World, job: str) -> list[object]:
+    """The runner's `vigild_error` pages for the job (it pages; it writes no such event)."""
+    return [
+        i for i in w.store.list_inbox() if i.job_id == job and i.body.get("kind") == "vigild_error"
+    ]
+
+
+def test_a_review_rounds_page_replans_and_names_its_task(world: World) -> None:
+    from tests.review.test_review_stage import CHANGES, _rounds
+
+    w = world
+    w.standin.review = _rounds({"w1": [CHANGES, CHANGES, CHANGES]})
+    job = _approve(w)
+    item = _failure_item(w, job, "review_rounds")
+    assert item["body"]["tasks"][f"{job}-w1"]["findings"] == 1
+    _arm(w, AMENDED, CHANGELOG)
+    assert _replan(w, item, NOTE).status_code == 200
+    assert not _errors(w, job)
+    ctx = w.runner._replan_context(job)
+    assert set(ctx) == {f"{job}-w1"} and ctx[f"{job}-w1"]["title"]
+
+
+def test_a_replan_event_holding_ints_replans_without_error(world: World) -> None:
+    import json
+
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    job = _approve(w)
+    item = _failure_item(w, job)
+    with w.store.tx():  # the page as an old vigild wrote it: an int per task
+        w.store.conn.execute(
+            "UPDATE inbox_items SET body=? WHERE id=?",
+            (json.dumps({**item["body"], "tasks": {"x-w1": 3}}), item["id"]),
+        )
+    _arm(w, AMENDED, CHANGELOG)
+    assert _replan(w, item, NOTE).status_code == 200
+    assert not _errors(w, job)
+    assert w.runner._replan_context(job) == {}

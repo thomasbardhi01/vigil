@@ -308,3 +308,9 @@ def test_reviewer_prompt_checks_every_acceptance_criterion() -> None:
     # the step is one of the numbered checks, before the structured output
     steps = [ln for ln in text.split("1. ", 1)[1].split(" End with ")[0].split(". ")]
     assert any("acceptance criterion" in s for s in steps)
+
+
+def test_the_workers_schema_leaves_out_the_executor_field(clone: Path) -> None:
+    p = assemble_worker(clone, _contract(), untrusted={})
+    assert '"executor"' not in p.parts["output_schema"]
+    assert '"self_check"' in p.parts["output_schema"]

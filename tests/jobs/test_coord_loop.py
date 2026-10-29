@@ -233,6 +233,10 @@ class StandIn:
     lock: threading.Lock = field(default_factory=threading.Lock)
     barrier: threading.Barrier | None = None
     renumber: bool = True  # a re-plan's draft avoids the ids the job has (finding #4)
+    # what the gateway does for a worker's first call (#102): one `model_calls` row for a
+    # session that has none after `on_session`; set by `world`, off for the no-work test
+    meter: Callable[[SessionSpec], None] | None = None
+    meter_workers: bool = True
 
     def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
         assert gateway_token.startswith("vgw_")
@@ -242,6 +246,8 @@ class StandIn:
         self.specs.append(spec)
         if self.on_session:
             self.on_session(spec)
+        if self.meter and self.meter_workers and spec.role is Role.WORKER:
+            self.meter(spec)
         if spec.role in (Role.REVIEWER, Role.AUDITOR):
             answer = (self.review if spec.role is Role.REVIEWER else self.audit)(spec)
             return ExecOutcome("done", 0, {"status": "done", "structured_output": answer})
@@ -384,6 +390,20 @@ def build_first(images: DevImages, sessions: SessionImages) -> None:
     sessions.resolve = lambda repo, base: sessions.ensure_fresh(repo, base)  # type: ignore[method-assign]
 
 
+def _meter_once(store: Store, cfg: Config, spec: SessionSpec) -> None:
+    """One zero-token `model_calls` row for a session that has none, as the gateway writes."""
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    if store.q("SELECT 1 FROM model_calls WHERE session_id=?", (spec.session_id,)):
+        return
+    record_call(
+        store, PriceTable(cfg.prices), session_id=spec.session_id, task_id=spec.task_id,
+        job_id=spec.job_id, purpose="session", provider="anthropic",
+        backend_preset="claude-sonnet", model="claude-sonnet-5-5", usage=CallUsage(),
+    )  # fmt: skip
+
+
 @dataclass
 class World:
     client: TestClient
@@ -419,6 +439,7 @@ def world(
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     images = DevImages(cfg, store, FakeDocker(), ws, FakeSuites())
     standin, publisher, tests = StandIn(), BarePublisher(ws), LocalTestRunner()
+    standin.meter = lambda spec: _meter_once(store, cfg, spec)
     runner = JobRunner(
         cfg,
         store,
@@ -680,6 +701,47 @@ def test_out_of_scope_worker_is_not_published(world: World) -> None:
     assert w.store.get_job(job).state.value == "blocked"  # round 2, N5: never stranded
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     assert any("acceptance" in p["title"] for p in pages)
+
+
+def _todo_worker(w: World) -> None:
+    def todo(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        test = spec.clone / TESTS[f][0]
+        test.write_text(test.read_text() + "\n# TODO make this stricter\n")
+
+    w.standin.worker_edit = todo
+
+
+def test_a_bare_todo_publishes_and_is_reported_to_the_reviewer(world: World) -> None:  # #104, #131
+    w = world
+    _todo_worker(w)
+    job = _approve(w)
+    assert w.publisher.prs != []  # report-only (owner, 2026-10-29): never fails the task
+    assert "failed" not in {t.state for t in w.store.list_tasks(job)}
+    ev = _events(w, "integrity_finding")
+    assert ev and {e["rule"] for e in ev} == {"todo-without-issue"}  # one per task
+    assert ev[0]["location"].count(":") == 1 and ev[0]["finding_id"] and ev[0]["snippet"]
+    assert ev[0]["job_id"] == job and ev[0]["session_id"]
+    reviews = [p for r, p in w.standin.packets if r == "reviewer"]
+    flagged = [p for p in reviews if "UNTRUSTED integrity-findings--rules-only--advisory" in p]
+    assert flagged and all("todo-without-issue" in p for p in flagged)
+
+
+def test_enforcing_a_bare_todo_pages_the_job_and_is_not_published(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:  # #104
+    monkeypatch.setattr("vigild.jobs.integrity.ENFORCE", True)
+    w = world
+    _todo_worker(w)
+    job = _approve(w)
+    assert w.publisher.prs == []
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("acceptance" in p["title"] for p in pages)
+    detail = json.dumps(pages)
+    assert "todo-without-issue" in detail and ".py:" in detail
 
 
 def test_a_session_without_guard_fails_closed(world: World) -> None:
@@ -1628,9 +1690,9 @@ def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: Wor
     job = _approve(w)
     assert w.store.get_job(job).state.value == "ready"
     assert {r for r, _ in seen} == {"coord", "worker", "reviewer", "auditor"}
-    assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
+    assert all(img and img.startswith("vigil-session-") for _, img in seen), seen
     images = {c["image"] for c in w.tests.calls}
-    assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
+    assert images and all(i.startswith("vigil-dev-") for i in images), images
 
 
 def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  # round 4, item 7
@@ -1835,6 +1897,8 @@ def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
             **doc["workers"][1],
             "task_id": f"{job}-w3",
             "goal": "third",
+            "why": "extra doc",  # an extra worker, answering for no AC (#136)
+            "done_when": "the extra doc holds",
             "test_cmd": "pytest -q tests/test_extra.py",
             "files_in_scope": ["docs/extra.md", "tests/test_extra.py"],
         }

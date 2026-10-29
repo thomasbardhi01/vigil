@@ -8,9 +8,10 @@ from typing import Any
 
 from vigild.db import Store
 from vigild.jobs.model import SessionRow
+from vigild.metering.calls import booked_usd, unmetered_sessions
 
 
-def _node(s: SessionRow) -> dict[str, Any]:
+def _node(s: SessionRow, missing: bool, booked: float) -> dict[str, Any]:
     return {
         "id": s.id,
         "role": s.role.value,
@@ -19,7 +20,8 @@ def _node(s: SessionRow) -> dict[str, Any]:
         "backend_preset": s.backend_preset,
         "branch": s.branch,
         "pr_url": s.pr_url,
-        "cost_usd": round(s.cost_usd, 6),
+        "cost_usd": round(booked if missing else s.cost_usd, 6),  # unmetered: the booked amount
+        "cost_missing": missing,
         "tokens_in": s.tokens_in,
         "tokens_out": s.tokens_out,
         "started_at": s.started_at,
@@ -32,7 +34,12 @@ def _node(s: SessionRow) -> dict[str, Any]:
 def job_tree(store: Store, job_id: str) -> dict[str, Any]:
     job = store.get_job(job_id)
     sessions = store.list_sessions(job_id)
-    nodes = {s.id: _node(s) for s in sessions}
+    unknown = unmetered_sessions(store, job_id)
+    missing = {u["session_id"] for u in unknown}
+    nodes = {
+        s.id: _node(s, s.id in missing, booked_usd(store, s.id) if s.id in missing else 0.0)
+        for s in sessions
+    }
     roots: list[dict[str, Any]] = []
     for s in sessions:
         parent = nodes.get(s.parent_session_id) if s.parent_session_id else None
@@ -49,7 +56,8 @@ def job_tree(store: Store, job_id: str) -> dict[str, Any]:
             "fix_depth": job.fix_depth,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
-            "cost_usd": round(sum(s.cost_usd for s in sessions), 6),
+            "cost_usd": round(sum(n["cost_usd"] for n in nodes.values()), 6),  # booked included
+            "cost_unknown_sessions": unknown,
         },
         "lineage": {"parent": job.parent_job_id, "children": store.child_jobs(job_id)},
         "tasks": [

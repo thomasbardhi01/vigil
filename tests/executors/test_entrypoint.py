@@ -460,3 +460,24 @@ def test_a_review_caps_each_calls_output(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.delenv("VIGIL_MAX_OUTPUT_TOKENS")
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in ep.agent_options("worker", TOKEN, print)["env"]
+
+
+@pytest.mark.parametrize(
+    ("pid", "ppid", "uid", "kills"),
+    [(1, 0, 0, True), (2, 1, 0, True), (2, 1, 1000, False), (50, 49, 0, False)],
+)
+def test_kill_strays_runs_as_the_root_harness_under_init_or_as_pid_1(
+    monkeypatch: pytest.MonkeyPatch, pid: int, ppid: int, uid: int, kills: bool
+) -> None:
+    """Under tini the harness is PID 2, not PID 1 (#112); outside a container
+    (not root, or not tini's child) it must never signal the host."""
+    ep: Any = _entrypoint()
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(ep.os, "getpid", lambda: pid)
+    monkeypatch.setattr(ep.os, "getppid", lambda: ppid)
+    monkeypatch.setattr(ep.os, "getuid", lambda: uid)
+    monkeypatch.setattr(ep.os, "kill", lambda p, s: sent.append((p, s)))
+    monkeypatch.setattr(ep.time, "sleep", lambda s: None)
+    ep.kill_strays()
+    assert bool(sent) is kills
+    assert all(p == -1 for p, _ in sent)

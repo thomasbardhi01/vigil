@@ -7,6 +7,12 @@ was replaced stays, marked `(superseded YYYY-MM-DD)`, with the new one above
 it. Coord checks this file before asking the owner, and logs which ruling it
 applied.
 
+## Autonomy (what coord may do between the owner's windows)
+- **2026-10-28**: Coord may approve a spec through MCP when the job is on the pre-approved list and the spec matches its brief and the owner's ACs. The list: the done-when batch (dw-62, dw-75, dw-38); the maintenance issues #98, #31, #79, #72, #71 and #102-#107; any replan of a job the owner already approved. Anything else, and anything touching money, auth, consent or a pinned path beyond those listed, waits for the owner.
+- **2026-10-28**: Coord acts on pages by this file (retry, replan with a note, dismiss, rebuild, resume), and may reset a `repo_failures` breaker once it has named the three failures and traced each to a known issue. A page it can't trace waits for the owner.
+- **2026-10-28**: Merges stay the owner's, in two windows: 08:00 and 20:00 ET. Coord marks PRs ready and orders work so nothing waits on a merge between windows; anything that needs a deploy is queued for the next window.
+- **2026-10-28**: Caps are the stop: $25 a day, $2 a task, WIP 4; usage lines 60% and 75% weekly.
+
 ## Merging and PRs
 - **2026-10-28**: Coord marks a PR ready on a clean review, not on green CI; auto-merge waits for CI.
 - **2026-10-28**: Rebase a PR onto main only, never onto a branch still under review; a stack the owner set up is retargeted after its base merges.
@@ -55,6 +61,7 @@ applied.
 - **2026-10-23**: ParkAgent stays public until 2a's reruns, the phase 1 run, the 2a merge and the allowlist cleanup (with doctor passing) are done; every repo is designed private-first (#1).
 
 ## Process (reviews, workers, reports)
+- **2026-10-28**: A routing rule's test submits a request through the API and checks the routed task; it never sets the input the rule reads (rule 6 never fired because `has_existing_tests` was never set while its tests set it by hand; #100).
 - **2026-10-28**: After round 1, re-review only the new diff; a bug class found once is fixed everywhere in the PR; after two rounds, bring it to the owner (#1).
 - **2026-10-28**: Coord checks `docs/owner-rulings.md` before asking the owner, and logs which ruling it applied (#1).
 - **2026-10-28**: After #60 and backup (#23) merge, docs-, tests- and fix-shaped work on vigil is submitted as vigild jobs, not built by coord's subagents (#1).
@@ -72,6 +79,14 @@ applied.
 - **2026-10-27**: Bench smoke results post as one vigild comment per vigil PR, updated in place, and never on ParkAgent or any other repo; the mix is 7 PolyBench TypeScript and 3 SWE-bench Pro tasks (#8).
 - **2026-10-26**: The plan gate refuses a reused worker ID, and a job enters `in_review` only if every planned task has an open PR or is superseded (#25).
 - **2026-10-23**: Job artifacts go to the vault, not the target repo (#30).
+
+## Coordination (coord's own rules)
+- **2026-10-28**: Parallel tracks don't share hot files (`vigild/jobs/runner.py`, `vigild/packets/assemble.py`, `vigild/db.py` `MIGRATIONS`, or the same docs table); if they must, they run in sequence.
+- **2026-10-28**: No stacked PRs unless the owner asks.
+- **2026-10-28**: Coord's status holds one merge order; after each merge the next PR is rebased onto main and checked.
+- **2026-10-28**: Coord assigns each migration-adding PR its step name at dispatch.
+- **2026-10-28**: `scripts/check-all.sh` runs on the committed HEAD before every push, by workers and coord.
+- **2026-10-28**: The long-term fix for docs table conflicts is #96 (one file per feature, generated tables).
 
 ## Not adopted (don't re-propose)
 - **2026-10-28** (ADR-0006 I): no multi-agent teams or debate; no memory or recall tools for workers; no LLM-generated instruction files and no longer CLAUDE.md (layer 3 is measured before it grows); no LLM-as-judge selection; no mid-trajectory critics; no RL on weights; no evolved verifiers; no more prompt text. The incident-to-playbook epic stays gated by replay.

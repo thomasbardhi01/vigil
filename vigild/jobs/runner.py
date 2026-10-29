@@ -56,10 +56,13 @@ from vigild.contract.models import (
     BLOCKING,
     Audit,
     AuditOutput,
+    ExecutorEvidence,
     Limits,
     Review,
     ReviewOutput,
+    Size,
     Spec,
+    StoredAudit,
     Task,
     TestOutcome,
     Verify,
@@ -77,13 +80,24 @@ from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
-from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
-from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
+from vigild.jobs import decisions
+from vigild.jobs.acceptance import (
+    NO_HIDDEN,
+    ac_plan,
+    check_worker,
+    contract_text,
+    escalates,
+    live_workers,
+    worker_acs,
+)
+from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
 from vigild.jobs.bench import TAGS as BENCH_TAGS
 from vigild.jobs.deps import infer_deps, is_lockfile
+from vigild.jobs.evidence import executor_block, failure_diagnostic, without_executor
 from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
+from vigild.jobs.integrity import Finding, finding_id
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
@@ -94,8 +108,11 @@ from vigild.packets.assemble import (
     assemble_hidden_test_author,
     assemble_review,
     assemble_worker,
+    joined_histories,
+    round_findings,
 )
 from vigild.packets.fence import fence
+from vigild.packets.prefill import Prefill, compute_prefill
 from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import (
@@ -110,11 +127,12 @@ from vigild.review.replay import (
     ReplayInvalid,
     ReplayNotFound,
     ReplayRefused,
+    ac_coverage,
     load_cases,
     resolve_prompt,
     run_set,
 )
-from vigild.router.rules import RoutingError, route
+from vigild.router.rules import CoordShape, RoutingError, request_paths, route, route_coord
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
@@ -185,6 +203,16 @@ class Pager(Protocol):
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def gate_spec(self, job_id: str) -> list[str]: ...
+    def gate_drafts(
+        self,
+        repo: str,
+        spec_text: str,
+        plan_text: str,
+        base: str,
+        *,
+        read: Callable[[str], str | None] | None = None,
+        is_dir: Callable[[str], bool] | None = None,
+    ) -> list[str]: ...
     def approve_bench(self, job_id: str) -> Any: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
@@ -1184,7 +1212,11 @@ class JobRunner:
                         try:
                             out = self.executor.run(spec, token, self._event_sink(s))
                         except HostRefused as e:  # no host may run it: nothing ran
-                            self._host_refused(spec.job_id, e, "the session")
+                            if self.store.is_replay(s.id):
+                                # a replay pages nobody and files nothing on the job it copies
+                                self.store.gate_refuse_replay(s.id, f"host_refused: {e}"[:500])
+                            else:
+                                self._host_refused(spec.job_id, e, "the session")
                             out = ExecOutcome("failed", None, {}, f"sandbox host refused: {e}")
                     tr.set("vigil.status", out.status)
                     if cap is not None:  # a review or audit: did it go past its cap?
@@ -1311,7 +1343,10 @@ class JobRunner:
         if not rows:
             return {}
         tasks = json.loads(rows[0]["data"]).get("tasks")
-        return tasks if isinstance(tasks, dict) else {}
+        if not isinstance(tasks, dict):
+            return {}
+        # an event written before #118 may hold an int per task: those are dropped
+        return {tid: t for tid, t in tasks.items() if isinstance(t, dict)}
 
     def _abandoned(self, job_id: str) -> bool:
         try:
@@ -1453,6 +1488,29 @@ class JobRunner:
     def _session_dir(self, session_id: str) -> Path:
         return self.cfg.vigild.data_path / "sessions" / session_id
 
+    def _job_attempt(self, job_id: str) -> int:
+        """1 plus the replans so far (#78): the coord's attempt."""
+        n = self.store.q(
+            "SELECT COUNT(*) AS n FROM events WHERE job_id=? AND type='replan'", (job_id,)
+        )[0]["n"]
+        return 1 + int(n)
+
+    def coord_shape(self, job: Job) -> CoordShape:
+        """What the coord's model is chosen from (ADR-0005 part 3). The attempt is 1
+        plus the replans so far; there is no size until ADR-0005 part 5 adds vigild's
+        estimate, so the request's hint is used if it carries one."""
+        intake = self.store.get_artifact(job.id, "intake.json")
+        meta = json.loads(intake.content) if intake else {}
+        labels = meta.get("labels")
+        hint = meta.get("size")
+        return CoordShape(
+            labels=[str(x) for x in labels] if isinstance(labels, list) else [],
+            parent_job_id=job.parent_job_id,
+            size=Size(hint) if hint in {m.value for m in Size} else None,
+            attempt=self._job_attempt(job.id),
+            paths=request_paths(meta),
+        )
+
     # --- stage 1: the coord drafts spec.md and plan.md ------------------------------------
 
     def run_coord(self, job_id: str) -> None:
@@ -1463,9 +1521,19 @@ class JobRunner:
         if b is not None:
             self._hold_for(job_id, b)
             return
-        preset = self._healthy(self.cfg.routing.coord)
+        try:
+            picked = route_coord(self.cfg, job.repo, self.coord_shape(job))
+        except RoutingError as e:
+            self._page(
+                job_id,
+                f"{job_id}: backend refused; coord not started",
+                {"error": str(e)},
+                resumable=True,
+            )
+            return
+        preset = self._healthy(picked.preset)
         if preset is None:
-            self._hold_for(job_id, self._backend_breaker(self.cfg.routing.coord))
+            self._hold_for(job_id, self._backend_breaker(picked.preset))
             return
         try:
             # the repo's dev image must be fresh before any work starts on it;
@@ -1495,6 +1563,14 @@ class JobRunner:
                 job_id, Role.COORD, backend_preset=preset, branch=branch
             )
             self.store.set_coord_session(job_id, coord.id)
+            self.store.update_session(coord.id, detail={"coord_reason": picked.reason})
+            self.store.add_event(
+                "coord_routed",
+                {"preset": preset, "coord_reason": picked.reason},
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=coord.id,
+            )
             try:
                 rid = self._reserve_queued(
                     job_id,
@@ -1538,6 +1614,7 @@ class JobRunner:
                 job_id=job_id,
                 session_id=coord.id,
             )
+            decisions.add(self.store, job_id, "vigild", "gate", gate_errors[0])
         if self.store.get_job(job_id).source == "bench":
             # tagged, and the run goes on with no owner step: bench measures spec quality
             self._bench_failure(job_id, "spec", stage="spec_gate", errors=gate_errors or [])
@@ -1622,13 +1699,10 @@ class JobRunner:
                 tid: {"title": t.get("title"), "state": t.get("state")} for tid, t in replan.items()
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
-        # A replan starts the coord fresh (#78, ADR-0005): spec.md, plan.md,
-        # spec_changelog.md, the note, the failures. The fork is for true escalation,
-        # attempt >= escalate_attempt, where attempt is 1 + the replans so far.
-        replans = self.store.q(
-            "SELECT COUNT(*) AS n FROM events WHERE job_id=? AND type='replan'", (job_id,)
-        )[0]["n"]
-        fresh = bool(replan or amend) and replans + 1 < self.cfg.routing.escalate_attempt
+        untrusted |= decisions.section(self.store, job_id)  # ADR-0005 part 4: fenced data
+        # A replan starts the coord fresh at every attempt (#78, #101, ADR-0005):
+        # spec.md, plan.md, spec_changelog.md, the note, the failures. Nothing is forked.
+        fresh = bool(replan or amend)
         if fresh:
             for name, label, cap in (
                 ("plan.md", "plan.md (the previous plan)", 12000),
@@ -1638,32 +1712,40 @@ class JobRunner:
                 art = self.store.get_artifact(job_id, name)
                 if art is not None and not (name == "spec.md" and amend is not None):
                     untrusted[label] = art.content[:cap]
+            histories = []
+            for task in self.store.list_tasks(job_id):
+                if hist := self._findings_history(task, None):
+                    histories.append(f"Task {task.id}:\n{hist}")
+            if histories:  # the review rounds that led here (#101), every task's
+                untrusted["review history"] = joined_histories(histories)
+        pre = compute_prefill(
+            clone,
+            request,
+            policy=self.cfg.repo(job.repo),
+            money_globs=self.cfg.routing.money_paths,
+            issue=issue or "",
+        )
+        skeleton = not (fresh or amend or replan or previous or gate_errors)
+        if skeleton:
+            self._write_skeleton(clone, job_id, job.title, pre)
         self.workspace.write_task(clone, request)
         # a fresh replan (#78) is not affected by the switch: it is always the classic one
         assemble = assemble_coord if fresh else COORD_PACKETS[self.cfg.routing.coord_packet]
         packet = assemble(
-            clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend, fresh=fresh
+            clone,
+            request,
+            untrusted=untrusted,
+            gate_errors=gate_errors,
+            amend=amend,
+            extra_paths=pre.candidates,
+            prefill=pre,
+            skeleton=skeleton,
+            fresh=fresh,
         )
-        # Re-plan (item 3): the coord resumes its own last session, its whole
-        # context, with the failures in this packet, unless it starts fresh.
         resume = None
-        if replan and not fresh:
-            prior = [
-                x
-                for x in self.store.list_sessions(job_id)
-                if x.role is Role.COORD and x.id != coord.id
-            ]
-            resume = self._resume_from(prior[-1].id) if prior else None
-            if resume is not None:
-                self.store.add_event(
-                    "fork",
-                    {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
-                     "entries": len(resume.entries), "replan": True},
-                    Provenance.HUMAN, job_id=job_id, session_id=coord.id,
-                )  # fmt: skip
         self.store.add_event(
             "packet",
-            {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
+            {"role": "coord", "attempt": attempt, "dropped": packet.dropped, "base_sha": base_sha},
             Provenance.HUMAN,
             job_id=job_id,
             session_id=coord.id,
@@ -1722,6 +1804,17 @@ class JobRunner:
                 job_id, f"{job_id}: coord result unusable", {"error": str(e)}, resumable=True
             )
             return None
+        # the coord's decisions: a vault blob, never read from the clone
+        log = self.workspace.read_blob(job.repo, head, f".vigil/{job_id}/{decisions.NAME}")
+        if log:
+            n_kept, n_dropped = decisions.ingest_coord(self.store, job_id, log)
+            self.store.add_event(
+                "decisions",
+                {"kept": n_kept, "dropped": n_dropped, "attempt": attempt},
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=coord.id,
+            )
         drafts: dict[str, str] = {}
         kept = self.store.get_artifact(job_id, "spec.md")
         human = kept is not None and kept.provenance == Provenance.HUMAN.value
@@ -1743,6 +1836,14 @@ class JobRunner:
             if missing:
                 return [missing], drafts
         return self.jobs.file_for_approval(job_id), drafts
+
+    def _write_skeleton(self, clone: Path, job_id: str, title: str, pre: Prefill) -> None:
+        """A first draft starts from vigild's skeleton (ADR-0005 part 5), written into
+        the coord's own fresh clone."""
+        d = clone / ".vigil" / job_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "spec.md").write_text(pre.spec_md(title))
+        (d / "plan.md").write_text(pre.plan_md(job_id))
 
     def _store_amendment(
         self, job: Any, head: str, amended: str, baseline: str = "approved"
@@ -2404,6 +2505,28 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def _ac_commands(
+        self, job_id: str, repo: str, base_sha: str, contract: dict[str, Any]
+    ) -> tuple[list[tuple[str, list[str]]], list[str]]:
+        """(runs, refusals) of the job's approved spec.md AC test commands (#136): the
+        vault's artifact, never the worker's tree or report. A job with one live worker
+        runs them all; with several, a worker answers for the ACs its `why` or
+        `done_when` names (its branch doesn't hold the others' tests), and for any AC
+        no live worker names."""
+        art = self.store.get_artifact(job_id, "spec.md")
+        if art is None:
+            return [], []
+        live = live_workers(self.store.list_tasks(job_id))
+        idents = [c.ident for c in parse_spec(art.content).criteria]
+        only = worker_acs(
+            idents, [contract_text(t.contract) for t in live], contract_text(contract)
+        )
+
+        def read(path: str) -> str | None:
+            return self.workspace.read_blob(repo, base_sha, path)
+
+        return ac_plan(art.content, read, only)
+
     def _needs_deps(
         self, repo: str, base_sha: str, head: str, report: WorkerReport
     ) -> dict[str, Any] | None:
@@ -2762,18 +2885,14 @@ class JobRunner:
         edits = json.loads(approval.content).get("edits") if approval else None
         # A fix round or a retry of a published task starts fresh (#78, ADR-0005):
         # spec.md, plan.md, spec_changelog.md, the PR diff, the findings and the
-        # verifier's summary, never the worker's transcript. The fork is for true
-        # escalation (rule 5, or attempt >= routing.escalate_attempt). A crashed worker
-        # still resumes its own session (item 3); a landed dependency is in the work
-        # tree already, so that worker starts fresh too.
+        # verifier's summary, never the worker's transcript. An escalation (rule 5, or
+        # attempt >= routing.escalate_attempt) starts fresh too (#101), with every
+        # round's findings. Only a crashed worker resumes its own session (item 3); a
+        # landed dependency is in the work tree already, so that worker starts fresh too.
         escalated = str(t.tier_reason or "").startswith("rule5")
         fix_round = self._fix_round(t)
         attempt = int(contract.get("attempt") or 1)
-        forks = (
-            escalated
-            or crashed
-            or (bool(published) and attempt >= self.cfg.routing.escalate_attempt)
-        )
+        forks = crashed
         fresh_fix: dict[str, str] | None = None
         if published and not forks:
             spec_art = self.store.get_artifact(job_id, "spec.md")
@@ -2787,9 +2906,11 @@ class JobRunner:
                 "plan": plan_art.content if plan_art else "",
                 "changelog": log_art.content if log_art else "",
             }
+            if escalated or attempt >= self.cfg.routing.escalate_attempt:
+                fresh_fix["history"] = self._findings_history(t, fix_round)
         packet = assemble_worker(
-            clone, contract, untrusted={}, approval_edits=edits, fix_round=fix_round,
-            fresh_fix=fresh_fix,
+            clone, contract, untrusted=decisions.section(self.store, job_id),
+            approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
         )  # fmt: skip
         resume = self._resume_from(prev.id) if prev and forks else None
         if after_deps:
@@ -2850,7 +2971,19 @@ class JobRunner:
             "vigil.attempt": int(contract.get("attempt", 1)),
         }
         self.store.update_session(
-            s.id, detail={"image": session_image, "session_base": session_base}
+            s.id,
+            detail={
+                "image": session_image,
+                "session_base": session_base,
+                # the executor evidence (#106): vigild's own record of the launch
+                "image_digest": session_image or image,
+                "base_sha": base_sha,
+                "launch_head": self.workspace.clone_head(clone),
+                "lineage": {
+                    "parent_session_id": prev.id if prev else None,
+                    "mode": "resume" if crashed else "fork" if resume is not None else "fresh",
+                },
+            },
         )
         out = self._run_session(s, spec, reservation, attrs)
         if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
@@ -2858,7 +2991,13 @@ class JobRunner:
             return False
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
-            self.store.update_session(s.id, status="crashed")
+            self.store.update_session(
+                s.id,
+                status="crashed",
+                detail={
+                    "failure_diagnostic": failure_diagnostic(out.status, out.exit_code, out.error)
+                },
+            )
             self.store.add_event(
                 "crashed", {"error": (out.error or "")[:500], "exit": out.exit_code},
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
@@ -2884,6 +3023,12 @@ class JobRunner:
         if hook:
             self.store.update_session(s.id, detail=hook)  # the Stop hook's record (item 6)
         if out.status != "done":
+            self.store.update_session(
+                s.id,
+                detail={
+                    "failure_diagnostic": failure_diagnostic(out.status, out.exit_code, out.error)
+                },
+            )
             return self._fail(
                 job_id,
                 s,
@@ -2891,6 +3036,12 @@ class JobRunner:
                 f"{task_id}: worker session {out.status}",
                 {"error": out.error or ""},
             )
+        if not self.store.q("SELECT 1 FROM model_calls WHERE session_id=? LIMIT 1", (s.id,)):
+            # no work, never green (#102): the gateway metered nothing for this session
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: session did no metered work",
+                {"error": "the session has no model_calls row; nothing is published"},
+            )  # fmt: skip
         try:
             head = self.workspace.import_result(
                 job.repo,
@@ -2933,7 +3084,7 @@ class JobRunner:
             )
         raw = self.workspace.read_blob(job.repo, head, f"{art_dir}/worker_report.json", 256 << 10)
         try:
-            report = WorkerReport.model_validate_json(raw or "")
+            report = WorkerReport.model_validate_json(without_executor(raw or ""))
         except ValidationError as e:
             return self._fail(
                 job_id,
@@ -2961,10 +3112,16 @@ class JobRunner:
         test_cmd = str(contract["spec"].get("test_cmd") or "")
         # owner ruling, 2026-10-23: vigild computes the class itself; the contract's
         # marker is the durable copy, not the authority
+        ac_runs, ac_refused = (
+            self._ac_commands(job_id, job.repo, base_sha, contract)
+            if test_cmd.strip()
+            else ([], [])
+        )
         overlap = runner_overlap(
             contract["spec"].get("files_in_scope") or [],
             self.cfg.repo(job.repo).runner_config,
             test_cmd,
+            *(c for c, _ in ac_runs),
         )
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
@@ -2992,6 +3149,7 @@ class JobRunner:
                         runner_overlap=overlap,
                         hidden=entry_suite(hidden_entry),
                         scope=list(contract["spec"].get("files_in_scope") or []),
+                        ac_commands=ac_runs,
                     )
             except Halted:
                 self._close_killed(job_id)
@@ -3006,6 +3164,8 @@ class JobRunner:
                 return self._fail(
                     job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
                 )
+            if ac_refused:
+                tests["ac_refused"] = ac_refused  # never skipped: it fails the task
             if overlap and not hidden_on:
                 tests["hidden_disabled"] = True
             elif overlap and "hidden" not in tests:
@@ -3020,6 +3180,16 @@ class JobRunner:
             update={
                 "test_before": as_outcome((tests or {}).get("before")),
                 "test_after": as_outcome((tests or {}).get("after")),
+                # from vigild's records, never the worker's claims (#106); a failed
+                # earlier attempt's diagnostic rides on the next session's report
+                "executor": ExecutorEvidence.model_validate(
+                    executor_block(
+                        self.store.get_session(s.id).detail,
+                        head,
+                        prev.detail.get("failure_diagnostic") if prev else None,
+                        prev.id if prev else None,
+                    )
+                ),
             }
         )
         self.store.add_artifact(
@@ -3040,6 +3210,7 @@ class JobRunner:
             cost=session_cost(self.store, s.id),
             runner_config=self.cfg.repo(job.repo).runner_config,
             session_base=session_base,
+            on_findings=lambda found: self._integrity_findings(job_id, task_id, s.id, found),
         )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
@@ -3515,6 +3686,25 @@ class JobRunner:
                 out["note"] = json.loads(note.content)["note"]
         return out
 
+    def _findings_history(self, t: Any, fix_round: dict[str, Any] | None) -> str:
+        """Every review round's findings for a task (findings.json is append-only), as
+        text for an escalation's packet (#101). The round in `fix_round` is already
+        in the packet in full, so it is left out here."""
+        rows = self.store.q(
+            "SELECT content FROM artifacts WHERE job_id=? AND task_id=? AND name='findings.json'"
+            " ORDER BY id",
+            (t.job_id, t.id),
+        )
+        by_round: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            try:
+                doc = json.loads(r["content"])
+                by_round[int(doc["round"])] = doc
+            except ValueError, KeyError, TypeError:
+                continue
+        skip = int(fix_round["round"]) if fix_round else None
+        return round_findings([d for n, d in by_round.items() if n != skip])
+
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
         """Why the owner's fix can't start because of GitHub's live view of the task's
         PR (merged or closed since vigild's poll), if it can't. This is a network
@@ -3746,7 +3936,14 @@ class JobRunner:
                     f"{job_id}: findings remain after {limit} review rounds and an escalation",
                     {
                         "kind": "review_rounds",
-                        "tasks": {tid: outcomes[tid][1] for tid in over},
+                        "tasks": {
+                            tid: {
+                                "title": self.store.get_task(tid).contract["spec"].get("goal"),
+                                "state": self.store.get_task(tid).state,
+                                "findings": outcomes[tid][1],
+                            }
+                            for tid in over
+                        },
                         "actions": ["replan", "abandon"],
                     },
                 )
@@ -3899,7 +4096,7 @@ class JobRunner:
             rv = self.store.get_artifact(job_id, "review.json", t.id)
             au = self.store.get_artifact(job_id, "audit.json", t.id)
             review = json.loads(rv.content) if rv else {}
-            audit = Audit.model_validate_json(au.content) if au else None
+            audit = StoredAudit.model_validate_json(au.content) if au else None
             prs.append(
                 {
                     "task_id": t.id,
@@ -3931,6 +4128,36 @@ class JobRunner:
         except Exception as e:
             log.exception("review of %s failed", t.id)
             return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
+
+    def _integrity_findings(
+        self, job_id: str, task_id: str, session_id: str, found: list[Finding]
+    ) -> None:
+        """#131, report-only: each finding is an `integrity_finding` event (a stable
+        `finding_id` so coord can count false positives) and, with the rest, vigild's own
+        record that the reviewer's packet fences as advisory text."""
+        rows = []
+        for f in found:
+            row = {
+                "finding_id": finding_id(job_id, task_id, f),
+                "rule": f.rule,
+                "location": f"{f.path}:{f.line}" if f.line else f.path,
+                "snippet": f.snippet,
+                "job_id": job_id,
+                "task_id": task_id,
+                "session_id": session_id,
+            }
+            rows.append(row)
+            self.store.add_event(
+                "integrity_finding",
+                redact(row),
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=session_id,
+                task_id=task_id,
+            )
+        self.store.add_artifact(
+            job_id, "integrity_findings.json", json.dumps(rows), Provenance.HUMAN, task_id=task_id
+        )
 
     def _review_setup(self, job: Any, t: Any) -> tuple[Task, Any, bool]:
         """A task's contract, its review shape, and whether it changes how tests run
@@ -3966,6 +4193,11 @@ class JobRunner:
             "the request": job.request,
             "the worker's report": report.content if report else "(none)",
         }
+        found = self.store.get_artifact(job.id, "integrity_findings.json", t.id)
+        if found:  # #131: advisory, rules-only; the reviewer weighs them
+            untrusted["integrity findings (rules-only, advisory)"] = "\n".join(
+                f"{r['rule']} {r['location']}: {r['snippet']}" for r in json.loads(found.content)
+            )
         rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
         return ReviewInputs(rules=rules, request=request, untrusted=untrusted, diff=diff)
 
@@ -3987,7 +4219,10 @@ class JobRunner:
             inputs.diff,
             inputs.untrusted,
         )
-        packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
+        # the reviewer sees the decisions log; the auditor reviews independently, without it
+        packet = assemble_review(
+            rules, request, diff=diff, untrusted=untrusted | decisions.section(self.store, job.id)
+        )
         out, why = self._read_only_session(
             job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
             self.cfg.budgets.review_session_usd, shape.value,
@@ -4097,6 +4332,7 @@ class JobRunner:
                  "tier_reason": r.tier_reason},
                 Provenance.HUMAN, job_id=job_id, task_id=task_id,
             )  # fmt: skip
+            decisions.add(self.store, job_id, "vigild", "escalation", f"{task_id}: {r.tier_reason}")
             most = self.cfg.vigild.breakers.max_escalations_per_day
             if escalations_today(self.store) > most:
                 self.breakers.trip(
@@ -4219,6 +4455,8 @@ class JobRunner:
         except (StaleDevImage, HostRefused) as e:  # DevImages paged a stale image with Rebuild
             self.budget.settle(rid)
             self.store.update_session(s.id, status="failed")
+            if replay is not None:
+                raise ReplayRefused(409, f"the sandbox image isn't ready: {e}"[:300]) from e
             if isinstance(e, HostRefused):
                 self._host_refused(job.id, e, "the review session")
             return None, f"the sandbox image isn't ready: {e}"[:300]
@@ -4412,6 +4650,225 @@ class JobRunner:
             load_cases(),
         )
         return {"prompt_version": prompt_version, "prompt_sha256": prompt.sha256, **report}
+
+    # --- spec replay (ADR-0005 part 7) ------------------------------------------------------
+
+    def _spec_replay_base(self, job_id: str, approved_at: str) -> tuple[str, str]:
+        """The base sha the approved spec was drafted on, and where it came from: the
+        `base_sha` of the last coord packet event at or before the approval
+        (`packet_event`), else, for a job from before the event carried it, the clone record
+        of the coord attempt numbered by the coord sessions begun by the approval
+        (`clone_record`, the last resort). Always vigild's own record."""
+        rows = self.store.q(
+            "SELECT data, ts FROM events WHERE job_id=? AND type='packet' ORDER BY id", (job_id,)
+        )
+        early = [
+            str(d["base_sha"]) for r in rows
+            if (d := json.loads(r["data"])).get("role") == "coord" and d.get("base_sha")
+            and str(r["ts"]) <= approved_at
+        ]  # fmt: skip
+        if early:
+            return early[-1], "packet_event"
+        # Clone ids are per coord attempt and reused (coord1, coord2, coord1), so a count of
+        # sessions names no clone: the record is the approved draft's own clone's, the last
+        # coord session that finished before the approval.
+        drafts = [
+            x for x in self.store.list_sessions(job_id)
+            if x.role is Role.COORD and x.clone_path and x.status == "done"
+            and str(x.created_at) <= approved_at
+        ]  # fmt: skip
+        try:
+            if not drafts:
+                raise WorkspaceError(f"no finished coord draft of {job_id} before its approval")
+            return self.workspace.base_sha(Path(str(drafts[-1].clone_path)).name), "clone_record"
+        except (OSError, ValueError, KeyError, WorkspaceError) as e:
+            raise ReplayInvalid(f"no record of the base {job_id}'s spec was drafted on") from e
+
+    def _session_tokens(self, session_id: str | None) -> dict[str, int]:
+        rows = self.store.q(
+            "SELECT COALESCE(SUM(tokens_in),0) i, COALESCE(SUM(tokens_cache_read),0) cr,"
+            " COALESCE(SUM(tokens_cache_write_5m),0) w5, COALESCE(SUM(tokens_cache_write_1h),0) w1,"
+            " COALESCE(SUM(tokens_out),0) o FROM model_calls WHERE session_id=?",
+            (session_id,),
+        )
+        r = rows[0]
+        return {"in": int(r["i"]), "cache_read": int(r["cr"]), "cache_write_5m": int(r["w5"]),
+                "cache_write_1h": int(r["w1"]), "out": int(r["o"])}  # fmt: skip
+
+    def replay_spec(self, job_id: str, packet_variant: str) -> dict[str, Any]:
+        """Re-draft a job's approved spec in one coord session (`POST /api/spec/replay`).
+        It drafts from the job's original request and notes at the base the approved spec
+        was drafted on, with the chosen packet variant, on the experiment line; every row is
+        `eval-only`. The gate runs once on the draft (no re-draft); nothing is imported to
+        the job, published or filed, and the job is unchanged. Reports the gate, AC coverage
+        against the approved spec, the packet's size, the tokens and the cost."""
+        assemble = COORD_PACKETS.get(packet_variant)
+        if assemble is None:
+            raise ReplayInvalid(
+                f"unknown packet variant {packet_variant!r}; one of {sorted(COORD_PACKETS)}"
+            )
+        try:
+            job = self.store.get_job(job_id)
+        except KeyError as e:
+            raise ReplayNotFound(f"no such job: {job_id}") from e
+        approval = self.store.get_artifact(job.id, "approval.json")
+        if approval is None:
+            raise ReplayInvalid(f"{job.id} has no approved spec")
+        before = self.store.spec_before(job.id, approval.id) or self.store.get_artifact(
+            job.id, "spec.md"
+        )
+        if before is None:
+            raise ReplayInvalid(f"{job.id} has no approved spec")
+        approved_spec = spec_body(before.content)
+        base_sha, base_source = self._spec_replay_base(job.id, approval.created_at)
+        open_ = self.breakers.open_breakers()
+        if open_:
+            raise ReplayRefused(
+                409, "a breaker is open: " + ", ".join(f"{b.kind.value}:{b.scope}" for b in open_)
+            )
+        errors = repo_rule_errors(self.cfg, job.repo, live_private(job.repo))
+        if errors:
+            raise ReplayRefused(403, "the private-repo rule: " + "; ".join(errors)[:300])
+        try:  # the preset a live first draft would get
+            picked = route_coord(self.cfg, job.repo, self.coord_shape(job))
+        except RoutingError as e:
+            raise ReplayRefused(403, f"backend refused: {e}"[:300]) from e
+        preset = self._healthy(picked.preset)
+        if preset is None:
+            raise ReplayRefused(409, "the coord's backend breaker is open")
+        rid = self.store.create_replay(job.id, "", base_sha, packet_variant, "", kind="spec")
+        try:
+            self._spec_replay_session(
+                job, rid, preset, assemble, base_sha, approved_spec, base_source, picked.reason
+            )
+        except ReplayRefused as e:
+            self.store.finish_replay(rid, "refused", error=str(e)[:1000])
+            raise
+        except Exception as e:
+            log.exception("spec replay %s failed", rid)
+            self.store.finish_replay(rid, "failed", error=f"vigild error: {type(e).__name__}")
+        return self._spec_replay_result(rid)
+
+    def _spec_replay_session(
+        self,
+        job: Any,
+        rid: str,
+        preset: str,
+        assemble: Any,
+        base_sha: str,
+        approved_spec: str,
+        base_source: str,
+        route_reason: str,
+    ) -> None:
+        branch = f"vigil/{rid}-spec"
+        s = self.store.create_session(
+            None, Role.COORD, backend_preset=preset, branch=branch,
+            provenance=Provenance.EVAL_ONLY,
+        )  # fmt: skip
+        self.store.link_replay(rid, s.id)  # from here the session books to the experiment line
+        amount = self.cfg.budgets.coord_session_usd
+        try:
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
+            res = self.budget.reserve(session_id=s.id, task_id=None, amount=amount, purpose="coord")
+        except (RepoPolicyError, BudgetExceeded) as e:
+            self.store.update_session(s.id, status="refused")
+            raise ReplayRefused(403 if isinstance(e, RepoPolicyError) else 409, str(e)) from e
+        try:
+            clone_id = f"{rid}-coord"
+            clone = self.workspace.clone(
+                job.repo, clone_id, branch=branch, base=job.base, start=base_sha,
+                record_as=base_sha,
+            )  # fmt: skip
+            meta_art = self.store.get_artifact(job.id, "intake.json")
+            meta = json.loads(meta_art.content) if meta_art else {}
+            request = {
+                "job_id": job.id, "repo": job.repo, "base": job.base, "base_sha": base_sha,
+                "branch": branch, "title": job.title, "request": job.request,
+                "notes": job.notes, "why": meta.get("why"), "value": meta.get("value"),
+                "risk": meta.get("risk"), "existing_task_ids": [],
+            }  # fmt: skip
+            untrusted: dict[str, str] = {}
+            issue = issue_text(self.store, job.id)
+            if issue is not None:
+                untrusted["github issue"] = issue
+            self.workspace.write_task(clone, request)
+            packet = assemble(clone, request, untrusted=untrusted, gate_errors=None)
+            session_image = self._session_image(job.repo, base_sha)
+            spec = SessionSpec(
+                session_id=s.id, role=Role.COORD, job_id=job.id, task_id=None, repo=job.repo,
+                preset=preset, model=self.cfg.preset(preset).model or "", clone=clone,
+                session_dir=self._session_dir(s.id), max_turns=40, max_minutes=COORD_MINUTES,
+                max_budget_usd=amount, mounts=self.workspace.overlays(clone),
+                packet=packet.text, image=session_image,
+                max_output_tokens=self.cfg.budgets.session_max_output_tokens,
+            )  # fmt: skip
+            out = self._run_session(
+                s, spec, res, {"vigil.job_id": job.id, "vigil.role": "coord",
+                               "vigil.repo": job.repo, "vigil.attempt": 1},
+            )  # fmt: skip
+        except (StaleDevImage, HostRefused) as e:
+            self.budget.settle(res)
+            self.store.update_session(s.id, status="failed")
+            raise ReplayRefused(409, redact(f"the sandbox isn't ready: {e}")[:1000]) from e
+        except Exception:
+            self.budget.settle(res)
+            self.store.update_session(s.id, status="failed")
+            raise
+        cost = round(session_cost(self.store, s.id), 6)
+        base_result: dict[str, Any] = {
+            "packet_chars": len(packet.text), "tokens": self._session_tokens(s.id),
+            "base_source": base_source, "coord_route": route_reason,
+            "gate": None, "ac_coverage": None,
+        }  # fmt: skip
+        gate_refused = str(self.store.get_replay(rid)["error"] or "").startswith("gate_refused")
+        if gate_refused or out.status != "done":
+            self.store.update_session(s.id, status="failed")
+            self.store.finish_replay(
+                rid, "refused" if gate_refused else "failed", cost_usd=cost,
+                error=redact(out.error or out.status)[:1000], result=base_result,
+            )  # fmt: skip
+            return
+        try:
+            head = self.workspace.import_result(
+                job.repo, clone_id, spec.session_dir / "out", branch, base_sha,
+                head=str(out.result.get("head") or ""),
+            )  # fmt: skip
+        except WorkspaceError as e:
+            self.store.update_session(s.id, status="failed")
+            self.store.finish_replay(
+                rid, "failed", cost_usd=cost, error=redact(str(e))[:1000], result=base_result
+            )
+            return
+        texts = {
+            n: self.workspace.read_blob(job.repo, head, f".vigil/{job.id}/{n}.md") or ""
+            for n in ("spec", "plan")
+        }
+        assert self.jobs is not None
+        if not texts["spec"] or not texts["plan"]:
+            errors = ["spec.md and plan.md are both required"]
+        else:
+            errors = self.jobs.gate_drafts(
+                job.repo, texts["spec"], texts["plan"], job.base,
+                read=lambda path: self.workspace.mirror_file_at(job.repo, base_sha, path),
+                is_dir=lambda path: self.workspace.mirror_is_dir_at(job.repo, base_sha, path),
+            )  # fmt: skip
+        self.store.update_session(s.id, status="done")
+        self.store.finish_replay(
+            rid, "done", cost_usd=cost,
+            result={**base_result, "gate": {"ok": not errors, "errors": redact(errors)},
+                    "ac_coverage": ac_coverage(approved_spec, texts["spec"])},
+        )  # fmt: skip
+
+    def _spec_replay_result(self, replay_id: str) -> dict[str, Any]:
+        row = self.store.get_replay(replay_id)
+        return {
+            "id": row["id"], "kind": row["kind"], "job_id": row["job_id"],
+            "base_sha": row["head"], "packet": row["prompt_version"], "status": row["status"],
+            "cost_usd": row["cost_usd"], "error": row["error"], "provenance": row["provenance"],
+            **dict.fromkeys(("gate", "ac_coverage", "tokens", "base_source", "coord_route")),
+            "packet_chars": 0,
+            **json.loads(row["result"]),
+        }  # fmt: skip
 
 
 # --- wiring for the real daemon ------------------------------------------------------------

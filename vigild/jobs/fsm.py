@@ -223,7 +223,7 @@ def _reviews_clean(c: Ctx) -> list[str]:
     audit, an audit.json of the same head that missed nothing medium or higher."""
     from pydantic import ValidationError
 
-    from vigild.contract.models import BLOCKING, Audit, Review
+    from vigild.contract.models import BLOCKING, StoredAudit, StoredReview
 
     errs: list[str] = []
     for t in c.store.list_tasks(c.job.id):
@@ -234,7 +234,7 @@ def _reviews_clean(c: Ctx) -> list[str]:
             errs.append(f"worker {t.id} has no review.json")
             continue
         try:
-            review = Review.model_validate_json(art.content)
+            review = StoredReview.model_validate_json(art.content)
         except ValidationError:
             errs.append(f"worker {t.id} review.json is invalid")
             continue
@@ -243,7 +243,7 @@ def _reviews_clean(c: Ctx) -> list[str]:
         if review.audit_required:
             au = c.store.get_artifact(c.job.id, "audit.json", t.id)
             try:
-                audit = Audit.model_validate_json(au.content) if au else None
+                audit = StoredAudit.model_validate_json(au.content) if au else None
             except ValidationError:
                 audit = None
             if audit is None or audit.head != review.head:

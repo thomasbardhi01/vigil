@@ -151,7 +151,15 @@ def test_in_review_to_ready_needs_clean_reviews(store: Store) -> None:
     store.add_artifact(jid, "review.json", "{}", Provenance.CLAUDE, task_id=tid)
     with pytest.raises(TransitionError, match=r"review\.json is invalid"):
         transition(store, jid, S.READY, Actor.VIGILD)
-    medium = {"severity": "medium", "file": "a.py", "line": 1, "claim": "c", "fix": "f"}
+    medium = {
+        "severity": "medium",
+        "file": "a.py",
+        "line": 1,
+        "claim": "c",
+        "fix": "f",
+        "evidence": {"kind": "diff_line", "ref": "a.py:1"},
+        "confidence": 0.9,
+    }
     store.add_artifact(
         jid, "review.json", _review(tid, jid, verdict="changes", findings=[medium]),
         Provenance.CLAUDE, task_id=tid,
@@ -348,3 +356,28 @@ def test_blocked_on_must_name_a_job(store: Store) -> None:
             store, parent, S.BLOCKED, Actor.VIGILD,
             evidence={"reason": "needs_deps", "blocked_on": "xx-9999"},
         )  # fmt: skip
+
+
+LEGACY = {"severity": "low", "file": "a.py", "line": 1, "claim": "c", "fix": "f"}
+
+
+def test_a_pre_105_review_and_audit_still_pass_the_ready_gate(store: Store) -> None:
+    """#105: stored artifacts written before evidence and confidence existed stay readable."""
+    jid = _job(store, S.IN_REVIEW)
+    tid = _worker(store, jid, pr=True, report=True)
+    store.add_artifact(
+        jid, "review.json", _review(tid, jid, findings=[LEGACY], audit_required=True),
+        Provenance.CLAUDE, task_id=tid,
+    )  # fmt: skip
+    audit = {
+        "findings": [{**LEGACY, "matched": 0}], "false_findings": [], "task_id": tid,
+        "job_id": jid, "head": "a" * 40, "shape": "docs", "rung": 0, "auditor": "claude-opus",
+        "provenance": "claude",
+    }  # fmt: skip
+    store.add_artifact(jid, "audit.json", json.dumps(audit), Provenance.CLAUDE, task_id=tid)
+    sent = "b" * 40
+    store.add_event("pr_open", {"published": sent}, Provenance.HUMAN, job_id=jid, task_id=tid)
+    heads = {tid: {"published": sent, "vigil": False}}
+    assert (
+        transition(store, jid, S.READY, Actor.VIGILD, evidence={"pr_heads": heads}).state is S.READY
+    )

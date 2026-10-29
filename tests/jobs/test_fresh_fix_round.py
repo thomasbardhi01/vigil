@@ -1,8 +1,7 @@
 """A fix round starts the worker fresh (#78, owner, 2026-10-28).
 
 Its packet carries spec.md, the PR diff, the review and audit findings and the
-verifier's summary, never the worker's transcript. The fork stays for true
-escalation: attempt >= routing.escalate_attempt (or rule 5)."""
+verifier's summary, never the worker's transcript. No attempt forks (#101); only a crashed session resumes."""
 
 # ruff: noqa: F811  (fixtures imported from the modules that define them)
 
@@ -52,14 +51,6 @@ def test_the_fresh_fix_packet_carries_spec_diff_findings_and_verifier(world: Wor
     assert "<<<UNTRUSTED review-findings" in p and LOW_A["claim"] in p
     assert "<<<UNTRUSTED owner-note" in p and NOTE in p
     assert "## docs/feature-map.md (excerpt)" not in p  # no context pack
-
-
-def test_a_fix_round_forks_at_the_configured_escalation_attempt(world: World) -> None:
-    w = world
-    w.runner.cfg.routing.escalate_attempt = 1  # attempt 1 is already the escalation
-    job, (first, fix) = _fixed(w)
-    assert fix.resume is not None and fix.resume.from_session == first.session_id
-    assert w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='fork'", (job,))
 
 
 def _fail_the_second_run(w: World) -> None:

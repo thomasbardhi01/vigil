@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from vigild.db import Store
+from vigild.metering.calls import booked_usd, unmetered_sessions
 
 KPIS = (
     "first_pass_merge_rate",
@@ -55,11 +56,17 @@ def compute(store: Store) -> dict[str, Any]:
         result["first_pass_merge_rate"] = len(first_pass) / len(merged)
         prs = 0
         cost = 0.0
+        unknown: list[dict[str, str]] = []  # no metering row: listed apart, still summed (#102)
         for j in merged:
-            rows = store.q("SELECT cost_usd, pr_url FROM sessions WHERE job_id=?", (j,))
-            cost += sum(r["cost_usd"] for r in rows)
+            mine = unmetered_sessions(store, j)
+            unknown += mine
+            rows = store.q("SELECT id, cost_usd, pr_url FROM sessions WHERE job_id=?", (j,))
+            missing = {u["session_id"] for u in mine}
+            cost += sum(r["cost_usd"] for r in rows if r["id"] not in missing)
+            cost += sum(booked_usd(store, s) for s in missing)  # the ledger is booked money
             prs += len({r["pr_url"] for r in rows if r["pr_url"]})
         result["cost_per_merged_pr"] = cost / prs if prs else None
+        result["cost_unknown_sessions"] = unknown
         hours = []
         for j, t in merged.items():
             created = store.get_job(j).created_at

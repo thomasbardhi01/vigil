@@ -30,7 +30,8 @@ from vigild.packets.assemble import assemble_review
 from vigild.repos import set_visibility_source
 
 FINDING = {"severity": "medium", "file": "docs/feature-map.md", "line": 3,
-           "claim": "AC1: the row names no unit", "fix": "say req/min"}  # fmt: skip
+           "claim": "AC1: the row names no unit", "fix": "say req/min",
+           "evidence": {"kind": "diff_line", "ref": "docs/feature-map.md:3"}, "confidence": 0.9}  # fmt: skip
 CHANGES = {**CLEAN_REVIEW, "verdict": "changes", "findings": [FINDING]}
 
 

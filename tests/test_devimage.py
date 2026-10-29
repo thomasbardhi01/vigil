@@ -112,7 +112,7 @@ def test_parkagent_records_what_it_cant_run(cfg: Config) -> None:
 def test_a_new_key_is_built_from_lockfiles_only_and_validated(world: Any) -> None:
     images, docker, suites, _, base, _ = world
     tag = images.ensure_fresh(REPO, base)
-    assert tag.startswith("vigil-dev/fixture:")
+    assert tag.startswith("vigil-dev-") and "/fixture:" in tag
     ((built, files),) = docker.builds
     assert built == tag and files == ["uv.lock"]  # lockfiles only: no source, no missing file
     assert [c for _, c, _ in suites.ran] == list(images.cfg.repo(REPO).dev_suites.values())
@@ -251,7 +251,7 @@ def test_a_session_image_is_the_executor_layer_over_the_dev_image(layered: Any) 
     sessions, docker, images, base, _ = layered
     tag = sessions.ensure_fresh(REPO, base)
     dev_tag = images.ensure_fresh(REPO, base)
-    assert tag.startswith("vigil-session/fixture:") and dev_tag.startswith("vigil-dev/fixture:")
+    assert tag.startswith("vigil-session-") and dev_tag.startswith("vigil-dev-")
     _, layer_build = docker.args
     assert layer_build["dockerfile"].name == "Dockerfile"
     assert layer_build["dockerfile"].parent.name == "claude-executor"  # one layer definition

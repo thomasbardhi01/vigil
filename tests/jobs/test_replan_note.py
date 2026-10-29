@@ -466,7 +466,8 @@ def test_an_approval_after_a_noted_replan_closes_its_notes(world: World) -> None
     packets = _capture(w)
     r = _replan(w, _failure_item(w, job), "new note")
     assert r.status_code == 200
-    assert "new note" in packets[0] and "old note" not in packets[0]
+    # the owner's section only: vigild's fenced decisions log keeps the replan lines
+    assert "new note" in packets[0] and "old note" not in strip_fenced(packets[0])
 
 
 def test_author_contract_does_not_match_authorization_or_authority() -> None:

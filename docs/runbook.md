@@ -271,6 +271,18 @@ you. There is no timer and no launchd job.
   uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
   ```
 
+- **The `rebuilds-images` label.** CI's `image-key` workflow (`.github/workflows/image-key.yml`) puts it on a PR that
+  changes an input of a dev-image key or of the executor layer: a repo's dev
+  Dockerfile, vigil's `pyproject.toml` or `uv.lock`, a repo's `dev_suites` or
+  `dev_image_tools`, anything under `images/claude-executor/`, the managed
+  settings or the worker-report schema. Such a PR must have a body line
+  `Rebuilds images: <repo or layer>` (editing the body re-runs the check; the job reads the live body), and
+  CI builds vigil's dev image and runs its suites offline. It does not build
+  the session layer (no claude-mods in CI). **After a labelled PR merges, run**
+  `vigil dev-image --repo <repo>` for each repo it names (add `--rebuild` only
+  to force one); until then `vigil doctor` fails `dev image fresh` or
+  `session image fresh` with both keys, and the next job is refused with
+  `build <image> first`.
 - **Session images.** A repo's coord and worker sessions run in its session
   image: the executor layer (`images/claude-executor/Dockerfile`) built over
   its dev image, so workers can run the real suite offline. `vigil dev-image` builds it
@@ -941,6 +953,32 @@ Run by hand only when the launchd agent isn't installed or is booted out
   the field carry none). An issue intake took itself stays claimed even
   after its job is abandoned; to redo it, submit a new job through the API.
 - Running it under launchd arrives with phase 2b, together with the CLI.
+
+## Replaying a spec
+
+A spec replay asks "what would the coord have drafted with this packet?" for a job whose
+spec the owner approved, without touching the job. It needs vigild running, the job's
+vault and clone record on disk, and no open breaker.
+
+- **Run it:** `uv run python cli/vigil spec replay <job> --packet classic` (or
+  `POST /api/spec/replay` with the admin credential and `{"job_id", "packet"}`). `packet`
+  is a variant registered in `COORD_PACKETS` in `vigild/packets/assemble.py`; an unknown
+  name is a 422. A job with no approved spec is a 422. A private repo reaches only the
+  backends its real coord may (403 otherwise). **Replaying ParkAgent's pa-0003 runs only
+  after the owner confirms.**
+- **What it prints:** the replay's id (`rp-...`) and status; the **gate** (ok, or the
+  errors; it runs once, with no re-draft); **AC coverage** (the approved spec's ACs found
+  in the redraft with the same id and the same test command, whitespace collapsed, and
+  the missing ones; a changed wording with the same id and command counts as covered); the packet's size in characters; the session's tokens (in, cache
+  read, cache write 5m and 1h, out) and its cost. The same row is in `replays`
+  (`kind='spec'`, the report in `result`).
+- **What it costs and where it books:** one coord session, at most `coord_session_usd`
+  (a hard cap), on the experiment line (`experiment_monthly_usd`), never the day, and
+  counted in the month. A full line, or any open breaker, refuses it (409).
+- **What it never does:** publish, push, import into the job, file an inbox item, or change
+  the job, its artifacts or its tasks. Every row it writes is `eval-only`.
+- **To compare packets:** replay the same job once per variant and compare the gate, the
+  coverage, the characters and the cost; the bar is no drop in the gate pass rate.
 
 ## Review replays and the regression set
 

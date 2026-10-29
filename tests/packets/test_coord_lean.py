@@ -12,6 +12,7 @@ from vigild.packets import coord_context as cc
 from vigild.packets.assemble import (
     COORD_LAYER_BUDGET_TOKENS,
     DEFAULT_BUDGET_CHARS,
+    _classic_context,
 )
 from vigild.packets.assemble import assemble_coord_lean as assemble_coord
 
@@ -185,16 +186,9 @@ def test_the_packet_is_a_quarter_of_the_old_one_on_this_repos_docs() -> None:
         _request(request="Change vigild/budget.py so the daily cap warns at 80%"),
         untrusted={"issue": "a short issue"},
     )
-    legacy_pack, used = [], 0
-    for doc in ("README.md", "docs/feature-map.md", "docs/architecture.md"):
-        f = REPO_ROOT / doc
-        if f.is_file():
-            block = f"## {doc}\n\n```\n{f.read_text().rstrip()}\n```"
-            if used + len(block) <= DEFAULT_BUDGET_CHARS:
-                legacy_pack.append(block)
-                used += len(block)
+    classic, _ = _classic_context(REPO_ROOT, DEFAULT_BUDGET_CHARS)  # the real old pack
     legacy = len(new.text) - len(new.parts["context_pack"]) - len(new.parts["feature_index"])
-    legacy += len("\n\n".join(legacy_pack))
+    legacy += len(classic)
     print(f"coord packet: {legacy // 4} -> {len(new.text) // 4} tokens (chars/4)")
     assert len(new.text) <= legacy / 4
     assert "# Feature map\n\nOne row per Vigil feature" not in new.text
@@ -313,3 +307,18 @@ def test_a_file_that_fits_is_sent_whole_and_a_non_python_file_is_dropped(repo: P
     p = assemble_coord(repo, _request(request="See vigild/budget.py and notes.txt"), untrusted={})
     assert "CAP = 10" in p.parts["context_pack"]
     assert any("notes.txt" in d for d in p.dropped)
+
+
+def test_the_classic_context_cuts_a_doc_over_the_budget_instead_of_dropping_it(
+    tmp_path: Path,
+) -> None:
+    """#131 grew docs/feature-map.md to 120,635 chars, past the 120,000 budget, and the
+    classic coord packet (production's) silently lost the whole feature map. A doc that
+    doesn't fit is cut at a line to what is left of the budget, and the cut is named."""
+    (tmp_path / "docs").mkdir()
+    rows = [f"| f{i} | row {i} |" for i in range(2000)]
+    (tmp_path / "docs" / "feature-map.md").write_text("\n".join(rows) + "\n")
+    text, dropped = _classic_context(tmp_path, budget_chars=10_000)
+    assert "| f0 | row 0 |" in text and len(text) <= 10_000 + 400
+    assert "| f1999 | row 1999 |" not in text
+    assert any("feature-map.md" in d and "cut" in d for d in dropped)

@@ -7,7 +7,8 @@ review round 2). This replaces the nightly validation of a hand-built image.
   a Linux container, each with its reason.
 - **Key:** sha256 over the Dockerfile, each lockfile's blob id at the base
   commit (from vigild's mirror), and the suites. The image is
-  `vigil-dev/<name>:<key[:16]>`. A new key is a new image.
+  `vigil-dev/<name>:<key[:16]>` (a non-production data dir: `vigil-dev-<hash8>/...`,
+  #128). A new key is a new image.
 - **Build:** the context is only the lockfiles, copied from the base commit;
   no repo source goes into the image. The build has the network; nothing after
   it does.
@@ -125,6 +126,16 @@ class Validation:
 OnFailure = Callable[[str, str, dict[str, Any]], None]
 
 
+def image_prefix(data_path: Path, kind: str) -> str:
+    """`vigil-dev` / `vigil-session` for production (the default data dir); any
+    other data dir gets `vigil-<kind>-<sha256(resolved path)[:8]>`, so a test or
+    scratch build never moves a tag production's records name (#128)."""
+    resolved = data_path.expanduser().resolve()
+    if resolved == (Path.home() / "vigil-data").resolve():
+        return f"vigil-{kind}"
+    return f"vigil-{kind}-{hashlib.sha256(str(resolved).encode()).hexdigest()[:8]}"
+
+
 class DevImages:
     def __init__(
         self,
@@ -162,9 +173,17 @@ class DevImages:
         h.update(b"\0" + json.dumps(pol.dev_suites, sort_keys=True).encode())
         return h.hexdigest()
 
-    def tag(self, repo: str, key: str) -> str:
+    def tag(self, repo: str, key: str, kind: str = "dev") -> str:
         name = re.sub(r"[^a-z0-9._-]", "-", repo.split("/")[-1].lower())
-        return f"vigil-dev/{name}:{key[:16]}"
+        return f"{image_prefix(self.cfg.vigild.data_path, kind)}/{name}:{key[:16]}"
+
+    def newest_validated(self, repo: str, stages: tuple[str, ...]) -> dict[str, Any] | None:
+        """The newest passing record of these stages (`validate` is a dev image,
+        `session-validate` a session image); doctor compares its key to main's."""
+        rows = self.store.q(
+            "SELECT * FROM dev_images WHERE repo=? AND ok=1 ORDER BY id DESC", (repo,)
+        )
+        return next((dict(r) for r in rows if r["stage"] in stages), None)
 
     def latest(self, repo: str, key: str | None = None) -> dict[str, Any] | None:
         sql, args = "SELECT * FROM dev_images WHERE repo=?", [repo]
@@ -349,13 +368,46 @@ SESSION_CHECK = (
 )
 
 
-def layer_digest() -> str:
-    """The executor layer's identity: every file it's built from."""
-    h = hashlib.sha256()
+def layer_files() -> list[Path]:
+    """Every file the executor layer's digest hashes, in hash order."""
     files = sorted(
         f for f in EXECUTOR_LAYER.rglob("*") if f.is_file() and "__pycache__" not in f.parts
     )
-    for f in [*files, MANAGED_SETTINGS, REPORT_SCHEMA]:
+    return [*files, MANAGED_SETTINGS, REPORT_SCHEMA]
+
+
+def key_input_paths(cfg: Config, repo: str | None = None) -> list[str]:
+    """Checkout-relative files whose change changes a dev-image key or the layer
+    digest: every repo's dev Dockerfile, the layer's files, and the lockfiles of
+    `repo` (the repo this checkout is; other repos' lockfiles are in their trees).
+    The CI `image-key` job (scripts/image-key-check.py) uses this one list."""
+    paths = {cfg.repo(r).dev_dockerfile for r in cfg.repos.repos}
+    paths |= {str(f.relative_to(ROOT)) for f in layer_files()}
+    if repo is not None:
+        paths |= set(cfg.repo(repo).dev_lockfiles)
+    return sorted(paths)
+
+
+# Fields of a repo's entry in configs/repos.yaml that its key hashes (the suites)
+# or its image provides (the tools a test_cmd may use).
+KEY_CONFIG_FIELDS = ("dev_dockerfile", "dev_lockfiles", "dev_suites", "dev_image_tools")
+
+
+def config_input_changes(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
+    """`repo: field` for each key-relevant field of repos.yaml that differs."""
+    out: list[str] = []
+    for name in sorted(head):
+        if name not in base:
+            out.append(f"{name}: new repo")
+            continue
+        out += [f"{name}: {f}" for f in KEY_CONFIG_FIELDS if base[name].get(f) != head[name].get(f)]
+    return out
+
+
+def layer_digest() -> str:
+    """The executor layer's identity: every file it's built from."""
+    h = hashlib.sha256()
+    for f in layer_files():
         h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 
@@ -383,7 +435,7 @@ class SessionImages:
         return hashlib.sha256(f"{dev_tag}\0{layer_digest()}\0{sha}".encode()).hexdigest()
 
     def tag(self, repo: str, key: str) -> str:
-        return self.dev.tag(repo, key).replace("vigil-dev/", "vigil-session/", 1)
+        return self.dev.tag(repo, key, "session")
 
     def resolve(self, repo: str, base_sha: str) -> str:
         """The built session image, or a refusal. Never builds (ADR-0004 §5)."""
