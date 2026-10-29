@@ -315,7 +315,7 @@ stateDiagram-v2
   once its own dependencies have published, up to three sessions at once
   across the fleet, each in its own container, clone and `vigil/<task>`
   branch. After a worker exits, vigild imports its result into the vault
-  (decision `vault-host-git`), reads `worker_report.json` from there, checks stage-3 acceptance
+  (decision `vault-host-git`), reads `worker_report.json` from there (dropping any `executor` block the worker wrote, then storing the report with vigild's own `executor` evidence: the session image digest, the base, launch and end heads, the attempt lineage `{parent_session_id, mode: fork|fresh|resume}`, and, when an earlier attempt failed, a redacted failure diagnostic of at most 2,000 bytes that reads `withheld (unknown output)` unless the failure is a known kind; all optional, so older reports still load; #106), checks stage-3 acceptance
   (decision `reading-session-files`; it includes the rules-only completion-integrity
   check, `vigild/jobs/integrity.py`: added TODOs and skips with no reason, stubs, self-referential
   report text and deleted guards; report-only since the owner's ruling of 2026-10-29: each

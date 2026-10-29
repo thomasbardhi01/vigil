@@ -223,6 +223,34 @@ class SelfCheck(Strict):
     could_delete: str
 
 
+class Lineage(Strict):
+    parent_session_id: str | None = None
+    mode: Literal["fork", "fresh", "resume"]
+
+
+class ExecutorEvidence(Strict):
+    """What vigild knows of the session that wrote the report, from its own
+    records (#106). Every field is optional so older reports still load."""
+
+    image_digest: str | None = None
+    base_head: str | None = None
+    launch_head: str | None = None
+    end_head: str | None = None
+    lineage: Lineage | None = None
+    prior_failure_diagnostic: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Screened output of an EARLIER session's failure, carried forward; it is not "
+            "this session's own outcome. `prior_failure_session_id` names that session."
+        ),
+    )
+    prior_failure_session_id: str | None = Field(
+        default=None,
+        description="The session whose failure `prior_failure_diagnostic` describes.",
+    )
+
+
 class WorkerReport(Strict):
     task_id: str
     job_id: str
@@ -236,6 +264,8 @@ class WorkerReport(Strict):
     # Dependencies the work needs that the dev image lacks; the task blocks
     # on a deps job instead of being judged (round 3).
     needs_deps: list[DepRequest] = Field(default_factory=list)
+    # Ignored: vigild replaces it with its own records (#106).
+    executor: ExecutorEvidence | None = None
     provenance: Provenance
 
 
