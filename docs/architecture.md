@@ -448,9 +448,11 @@ code. Hosted non-Claude output (Jev) has no value of its own and is tagged
 - **cost per merged PR:** metered spend per merged PR;
 - **median spec→merge.**
 
-A session with no `model_calls` row is never $0 in a report: `kpis.py`, the
-job tree and the batch roll-up list it under `cost_missing_sessions` /
-`missing_sessions`, by session id, outside every sum (#102).
+The ledger is booked money: every spend total keeps its rows. A session with
+no `model_calls` row is never reported as metered: `kpis.py`, the job tree and
+the batch roll-up list it apart under `cost_unknown_sessions`, as
+`{session_id, note}` ("cost unknown; booked at reservation $X"), and its
+booking stays in the sums (#102).
 
 The raw data is stored from phase 1. The ladder, routing and the cost
 model read these numbers from phase 2.

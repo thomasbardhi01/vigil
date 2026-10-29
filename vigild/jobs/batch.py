@@ -19,14 +19,11 @@ MAX_JOBS = 10
 _OF_JOB = "(session_id IN (SELECT id FROM sessions WHERE job_id=?) OR task_id IN (SELECT id FROM tasks WHERE job_id=?))"  # noqa: E501
 
 
-def job_cost(store: Store, job_id: str, missing: list[str] | None = None) -> tuple[float, float]:
-    """(spent, held) in USD for one job. A session in `missing` (no metering row, #102) is
-    outside the spend: its cost is unknown, not $0."""
-    gone = missing or []
+def job_cost(store: Store, job_id: str) -> tuple[float, float]:
+    """(spent, held) in USD for one job."""
     spent = store.q(
-        f"SELECT COALESCE(SUM(amount_usd), 0) FROM ledger WHERE {_OF_JOB}"  # noqa: S608
-        f" AND COALESCE(session_id, '') NOT IN ({','.join('?' * len(gone))})",
-        (job_id, job_id, *gone),
+        f"SELECT COALESCE(SUM(amount_usd), 0) FROM ledger WHERE {_OF_JOB}",  # noqa: S608
+        (job_id, job_id),
     )[0][0]
     held = store.q(
         f"SELECT COALESCE(SUM(amount_usd), 0) FROM reservations WHERE status='open' AND {_OF_JOB}",  # noqa: S608
@@ -41,8 +38,7 @@ def batch_view(store: Store, batch_id: str) -> dict[str, Any]:
     jobs: list[dict[str, Any]] = []
     for job_id in store.batch_job_ids(batch_id):
         job = store.get_job(job_id)
-        missing = unmetered_sessions(store, job_id)
-        spent, held = job_cost(store, job_id, missing)
+        spent, held = job_cost(store, job_id)
         jobs.append(
             {
                 "job_id": job_id,
@@ -53,7 +49,7 @@ def batch_view(store: Store, batch_id: str) -> dict[str, Any]:
                 "spent_usd": round(spent, 6),
                 "held_usd": round(held, 6),
                 "total_usd": round(spent + held, 6),
-                "missing_sessions": missing,
+                "cost_unknown_sessions": unmetered_sessions(store, job_id),
             }
         )
     spent = sum(j["spent_usd"] for j in jobs)
@@ -67,6 +63,6 @@ def batch_view(store: Store, batch_id: str) -> dict[str, Any]:
             "spent_usd": round(spent, 6),
             "held_usd": round(held, 6),
             "total_usd": round(spent + held, 6),
-            "missing_sessions": [m for j in jobs for m in j["missing_sessions"]],
+            "cost_unknown_sessions": [m for j in jobs for m in j["cost_unknown_sessions"]],
         },
     }

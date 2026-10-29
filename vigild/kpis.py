@@ -56,19 +56,14 @@ def compute(store: Store) -> dict[str, Any]:
         result["first_pass_merge_rate"] = len(first_pass) / len(merged)
         prs = 0
         cost = 0.0
-        missing: list[str] = []  # no metering row: unknown, never counted as $0 (#102)
+        unknown: list[dict[str, str]] = []  # no metering row: listed apart, still summed (#102)
         for j in merged:
-            gone = unmetered_sessions(store, j)
-            missing += gone
-            rows = store.q(
-                "SELECT cost_usd, pr_url FROM sessions WHERE job_id=?"  # noqa: S608
-                f" AND id NOT IN ({','.join('?' * len(gone))})",
-                (j, *gone),
-            )
+            unknown += unmetered_sessions(store, j)
+            rows = store.q("SELECT cost_usd, pr_url FROM sessions WHERE job_id=?", (j,))
             cost += sum(r["cost_usd"] for r in rows)
             prs += len({r["pr_url"] for r in rows if r["pr_url"]})
         result["cost_per_merged_pr"] = cost / prs if prs else None
-        result["cost_missing_sessions"] = missing
+        result["cost_unknown_sessions"] = unknown
         hours = []
         for j, t in merged.items():
             created = store.get_job(j).created_at

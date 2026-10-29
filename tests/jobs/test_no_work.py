@@ -57,19 +57,23 @@ def _session(store: Store, job: str, sid: str, cost: float, rows: int) -> None:
         )
 
 
-def test_the_job_tree_lists_a_no_row_session_as_missing_outside_its_sum(store: Store) -> None:
+NOTE = "cost unknown; booked at reservation $0.25"
+UNKNOWN = [{"session_id": "s-none", "note": NOTE}]
+
+
+def test_the_job_tree_lists_a_no_row_session_apart_and_keeps_its_booking(store: Store) -> None:
     job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
     _session(store, job.id, "s-ok", 0.5, 1)
     _session(store, job.id, "s-none", 0.25, 0)
     tree = job_tree(store, job.id)
     nodes = {n["id"]: n for n in tree["sessions"]}
-    assert nodes["s-none"]["cost_usd"] is None and nodes["s-none"]["cost_missing"] is True
+    assert nodes["s-none"]["cost_usd"] == 0.25 and nodes["s-none"]["cost_missing"] is True
     assert nodes["s-ok"]["cost_usd"] == 0.5 and nodes["s-ok"]["cost_missing"] is False
-    assert tree["job"]["cost_usd"] == 0.5
-    assert tree["job"]["cost_missing_sessions"] == ["s-none"]
+    assert tree["job"]["cost_usd"] == 0.75
+    assert tree["job"]["cost_unknown_sessions"] == UNKNOWN
 
 
-def test_the_batch_roll_up_lists_a_no_row_session_as_missing_outside_its_sums(
+def test_the_batch_roll_up_lists_a_no_row_session_apart_and_keeps_its_booking(
     store: Store,
 ) -> None:
     batch, (job_id,) = store.create_batch(
@@ -78,19 +82,28 @@ def test_the_batch_roll_up_lists_a_no_row_session_as_missing_outside_its_sums(
     _session(store, job_id, "s-ok", 0.5, 1)
     _session(store, job_id, "s-none", 0.25, 0)
     out = batch_view(store, batch)
-    assert out["jobs"][0]["spent_usd"] == 0.5
-    assert out["jobs"][0]["missing_sessions"] == ["s-none"]
-    assert out["cost"]["spent_usd"] == 0.5
-    assert out["cost"]["missing_sessions"] == ["s-none"]
+    assert out["jobs"][0]["spent_usd"] == 0.75
+    assert out["jobs"][0]["cost_unknown_sessions"] == UNKNOWN
+    assert out["cost"]["spent_usd"] == 0.75
+    assert out["cost"]["cost_unknown_sessions"] == UNKNOWN
 
 
-def test_the_kpis_list_a_no_row_session_as_missing_outside_the_sums(store: Store) -> None:
+def test_the_kpis_list_a_no_row_session_apart_and_keep_its_booking(store: Store) -> None:
     job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
     for f, t in (("building", "in_review"), ("in_review", "ready"), ("ready", "merged")):
         store.add_event("state", {"from": f, "to": t}, "human", job_id=job.id)
     _session(store, job.id, "s-ok", 1.5, 1)
-    _session(store, job.id, "s-none", 9.0, 0)
+    _session(store, job.id, "s-none", 0.25, 0)
     store.x("UPDATE sessions SET pr_url='https://x/1' WHERE id='s-ok'")
     k = compute(store)
-    assert k["cost_per_merged_pr"] == 1.5
-    assert k["cost_missing_sessions"] == ["s-none"]
+    assert k["cost_per_merged_pr"] == 1.75
+    assert k["cost_unknown_sessions"] == UNKNOWN
+
+
+def test_no_reservation_in_the_ledger_notes_zero(store: Store) -> None:
+    job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    _session(store, job.id, "s-none", 0.0, 0)
+    store.x("DELETE FROM ledger")
+    assert job_tree(store, job.id)["job"]["cost_unknown_sessions"] == [
+        {"session_id": "s-none", "note": "cost unknown; booked at reservation $0.00"}
+    ]

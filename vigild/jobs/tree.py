@@ -8,10 +8,10 @@ from typing import Any
 
 from vigild.db import Store
 from vigild.jobs.model import SessionRow
-from vigild.metering.calls import unmetered_sessions
+from vigild.metering.calls import booked_usd, unmetered_sessions
 
 
-def _node(s: SessionRow, missing: bool) -> dict[str, Any]:
+def _node(s: SessionRow, missing: bool, booked: float) -> dict[str, Any]:
     return {
         "id": s.id,
         "role": s.role.value,
@@ -20,7 +20,7 @@ def _node(s: SessionRow, missing: bool) -> dict[str, Any]:
         "backend_preset": s.backend_preset,
         "branch": s.branch,
         "pr_url": s.pr_url,
-        "cost_usd": None if missing else round(s.cost_usd, 6),  # no metering row: unknown, not $0
+        "cost_usd": round(booked if missing else s.cost_usd, 6),  # unmetered: the booked amount
         "cost_missing": missing,
         "tokens_in": s.tokens_in,
         "tokens_out": s.tokens_out,
@@ -34,8 +34,12 @@ def _node(s: SessionRow, missing: bool) -> dict[str, Any]:
 def job_tree(store: Store, job_id: str) -> dict[str, Any]:
     job = store.get_job(job_id)
     sessions = store.list_sessions(job_id)
-    missing = unmetered_sessions(store, job_id)
-    nodes = {s.id: _node(s, s.id in missing) for s in sessions}
+    unknown = unmetered_sessions(store, job_id)
+    missing = {u["session_id"] for u in unknown}
+    nodes = {
+        s.id: _node(s, s.id in missing, booked_usd(store, s.id) if s.id in missing else 0.0)
+        for s in sessions
+    }
     roots: list[dict[str, Any]] = []
     for s in sessions:
         parent = nodes.get(s.parent_session_id) if s.parent_session_id else None
@@ -52,8 +56,8 @@ def job_tree(store: Store, job_id: str) -> dict[str, Any]:
             "fix_depth": job.fix_depth,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
-            "cost_usd": round(sum(s.cost_usd for s in sessions if s.id not in missing), 6),
-            "cost_missing_sessions": missing,
+            "cost_usd": round(sum(s.cost_usd for s in sessions), 6),
+            "cost_unknown_sessions": unknown,
         },
         "lineage": {"parent": job.parent_job_id, "children": store.child_jobs(job_id)},
         "tasks": [

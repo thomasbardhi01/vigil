@@ -126,7 +126,7 @@ def test_the_roll_up_adds_up(client: TestClient, tokens: Tokens, store: Store) -
         "spent_usd": 0.375,
         "held_usd": 0.5,
         "total_usd": 0.875,
-        "missing_sessions": [],
+        "cost_unknown_sessions": [],
     }
     assert out["name"] == "docs" and out["batch_id"] == ids["batch_id"]
     # a job outside the batch is not counted

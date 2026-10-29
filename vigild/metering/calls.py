@@ -149,17 +149,34 @@ def session_cost(store: Store, session_id: str) -> float:
     return float(row[0]["c"])
 
 
-def unmetered_sessions(store: Store, job_id: str | None = None) -> list[str]:
-    """Sessions that ended with no `model_calls` row (#102), by id: their cost is unknown,
-    not $0, so every report lists them as missing and keeps them out of its sums. A
-    deps session has no model by design and is never listed."""
+def unmetered_sessions(store: Store, job_id: str | None = None) -> list[dict[str, str]]:
+    """Sessions that ended with no `model_calls` row (#102), listed apart in every report as
+    `{session_id, note}`. The ledger booked their reservation and it stays in every spend
+    total; the note says the cost is unknown. A deps session has no model by design and is
+    never listed."""
     sql = (
-        "SELECT id FROM sessions WHERE ended_at IS NOT NULL AND role != 'deps'"
+        "SELECT id, (SELECT COALESCE(SUM(amount_usd), 0) FROM ledger l WHERE l.session_id ="
+        " sessions.id) AS booked FROM sessions WHERE ended_at IS NOT NULL AND role != 'deps'"
         " AND NOT EXISTS (SELECT 1 FROM model_calls m WHERE m.session_id = sessions.id)"
     )
     rows = store.q(sql + (" AND job_id=?" if job_id else "") + " ORDER BY created_at, id",
                    (job_id,) if job_id else ())  # fmt: skip
-    return [str(r["id"]) for r in rows]
+    return [
+        {
+            "session_id": str(r["id"]),
+            "note": f"cost unknown; booked at reservation ${float(r['booked']):.2f}",
+        }
+        for r in rows
+    ]
+
+
+def booked_usd(store: Store, session_id: str) -> float:
+    """What the ledger booked for one session."""
+    return float(
+        store.q(
+            "SELECT COALESCE(SUM(amount_usd), 0) FROM ledger WHERE session_id=?", (session_id,)
+        )[0][0]
+    )
 
 
 def last_call_truncated(store: Store, session_id: str) -> bool:
