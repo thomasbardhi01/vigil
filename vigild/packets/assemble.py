@@ -621,7 +621,9 @@ def _coord_context(
 
 def _classic_context(repo: Path, budget_chars: int) -> tuple[str, list[str]]:
     """Today's coord context: README.md, the whole feature map and the whole
-    architecture doc, whichever fit the budget."""
+    architecture doc, in that order. A doc that doesn't fit is cut at a line to what is
+    left of the budget (#131 grew the feature map past it, and dropping it whole left the
+    coord with none); the cut is listed."""
     items: list[str] = []
     dropped: list[str] = []
     used = 0
@@ -631,8 +633,13 @@ def _classic_context(repo: Path, budget_chars: int) -> tuple[str, list[str]]:
             continue
         block = _wrap(doc, text)
         if used + len(block) > budget_chars:
-            dropped.append(f"{doc} ({len(text)} chars)")
-            continue
+            room = budget_chars - used - len(_wrap(doc, ""))
+            kept = text[: max(room, 0)].rsplit("\n", 1)[0] if room > 0 else ""
+            if not kept.strip():
+                dropped.append(f"{doc} ({len(text)} chars)")
+                continue
+            dropped.append(f"{doc} (cut at {len(kept)} of {len(text)} chars)")
+            block = _wrap(doc, kept)
         items.append(block)
         used += len(block)
     if dropped:
