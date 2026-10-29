@@ -7,6 +7,12 @@ was replaced stays, marked `(superseded YYYY-MM-DD)`, with the new one above
 it. Coord checks this file before asking the owner, and logs which ruling it
 applied.
 
+## Autonomy (what coord may do between the owner's windows)
+- **2026-10-28**: Coord may approve a spec through MCP when the job is on the pre-approved list and the spec matches its brief and the owner's ACs. The list: the done-when batch (dw-62, dw-75, dw-38); the maintenance issues #98, #31, #79, #72, #71 and #102-#107; any replan of a job the owner already approved. Anything else, and anything touching money, auth, consent or a pinned path beyond those listed, waits for the owner.
+- **2026-10-28**: Coord acts on pages by this file (retry, replan with a note, dismiss, rebuild, resume), and may reset a `repo_failures` breaker once it has named the three failures and traced each to a known issue. A page it can't trace waits for the owner.
+- **2026-10-28**: Merges stay the owner's, in two windows: 08:00 and 20:00 ET. Coord marks PRs ready and orders work so nothing waits on a merge between windows; anything that needs a deploy is queued for the next window.
+- **2026-10-28**: Caps are the stop: $25 a day, $2 a task, WIP 4; usage lines 60% and 75% weekly.
+
 ## Merging and PRs
 - **2026-10-28**: Coord marks a PR ready on a clean review, not on green CI; auto-merge waits for CI.
 - **2026-10-28**: Rebase a PR onto main only, never onto a branch still under review; a stack the owner set up is retargeted after its base merges.
