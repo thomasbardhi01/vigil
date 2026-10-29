@@ -194,3 +194,22 @@ def test_a_finding_without_evidence_fails_the_review_like_a_malformed_review(wor
     body = json.dumps(item["body"]["tasks"])
     assert "no valid review.json" in body and "evidence" in body
     assert w.store.get_artifact(job, "review.json", f"{job}-w1") is None
+
+
+def test_a_pre_105_audit_still_lets_the_ready_item_be_made(world: World) -> None:
+    """#105: an audit.json stored before evidence and confidence existed is read leniently."""
+    w = world
+    job = _approve(w)
+    tid = f"{job}-w1"
+    au = w.store.get_artifact(job, "audit.json", tid)
+    assert au is not None
+    legacy = {
+        **json.loads(au.content),
+        "findings": [{"severity": "low", "file": "a.py", "line": 1, "claim": "c", "fix": "f",
+                      "matched": 0}],
+    }  # fmt: skip
+    w.store.add_artifact(job, "audit.json", json.dumps(legacy), au.provenance, task_id=tid)
+    before = len(w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"])
+    w.runner._ready(job)
+    after = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"]
+    assert len(after) == before + 1

@@ -34,6 +34,8 @@ def test_a_finding_with_evidence_and_confidence_parses() -> None:
         {"kind": "test", "ref": "tests/test_a.py::test_x"},
         {"kind": "spec_criterion", "ref": "AC3"},
         {"kind": "runtime_log", "ref": "log-2"},
+        {"kind": "diff_line", "ref": "a.py:12-20"},
+        {"kind": "diff_line", "ref": "a.py:L12"},
     ],
 )
 def test_each_kind_parses(ev: dict[str, str]) -> None:
@@ -71,3 +73,30 @@ def test_a_diff_line_without_a_line_number_names_the_locator() -> None:
 @pytest.mark.parametrize("c", [-0.1, 1.01, 7])
 def test_a_confidence_outside_0_to_1_is_refused(c: float) -> None:
     _refused({**GOOD, "confidence": c}, "confidence")
+
+
+@pytest.mark.parametrize("ref", ["AC-3", "ac3", "AC 3", "AC3"])
+def test_an_ac_ref_is_normalised(ref: str) -> None:
+    f = Finding.model_validate({**GOOD, "evidence": {"kind": "spec_criterion", "ref": ref}})
+    assert f.evidence.ref == "AC3"
+
+
+def test_an_empty_ref_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        Finding.model_validate({**GOOD, "evidence": {"kind": "spec_criterion", "ref": ""}})
+
+
+def test_a_stored_finding_without_evidence_or_confidence_parses() -> None:
+    from vigild.contract.models import StoredFinding
+
+    f = StoredFinding.model_validate(BASE)
+    assert f.evidence is None and f.confidence is None
+
+
+def test_a_new_review_without_evidence_is_still_refused() -> None:
+    from vigild.contract.models import CHECKLIST, ReviewOutput
+
+    doc = {"verdict": "changes", "findings": [BASE], "checklist": {c: True for c in CHECKLIST}}
+    with pytest.raises(ValidationError) as e:
+        ReviewOutput.model_validate(doc)
+    assert "evidence" in str(e.value)

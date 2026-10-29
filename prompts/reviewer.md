@@ -21,5 +21,9 @@ End with structured output: `{"verdict": "clean" | "changes", "findings": [{"sev
 fix it. Every finding also carries `evidence`: `kind` is `test` (ref: a test id),
 `diff_line` (ref: `path:line`), `spec_criterion` (ref: an AC id such as `AC3`) or
 `runtime_log` (ref: a log excerpt id), and `confidence` is a number from 0 to 1. A finding
-with no evidence, or a ref that does not fit its kind, makes the whole review invalid. `clean` means zero findings of severity
-medium or higher. Answer every checklist item. An answer without the checklist fails.
+with no evidence, or a ref that does not fit its kind, makes the whole review invalid.
+`confidence` is your probability that the finding is real and would change the merge
+decision. Example finding:
+`{"severity": "medium", "file": "vigild/a.py", "line": 12, "claim": "AC2's bound is not
+tested", "fix": "add the 13-case test", "evidence": {"kind": "spec_criterion", "ref":
+"AC2"}, "confidence": 0.8}`. `clean` means zero findings of severity medium or higher. Answer every checklist item. An answer without the checklist fails.
