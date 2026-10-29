@@ -87,7 +87,10 @@ def test_a_plain_replan_at_attempt_two_starts_fresh_too(world: World) -> None:
 
 
 def _errors(w: World, job: str) -> list[object]:
-    return w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='vigild_error'", (job,))
+    """The runner's `vigild_error` pages for the job (it pages; it writes no such event)."""
+    return [
+        i for i in w.store.list_inbox() if i.job_id == job and i.body.get("kind") == "vigild_error"
+    ]
 
 
 def test_a_review_rounds_page_replans_and_names_its_task(world: World) -> None:
