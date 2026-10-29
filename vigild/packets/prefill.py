@@ -229,14 +229,14 @@ def compute_prefill(
     pre.pinned_paths = [c for c in pre.candidates if in_scope(c, policy.ladder_pinned_paths)]
 
     tracked = _files(repo)
-    py, tree = load_py(repo) if any(c.endswith(".py") for c in pre.candidates) else ({}, None)
+    py = load_py(repo) if any(c.endswith(".py") for c in pre.candidates) else {}
     tests: list[str] = []
     for c in pre.candidates:
         name = c.rsplit("/", 1)[-1]
         if is_test_file(name):
             tests.append(c)
         elif c.endswith(".py"):  # the import graph (#107)
-            tests += related_tests(py, [c], tree=tree)[:MAX_TESTS_PER_STEM]
+            tests += related_tests(py, [c])[:MAX_TESTS_PER_STEM]
             pre.related = True
         elif (stem := name.split(".")[0]) != "__init__":  # non-Python: the name heuristic
             found = [

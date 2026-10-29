@@ -182,8 +182,8 @@ def _context_pack(
             related.update(str(t.relative_to(repo)) for t in found[:3])
     py_files = [f for f in files if "*" not in f and f.endswith(".py")]
     if py_files:
-        py, tree = load_py(repo)
-        related.update(related_tests(py, py_files, tree=tree)[:MAX_RELATED])
+        py = load_py(repo)
+        related.update(related_tests(py, py_files)[:MAX_RELATED])
     for rel in sorted(related - set(files)):
         body = _read(repo, rel)
         if body is not None:

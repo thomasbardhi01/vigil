@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from vigild.packets.assemble import _context_pack
-from vigild.packets.related_tests import BLIND_SPOTS, read_py, related_tests
+from vigild.packets.related_tests import BLIND_SPOTS, load_py, read_py, related_tests
 
 FILES = {
     "pkg/__init__.py": "",
@@ -92,3 +92,48 @@ def test_this_repo_budget_has_direct_and_indirect_tests() -> None:
         p for p in got if "import vigild.budget" in files[p] or "vigild.budget import" in files[p]
     }
     assert set(got) - direct  # at least one test reaches budget through another module
+
+
+def test_a_from_import_of_a_submodule_skips_the_package_init() -> None:
+    files = {
+        "p/__init__.py": "from p import fsm\n",
+        "p/fsm.py": "X = 1\n",
+        "p/decisions.py": "Y = 1\n",
+        "tests/test_fsm.py": "from p import fsm\n",
+        "tests/test_dec.py": "from p import decisions\n",
+        "tests/test_pkg.py": "import p\n",
+    }
+    got = related_tests(files, ["p/fsm.py"])
+    assert "tests/test_fsm.py" in got
+    assert "tests/test_dec.py" not in got
+    assert "tests/test_pkg.py" in related_tests(files, ["p/__init__.py"])  # init still fans out
+
+
+def test_name_matches_rank_first_then_files_reached() -> None:
+    files = {
+        "a.py": "",
+        "b.py": "import a\n",
+        "tests/test_aaa_first.py": "import b\n",
+        "tests/test_both.py": "import a\nimport c\n",
+        "c.py": "",
+        "tests/test_a.py": "import b\n",
+        "tests/test_one.py": "import a\n",
+    }
+    assert related_tests(files, ["a.py"])[0] == "tests/test_a.py"
+    got = related_tests(files, ["a.py", "c.py"])
+    assert got.index("tests/test_both.py") < got.index("tests/test_one.py")
+
+
+def test_a_changed_import_gives_a_fresh_graph() -> None:
+    files = {"m.py": "", "tests/test_x.py": "import m\n"}
+    assert related_tests(files, ["m.py"]) == ["tests/test_x.py"]
+    files = {**files, "tests/test_x.py": "import other\n"}
+    assert related_tests(files, ["m.py"]) == []
+
+
+def test_the_real_repo_ranks_the_obvious_tests_first() -> None:
+    py = load_py(Path(__file__).resolve().parents[2])
+    assert {"tests/test_budget.py", "tests/jobs/test_budget_queue.py"} <= set(
+        related_tests(py, ["vigild/budget.py"])[:3]
+    )
+    assert "tests/test_verifier.py" in related_tests(py, ["vigild/verifier.py"])[:3]
