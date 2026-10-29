@@ -207,3 +207,16 @@ def test_a_log_over_4000_characters_keeps_the_newest_lines_and_notes_the_drop(wo
         Provenance.CLAUDE.value,
         Provenance.HUMAN.value,
     }
+
+
+def test_a_version_holding_any_coord_line_is_claude_and_a_vigild_only_log_is_human(
+    world: World,
+) -> None:
+    w = world
+    job = _request(w)
+    decisions.add(w.store, job, "vigild", "gate", "only vigild so far")
+    assert w.store.get_artifact(job, NAME).provenance == Provenance.HUMAN.value  # type: ignore[union-attr]
+    decisions.ingest_coord(w.store, job, _line("a coord line"))
+    assert w.store.get_artifact(job, NAME).provenance == Provenance.CLAUDE.value  # type: ignore[union-attr]
+    decisions.add(w.store, job, "vigild", "replan", "after the coord")
+    assert w.store.get_artifact(job, NAME).provenance == Provenance.CLAUDE.value  # type: ignore[union-attr]

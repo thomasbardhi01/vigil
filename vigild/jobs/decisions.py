@@ -28,14 +28,18 @@ def _render(line: DecisionLine) -> str:
     return json.dumps(line.model_dump(), sort_keys=True)
 
 
-def _append(store: Store, job_id: str, new: list[DecisionLine], provenance: Provenance) -> None:
+def _append(store: Store, job_id: str, new: list[DecisionLine]) -> None:
+    """A new version: the old text unchanged plus the new lines. Its provenance is
+    `claude` if any line in it, old or new, is the coord's, else `human`."""
     if not new:
         return
     art = store.get_artifact(job_id, NAME)
     old = art.content if art is not None else ""
     if old and not old.endswith("\n"):
         old += "\n"
-    store.add_artifact(job_id, NAME, old + "".join(_render(x) + "\n" for x in new), provenance)
+    content = old + "".join(_render(x) + "\n" for x in new)
+    by_coord = any(json.loads(r)["by"] == "coord" for r in content.splitlines() if r.strip())
+    store.add_artifact(job_id, NAME, content, Provenance.CLAUDE if by_coord else Provenance.HUMAN)
 
 
 def add(store: Store, job_id: str, by: Literal["coord", "vigild"], kind: str, text: str) -> None:
@@ -46,7 +50,7 @@ def add(store: Store, job_id: str, by: Literal["coord", "vigild"], kind: str, te
         kind=kind,
         text=str(redact(text))[:300],
     )
-    _append(store, job_id, [line], Provenance.HUMAN)
+    _append(store, job_id, [line])
 
 
 def ingest_coord(store: Store, job_id: str, raw: str) -> tuple[int, int]:
@@ -67,8 +71,8 @@ def ingest_coord(store: Store, job_id: str, raw: str) -> tuple[int, int]:
         except ValueError, ValidationError:
             dropped += 1
             continue
-        kept.append(line.model_copy(update={"text": redact(line.text), "kind": line.kind}))
-    _append(store, job_id, kept, Provenance.CLAUDE)
+        kept.append(line.model_copy(update={"text": redact(line.text)}))
+    _append(store, job_id, kept)
     return len(kept), dropped
 
 
