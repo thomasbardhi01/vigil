@@ -1835,6 +1835,8 @@ def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
             **doc["workers"][1],
             "task_id": f"{job}-w3",
             "goal": "third",
+            "why": "extra doc",  # an extra worker, answering for no AC (#136)
+            "done_when": "the extra doc holds",
             "test_cmd": "pytest -q tests/test_extra.py",
             "files_in_scope": ["docs/extra.md", "tests/test_extra.py"],
         }
