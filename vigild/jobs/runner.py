@@ -2570,6 +2570,8 @@ class JobRunner:
         """Why a worker session can't start for this task: what is left of its cap can't
         afford one call at the gateway's floor. A budget outcome, not a repo failure."""
         left = self.remaining(task_id)[2]
+        if left < MIN_RETRY_USD:
+            return None  # the task's own cap is spent: the per-task cap breaker's page, as before
         floor = self.call_floor_usd(task_id)
         if left >= floor:
             return None
