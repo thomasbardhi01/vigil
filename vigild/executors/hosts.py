@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -218,6 +218,31 @@ class HostExecutor:
             p = self._where.get(session_id)
         if p is not None:
             self.hosts.runtime(p).stop(session_id)
+
+    def _kill_runtimes(self) -> list[Any]:
+        """Every runtime a kill must reach: the local host's, and any other host a session
+        was placed on."""
+        local = self.hosts.runtime(Placement(self.hosts.cfg.sandbox_hosts.local))
+        with self.hosts._lock:
+            others = [r for r in self.hosts._runtimes.values() if r is not local]
+        return [local, *others]
+
+    def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
+        """Kill a job's containers on every host (kill, #52; `DockerRuntime.stop_job`)."""
+        sids = list(session_ids)
+        return sum(int(r.stop_job(job_id, sids)) for r in self._kill_runtimes())
+
+    def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, Any]:
+        """Remove a job's containers and networks on every host and say which are still
+        there (kill, #52; `DockerRuntime.purge_job`)."""
+        sids = list(session_ids)
+        out: dict[str, Any] = {"containers": 0, "networks": 0, "failed": []}
+        for r in self._kill_runtimes():
+            one = r.purge_job(job_id, sids)
+            out["containers"] += one["containers"]
+            out["networks"] += one["networks"]
+            out["failed"] += one["failed"]
+        return out
 
     def run_deps(
         self, image: str, work: Any, command: str, timeout_s: int = 900

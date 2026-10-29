@@ -648,6 +648,8 @@ class DockerRuntime:
         self.cfg = cfg
         self.client = client or docker.from_env()
         self.host = host or cfg.sandbox_hosts.local
+        self._killed: dict[str, set[str]] = {}  # job -> containers its kill stopped
+        self._killed_lock = threading.Lock()
 
     @contextmanager
     def _network(self, spec: SessionSpec, on_event: EventSink) -> Iterator[str]:
@@ -770,29 +772,49 @@ class DockerRuntime:
         """Kill every running container of a job (kill, #52): its sessions' and
         sidecars', its verifier's, probes' and deps builds'. Found by vigil's labels
         only. The sessions' own `run` then sees the exit and cleans up; `purge_job`
-        removes what is left."""
+        removes what is left and counts these too, though `run` got to them first."""
         sids = set(session_ids)
         n = 0
         for c in self.client.containers.list(filters={"label": LABEL}):
             if self._of_job(c.labels or {}, job_id, sids):
+                with self._killed_lock:
+                    self._killed.setdefault(job_id, set()).add(str(c.name))
                 with contextlib.suppress(Exception):  # it may have exited already
                     c.kill()
                     n += 1
+        for net in self.client.networks.list(filters={"label": LABEL}):
+            if self._of_job((getattr(net, "attrs", None) or {}).get("Labels") or {}, job_id, sids):
+                with self._killed_lock:  # `run` may remove it before the purge does
+                    self._killed.setdefault(job_id, set()).add(f"net:{net.name}")
         return n
 
-    def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, int]:
+    def _job_names(self, job_id: str, sids: set[str]) -> set[str]:
+        return {
+            str(c.name)
+            for c in self.client.containers.list(all=True, filters={"label": LABEL})
+            if self._of_job(c.labels or {}, job_id, sids)
+        }
+
+    def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, Any]:
         """Remove every container and network of a job that is still there, by vigil's
-        labels only (kill, #52). Never touches another job's, nor anything unlabelled."""
+        labels only (kill, #52), then look again: `failed` names each container or
+        network that is still there. `containers` counts the ones this kill took down,
+        including those `run`'s own cleanup removed first. Never touches another job's,
+        nor anything unlabelled."""
         sids = set(session_ids)
-        out = {"containers": 0, "networks": 0}
+        with self._killed_lock:
+            killed = self._killed.pop(job_id, set())
+        seen = {n for n in killed if not n.startswith("net:")}
+        seen_nets = {n[4:] for n in killed if n.startswith("net:")}
         for c in self.client.containers.list(all=True, filters={"label": LABEL}):
             if self._of_job(c.labels or {}, job_id, sids):
+                seen.add(str(c.name))
                 with contextlib.suppress(Exception):
                     c.remove(force=True)
-                    out["containers"] += 1
         for net in self.client.networks.list(filters={"label": LABEL}):
             labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
             if self._of_job(labels, job_id, sids):
+                seen_nets.add(str(net.name))
                 with contextlib.suppress(Exception):
                     net.reload()
                     # the shared collector is attached to every session network
@@ -800,8 +822,17 @@ class DockerRuntime:
                         with contextlib.suppress(Exception):
                             net.disconnect(cid, force=True)
                     net.remove()
-                    out["networks"] += 1
-        return out
+        left = self._job_names(job_id, sids)
+        net_left = {
+            str(n.name)
+            for n in self.client.networks.list(filters={"label": LABEL})
+            if str(n.name) in seen_nets
+        }
+        return {
+            "containers": len(seen - left),
+            "networks": len(seen_nets - net_left),
+            "failed": sorted(left | net_left),
+        }
 
     def run_deps(
         self, image: str, work: Path, command: str, timeout_s: int = 900

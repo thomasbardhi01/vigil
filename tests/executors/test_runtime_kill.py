@@ -28,12 +28,18 @@ class Box:
         self.attrs: dict[str, Any] = {"Labels": labels, "Containers": {"collector-id": {}}}
         self.name = name
         self.log = log
+        self.home: list[Box] = []
+        self.stuck = False
 
     def kill(self) -> None:
         self.log.append(f"kill {self.name}")
 
     def remove(self, force: bool = False) -> None:
         self.log.append(f"rm {self.name}")
+        if self.stuck:
+            raise RuntimeError("device busy")
+        if self in self.home:
+            self.home.remove(self)
 
     def reload(self) -> None:
         pass
@@ -45,6 +51,8 @@ class Box:
 class Listing:
     def __init__(self, boxes: list[Box]) -> None:
         self.boxes = boxes
+        for b in boxes:
+            b.home = boxes
 
     def list(self, **kw: Any) -> list[Box]:
         key = kw["filters"]["label"]
@@ -101,7 +109,7 @@ def test_stop_job_kills_only_the_jobs_containers(cfg: Config) -> None:
 def test_purge_job_removes_only_the_jobs_containers_and_networks(cfg: Config) -> None:
     rt, log = _world(cfg)
     out = rt.purge_job("job-mine", ["s-mine"])
-    assert out == {"containers": 6, "networks": 2}
+    assert out == {"containers": 6, "networks": 2, "failed": []}
     assert sorted(x for x in log if x.startswith("rm ")) == [
         "rm deps", "rm deps-sidecar", "rm net-deps", "rm net-mine", "rm probe", "rm sidecar",
         "rm verifier", "rm worker",
@@ -113,7 +121,7 @@ def test_purge_job_removes_only_the_jobs_containers_and_networks(cfg: Config) ->
 def test_a_job_with_nothing_matches_nothing(cfg: Config) -> None:
     rt, log = _world(cfg)
     assert rt.stop_job("job-none", []) == 0
-    assert rt.purge_job("job-none", []) == {"containers": 0, "networks": 0}
+    assert rt.purge_job("job-none", []) == {"containers": 0, "networks": 0, "failed": []}
     assert log == []
 
 
@@ -143,3 +151,21 @@ def test_the_containers_a_job_starts_carry_its_label(cfg: Config, tmp_path: Path
         max_minutes=1, max_budget_usd=0.1,
     )  # fmt: skip
     assert proxy_kwargs(cfg, spec)["labels"][JOB_LABEL] == "job-7"
+
+
+def test_purge_counts_what_the_kill_stopped_though_run_removed_it_first(cfg: Config) -> None:
+    rt, _log = _world(cfg)
+    rt.stop_job("job-mine", ["s-mine"])
+    for b in rt.client.containers.boxes[:]:
+        if b.name in ("worker", "sidecar"):
+            b.remove()  # the session's own `run` cleaning up after the kill
+    out = rt.purge_job("job-mine", ["s-mine"])
+    assert out["containers"] == 6 and out["failed"] == []
+
+
+def test_a_container_that_will_not_go_is_named(cfg: Config) -> None:
+    rt, _log = _world(cfg)
+    (sidecar,) = [b for b in rt.client.containers.boxes if b.name == "sidecar"]
+    sidecar.stuck = True
+    out = rt.purge_job("job-mine", ["s-mine"])
+    assert out["failed"] == ["sidecar"] and out["containers"] == 5
