@@ -78,6 +78,15 @@ class HarnessRefused(Exception):
     """The work tree can't be committed safely; the session fails closed."""
 
 
+class AgentFailed(Exception):
+    """The agent's CLI exited or the SDK raised; carries the tail of the CLI's
+    stderr (#121)."""
+
+    def __init__(self, message: str, stderr_tail: str) -> None:
+        super().__init__(message)
+        self.stderr_tail = stderr_tail
+
+
 def redact(value: Any, token: str = "") -> Any:
     if isinstance(value, str):
         if token:
@@ -471,7 +480,24 @@ def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
     return opts
 
 
+def stderr_bytes(lines: collections.deque[str]) -> str:
+    return "".join(lines).encode()[-2000:].decode(errors="ignore")
+
+
 async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
+    """The session's agent loop. A CLI that exits non-zero (the SDK's ProcessError) or
+    any other failure of the loop raises AgentFailed with the last 2,000 bytes of the
+    CLI's stderr (#121)."""
+    stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
+    try:
+        return await _agent_loop(packet, role, token, stderr_tail)
+    except Exception as e:
+        raise AgentFailed(f"{type(e).__name__}: {e}"[:500], stderr_bytes(stderr_tail)) from e
+
+
+async def _agent_loop(
+    packet: str, role: str, token: str, stderr_tail: collections.deque[str]
+) -> dict[str, Any]:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -484,7 +510,6 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     )
 
     required = os.environ.get("VIGIL_REQUIRE_PLUGIN", "guard")
-    stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
     options = ClaudeAgentOptions(**agent_options(role, token, stderr_tail.append))
     result: dict[str, Any] = {"plugins": [], "denials": [], "tool_calls": 0}
     turns = 0
@@ -577,7 +602,7 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
                 text = json.dumps(msg.structured_output)
                 if len(text) <= MAX_STRUCTURED:
                     result["structured_output"] = msg.structured_output
-    result["cli_stderr_tail"] = "".join(stderr_tail)[-2000:]
+    result["cli_stderr_tail"] = stderr_bytes(stderr_tail)
     return result
 
 
@@ -610,6 +635,12 @@ def main() -> int:
         agent = asyncio.run(run_agent(packet, role, token))
     except SystemExit:
         raise
+    except AgentFailed as e:
+        emit(
+            "vigil_result",
+            redact({"status": "failed", "error": str(e), "cli_stderr_tail": e.stderr_tail}, token),
+        )
+        return 4
     except Exception as e:  # report, don't hide
         emit("vigil_result", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500]})
         return 4

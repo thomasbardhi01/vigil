@@ -75,7 +75,13 @@ from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_too
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.executors.hosts import HostRefused
 from vigild.executors.runtime import job_scope
-from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
+from vigild.gateway.service import (
+    CHARS_PER_TOKEN,
+    MIN_OUTPUT_TOKENS,
+    TOKEN_TTL_MARGIN_MIN,
+    Gateway,
+    worst_case_usd,
+)
 from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
@@ -103,6 +109,7 @@ from vigild.jobs.integrity import Finding, finding_id
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
+from vigild.metering.prices import PriceTable
 from vigild.packets.assemble import (
     COORD_PACKETS,
     assemble_audit,
@@ -2371,9 +2378,12 @@ class JobRunner:
                     admitted.append(tid)
                 if not admitted:
                     return {}
-                retrying = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                # no session, and no reservation, for a task that can't afford one call (#121)
+                broke = {t: w for t in admitted if (w := self.out_of_cap(t))}
+                startable = [t for t in admitted if t not in broke]
+                retrying = [t for t in startable if self.store.get_task(t).state == "failed"]
                 try:
-                    held = self._reserve_wave(job_id, admitted)
+                    held = self._reserve_wave(job_id, startable)
                 except Refused:
                     return None
                 for tid in admitted:
@@ -2396,7 +2406,7 @@ class JobRunner:
                     if t.tier and t.tier_reason and t.backend_preset:  # it ran: it was routed
                         self.store.route_task(tid, tier=t.tier, tier_reason=t.tier_reason,
                                               backend_preset=t.backend_preset)  # fmt: skip
-                for tid in admitted:
+                for tid in startable:
                     self.store.update_task(tid, state="failed" if tid in retrying else "waiting")
                     self._queue_leave(self._queue_key(job_id, "worker", tid))  # no thread will wait
                 self._block(job_id, f"routing: {e}")
@@ -2410,7 +2420,9 @@ class JobRunner:
             # a worker the day had no room for waits in its own thread (the budget
             # queue), so the others run and free the money
             return {
-                tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
+                tid: functools.partial(self._out_of_cap_fail, job_id, tid, broke[tid])
+                if tid in broke
+                else functools.partial(self._run_worker, job_id, tid, *held[tid])
                 if tid in held
                 else functools.partial(self._run_queued_worker, job_id, tid)
                 for tid in admitted
@@ -2554,6 +2566,56 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def call_floor_usd(self, task_id: str) -> float:
+        """The least one call costs the gateway's way (#121): its own worst-case arithmetic
+        at its output floor (`MIN_OUTPUT_TOKENS`), over the smallest input any call of
+        this task has had (none yet: no input). 0 for a task with no priced model."""
+        t = self.store.get_task(task_id)
+        if t.contract.get("shape") == "deps":
+            return 0.0
+        model = self.cfg.preset(t.backend_preset or self.cfg.routing.fallback).model or ""
+        prices = PriceTable(self.cfg.prices)
+        if not prices.has(model):
+            return 0.0
+        (row,) = self.store.q(
+            "SELECT MIN(tokens_in + tokens_cache_read + tokens_cache_write_5m"
+            " + tokens_cache_write_1h) AS n FROM model_calls WHERE task_id=?"
+            " AND tokens_in + tokens_cache_read + tokens_cache_write_5m"
+            " + tokens_cache_write_1h > 0",
+            (task_id,),
+        )
+        raw_len = int(row["n"] or 0) * CHARS_PER_TOKEN
+        return worst_case_usd(prices, model, raw_len, MIN_OUTPUT_TOKENS)
+
+    def out_of_cap(self, task_id: str) -> str | None:
+        """Why a worker session can't start for this task: what is left of its cap can't
+        afford one call at the gateway's floor. A budget outcome, not a repo failure."""
+        left = self.remaining(task_id)[2]
+        if left < MIN_RETRY_USD:
+            return None  # the task's own cap is spent: the per-task cap breaker's page, as before
+        floor = self.call_floor_usd(task_id)
+        if left >= floor:
+            return None
+        return (
+            f"out of cap: ${left:.2f} left, under the floor for one call (${floor:.2f}); "
+            "replan to give a fresh worker its own cap"
+        )
+
+    def _out_of_cap_fail(self, job_id: str, task_id: str, why: str) -> bool:
+        """No container, no session, no reservation: the task fails with the reason."""
+        return self._fail(
+            job_id, None, task_id, f"{task_id}: out of cap", {"error": why, "out_of_cap": True}
+        )
+
+    def _cli_stderr(self, out: ExecOutcome) -> str:
+        """The last 2,000 bytes of the worker CLI's stderr, redacted (#121). Untrusted
+        text: a packet takes it only through `packets.fence()`."""
+        raw = out.result.get("cli_stderr_tail")
+        if not raw and out.exit_code not in (0, None):
+            raw = out.error  # no result line: the container's own stderr tail
+        text = str(redact(str(raw or "")))
+        return text.encode()[-2000:].decode(errors="ignore")
+
     def _overlap(
         self, repo: str, contract: dict[str, Any], ac_runs: list[tuple[str, list[str]]]
     ) -> list[str]:
@@ -2649,7 +2711,16 @@ class JobRunner:
             if self.store.get_task(tid).state != "escalated":
                 lefts.append(left)
         # retry is offered while every task it would run has budget left
-        can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
+        broke = [tid for tid, t in tasks.items() if t.get("out_of_cap")]
+        can_retry = (
+            bool(lefts)
+            and all(x >= MIN_RETRY_USD for x in lefts)
+            and not any(
+                self.out_of_cap(tid)
+                for tid in task_ids
+                if self.store.get_task(tid).state != "escalated"
+            )
+        )  # a retry that can't make one call isn't offered (#121)
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
             # item 5: a child deps job; this job resumes on its own when it merges
@@ -2676,7 +2747,8 @@ class JobRunner:
             )
             return
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
-        self.job_failed(self.store.get_job(job_id))
+        if len(broke) < len(task_ids):  # all out of cap: a budget outcome, not a repo failure
+            self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
             job_id,
@@ -3056,6 +3128,9 @@ class JobRunner:
         if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
             self._close_killed(job_id)
             return False
+        cli_stderr = self._cli_stderr(out) if out.status != "done" else ""
+        if cli_stderr:
+            self.store.update_session(s.id, detail={"cli_stderr_tail": cli_stderr})
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
             self.store.update_session(
@@ -3070,6 +3145,8 @@ class JobRunner:
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
             )  # fmt: skip
             if self._resumable(task_id):
+                if (why := self.out_of_cap(task_id)) is not None:
+                    return self._out_of_cap_fail(job_id, task_id, why)
                 _, _, left = self.remaining(task_id)
                 try:
                     rid = self.budget.reserve(
@@ -3101,8 +3178,8 @@ class JobRunner:
                 s,
                 task_id,
                 f"{task_id}: worker session {out.status}",
-                {"error": out.error or ""},
-            )
+                {"error": out.error or "", "cli_stderr_tail": cli_stderr},
+            )  # fmt: skip
         if not self.store.q("SELECT 1 FROM model_calls WHERE session_id=? LIMIT 1", (s.id,)):
             # no work, never green (#102): the gateway metered nothing for this session
             return self._fail(
