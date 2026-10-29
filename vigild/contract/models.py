@@ -306,12 +306,48 @@ CHECKLIST = (
 )
 
 
+EvidenceKind = Literal["test", "diff_line", "spec_criterion", "runtime_log"]
+_DIFF_LINE = re.compile(r"^\S.*:L?\d+(-L?\d+)?$")  # path:12, path:L12, path:12-20
+_AC_ID = re.compile(r"^AC[-\s]?(\d+)$", re.IGNORECASE)  # AC3, AC-3, ac3, AC 3
+
+
+class Evidence(Strict):
+    """What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,
+    `path:line`, an AC id (`AC3`) or a log excerpt id."""
+
+    kind: EvidenceKind
+    ref: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _locator(self) -> Evidence:
+        if not self.ref.strip():
+            raise ValueError("evidence ref is empty")
+        if self.kind == "diff_line" and not _DIFF_LINE.match(self.ref):
+            raise ValueError("a diff_line evidence ref must look like path:line")
+        if self.kind == "spec_criterion":
+            m = _AC_ID.match(self.ref.strip())
+            if m is None:
+                raise ValueError("a spec_criterion evidence ref must be an AC id like AC3")
+            self.ref = f"AC{m.group(1)}"
+        return self
+
+
 class Finding(Strict):
     severity: Severity
     file: str = Field(min_length=1, max_length=500)
     line: int | None = Field(default=None, ge=0)
     claim: str = Field(min_length=1, max_length=4000)
     fix: str = Field(min_length=1, max_length=4000)
+    evidence: Evidence
+    confidence: float = Field(ge=0, le=1)
+
+
+class StoredFinding(Finding):
+    """A finding as read back from a stored artifact: one written before #105 has no evidence
+    or confidence. New model output is parsed with `Finding`, never this."""
+
+    evidence: Evidence | None = None  # type: ignore[assignment]
+    confidence: float | None = Field(default=None, ge=0, le=1)  # type: ignore[assignment]
 
 
 class Checklist(Strict):
@@ -364,6 +400,10 @@ class AuditFinding(Finding):
     matched: int | None = Field(default=None, ge=0)
 
 
+class StoredAuditFinding(StoredFinding):
+    matched: int | None = Field(default=None, ge=0)
+
+
 class AuditOutput(Strict):
     """What an auditor session ends with: its own independent findings, each
     matched (or not) to the reviewer's, and the reviewer's findings it judges
@@ -395,3 +435,25 @@ class Audit(AuditOutput):
         if not counted:
             return 1.0
         return sum(1 for f in counted if f.matched is not None) / len(counted)
+
+
+class DecisionLine(Strict):
+    """One line of a job's `decisions.jsonl` (ADR-0005 part 4). `by` says who wrote it;
+    vigild sets it, whatever the coord's file says."""
+
+    ts: str
+    by: Literal["coord", "vigild"]
+    kind: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
+    text: Annotated[str, Field(max_length=300)]
+
+
+class StoredReview(Review):
+    """review.json read back from the store (lenient: see `StoredFinding`)."""
+
+    findings: list[StoredFinding] = Field(max_length=100)  # type: ignore[assignment]
+
+
+class StoredAudit(Audit):
+    """audit.json read back from the store (lenient: see `StoredFinding`)."""
+
+    findings: list[StoredAuditFinding] = Field(max_length=100)  # type: ignore[assignment]

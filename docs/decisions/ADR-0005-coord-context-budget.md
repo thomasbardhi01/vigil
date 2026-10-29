@@ -86,14 +86,17 @@ The single `coord: claude-opus` becomes rules, top to bottom, first match wins. 
   - **Each line:** `{ts, by: coord|vigild, kind, text}`, with `text` of at most 300 characters.
   - **Checks:** vigild validates each line against a pydantic model and runs it through `redact`.
   - **Use:** every later session of the job (replan coord, worker, fix round, reviewer) gets it in its packet, fenced as data.
+- **Built:** `decisions.jsonl`; the Explore subagent waits for the owner's gateway read. vigild appends `gate`, `replan` and `escalation` lines itself, the auditor gets no log, and the packet section is capped at 4,000 characters, oldest lines dropped with a note (`vigild/jobs/decisions.py`).
 
 ### 5. vigild pre-fills the mechanical parts
 Before the coord runs, vigild computes these and writes them into the spec and plan skeleton the coord receives:
 - runner files, money paths and pinned paths;
-- the scope rules: exact files only, and each worker's scope inside spec.md's files in scope;
+- the scope rules: exact files or `dir/**` (never a bare directory, as the gate requires), and each worker's scope inside spec.md's files in scope;
 - `test_cmd` candidates: the repo's `dev_suites` and the test files that match the scope.
 
 The coord writes the goal, the acceptance criteria and the risks. The spec gate is unchanged: it still checks everything, including what vigild filled in.
+
+**Built** (`vigild/packets/prefill.py`, 2026-10-28): candidates are the router's `request_paths` over the title, request, notes and issue, kept if the file exists at `base_sha`; runner files by `runner_overlap` over the repo's `runner_config`, money paths by guard's `matches`, pinned paths by strict `in_scope`. All packets carry a fenced `prefill` part; a first draft also gets a skeleton `spec.md` and `plan.md` in its clone. A path whose every mention sits in a sentence that rules it out (starts with Not, or says out of scope, not, never or don't touch before the path) goes to `## Files out of scope`, not the candidates. A replan, an amendment and a retry after a gate refusal get the part but no skeleton, so the coord never starts over a spec it already has.
 
 ### 6. Compaction thresholds in the executor image
 CLI 2.1.306 was checked, by reading its binary in `vigil-session/vigil:4abf8a55`.
