@@ -154,6 +154,20 @@ class ReviewInputs:
 
 # the draft PR title of a runner-file task while hidden tests are off (host policy)
 OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
+PR_TITLE_MAX = 200  # GitHub refuses a title over 256 characters (422)
+
+
+def pr_title(job_id: str, goal: str) -> str:
+    """`[vigil <job>] ` and the goal's first line, cut at a word to fit: a replan's goal
+    can run to thousands of characters (vi-0008, 2026-10-29)."""
+    prefix = f"[vigil {job_id}] "
+    first = (goal.strip().splitlines() or [""])[0].strip()
+    room = PR_TITLE_MAX - len(prefix)
+    if len(first) > room:
+        first = first[: room - 1].rsplit(" ", 1)[0].rstrip(" ,;:.") + "…"
+    return prefix + first
+
+
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
@@ -3252,7 +3266,7 @@ class JobRunner:
                 title=(
                     OWNER_REVIEW_TITLE
                     if overlap and not hidden_on
-                    else f"[vigil {job_id}] {contract['spec']['goal']}"
+                    else pr_title(job_id, contract["spec"]["goal"])
                 ),
                 body=body,
                 scope=[
