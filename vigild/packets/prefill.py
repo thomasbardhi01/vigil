@@ -26,6 +26,7 @@ from vigild.config import RepoPolicy
 from vigild.gitsafe import GitError, git
 from vigild.intake.paths import in_scope, matches_any, scope_entry_error
 from vigild.packets.fence import fence
+from vigild.packets.related_tests import BLIND_SPOTS, is_test_file, load_py, related_tests
 from vigild.router.rules import request_paths
 from vigild.verifier import runner_class
 
@@ -63,6 +64,7 @@ class Prefill:
     out_of_scope: list[str] = field(default_factory=list)
     test_cmds: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    related: bool = False  # test_cmds include import-graph tests
 
     def body(self) -> str:
         def lines(title: str, items: Sequence[str]) -> str:
@@ -76,6 +78,8 @@ class Prefill:
             lines("test_cmd candidates", [f"`{c}`" for c in self.test_cmds]),
             lines("Named as out of scope (by the request)", [f"`{c}`" for c in self.out_of_scope]),
         ]
+        if self.related:
+            parts.append(f"Blind spots of the related tests: {BLIND_SPOTS}")
         if self.dropped:
             parts.append(lines("Dropped", self.dropped))
         return "\n\n".join(parts)
@@ -164,11 +168,8 @@ def _is_file(repo: Path, rel: str) -> bool:
 
 
 def _test_patterns(stem: str) -> list[str]:
+    """The name heuristic, kept for non-Python files (TS and the like)."""
     return [f"test_{stem}*.py", f"{stem}_test.py", f"{stem}.test.*", f"{stem}.spec.*"]
-
-
-def _is_test_file(name: str) -> bool:
-    return bool(re.match(r"(test_.*\.py|.*_test\.py|.*\.(test|spec)\.\w+)$", name))
 
 
 def _command(policy: RepoPolicy, path: str) -> str | None:
@@ -228,21 +229,22 @@ def compute_prefill(
     pre.pinned_paths = [c for c in pre.candidates if in_scope(c, policy.ladder_pinned_paths)]
 
     tracked = _files(repo)
+    py = load_py(repo) if any(c.endswith(".py") for c in pre.candidates) else {}
     tests: list[str] = []
     for c in pre.candidates:
         name = c.rsplit("/", 1)[-1]
-        if _is_test_file(name):
+        if is_test_file(name):
             tests.append(c)
-            continue
-        stem = name.split(".")[0]
-        if stem == "__init__":
-            continue
-        found = [
-            f
-            for f in tracked
-            if any(fnmatchcase(f.rsplit("/", 1)[-1], p) for p in _test_patterns(stem))
-        ]
-        tests += sorted(found)[:MAX_TESTS_PER_STEM]
+        elif c.endswith(".py"):  # the import graph (#107)
+            tests += related_tests(py, [c])[:MAX_TESTS_PER_STEM]
+            pre.related = True
+        elif (stem := name.split(".")[0]) != "__init__":  # non-Python: the name heuristic
+            found = [
+                f
+                for f in tracked
+                if any(fnmatchcase(f.rsplit("/", 1)[-1], p) for p in _test_patterns(stem))
+            ]
+            tests += sorted(found)[:MAX_TESTS_PER_STEM]
     cmds = list(policy.dev_suites.values())
     cmds += [cmd for t in dict.fromkeys(tests) if (cmd := _command(policy, t))]
     pre.test_cmds = list(dict.fromkeys(cmds))
