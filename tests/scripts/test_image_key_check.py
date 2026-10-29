@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from vigild import config
 
@@ -98,9 +101,19 @@ def test_a_changed_claude_mods_sha_is_an_input() -> None:
     assert ik.changed_inputs(cfg, REPO, ["configs/vigild.yaml"], REPOS, REPOS, base, same) == []
 
 
-def test_the_head_export_is_readable_by_the_agent_uid(tmp_path: Path) -> None:
+def test_the_head_export_is_readable_by_the_agent_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """#123: the suites run as uid 10001 against a bind-mounted export; a 0700
-    TemporaryDirectory made `/src` unreadable to it (`cp: cannot stat '/src/.'`)."""
+    TemporaryDirectory made `/src` unreadable to it (`cp: cannot stat '/src/.'`).
+    The repo is the test's own: the dev image's export of vigil has no `.git`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("[project]\n")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@vigil.invalid"]
+    for args in (["init", "-q"], ["add", "-A"], [*ident, "commit", "-q", "-m", "x"]):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    monkeypatch.setattr(ik, "ROOT", repo)
     src = tmp_path / "src"
     src.mkdir(mode=0o700)
     ik.export_head(src)
