@@ -47,8 +47,9 @@ RULES = (
     "under `## Money paths`, and `## Money paths` lists no file the rules don't match."
 )
 KEEP = (
-    "Keep these pre-filled fields. Change one only with a reason, one line in "
-    "`spec_changelog.md`. You write the goal, the acceptance criteria and the risks."
+    "Keep the scope rules and the runner, money and pinned flags. The candidate files are a "
+    "starting point: you may narrow or widen them, and each file you add or remove gets a "
+    "line in `spec_changelog.md`. You write the goal, the acceptance criteria and the risks."
 )
 
 
@@ -58,6 +59,7 @@ class Prefill:
     runner_files: list[str] = field(default_factory=list)
     money_paths: list[str] = field(default_factory=list)
     pinned_paths: list[str] = field(default_factory=list)
+    out_of_scope: list[str] = field(default_factory=list)
     test_cmds: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
 
@@ -71,6 +73,7 @@ class Prefill:
             lines("Money paths (guard's rules)", self.money_paths),
             lines("Pinned paths (the repo's ladder_pinned_paths)", self.pinned_paths),
             lines("test_cmd candidates", [f"`{c}`" for c in self.test_cmds]),
+            lines("Named as out of scope (by the request)", [f"`{c}`" for c in self.out_of_scope]),
         ]
         if self.dropped:
             parts.append(lines("Dropped", self.dropped))
@@ -94,6 +97,7 @@ class Prefill:
     def spec_md(self, title: str = "") -> str:
         head = " ".join(title.split())[:80]
         files = "\n".join(f"- `{c}`" for c in self.candidates) or f"- {TODO}"
+        out = "\n".join(f"- `{c}`" for c in self.out_of_scope) or f"- {TODO}"
         money = "\n".join(f"- `{c}`" for c in self.money_paths) or "none"
         return (
             f"# Spec: {head or TODO}\n\n"
@@ -101,7 +105,7 @@ class Prefill:
             f"## Non-goals\n{TODO}\n\n"
             f"## Acceptance criteria\n- AC1: {TODO}\n\n"
             f"## Files in scope\n{files}\n\n"
-            f"## Files out of scope\n- {TODO}\n\n"
+            f"## Files out of scope\n{out}\n\n"
             f"## Money paths\n{money}\n\n"
             f"## Risks\n{TODO}\n\n"
             f"## Rollback\n{TODO}\n"
@@ -115,6 +119,7 @@ class Prefill:
             "done_when": TODO,
             "test_cmd": TODO,
             "files_in_scope": self.candidates,
+            "out_of_scope": self.out_of_scope,
         }
         cmds = "\n".join(f"- `{c}`" for c in self.test_cmds) or "- (none)"
         return (
@@ -123,6 +128,22 @@ class Prefill:
             f"Pick each worker's `test_cmd` from the candidates (or write your own):\n{cmds}\n\n"
             "```json\n" + json.dumps({"workers": [worker], "verify": []}, indent=1) + "\n```\n"
         )
+
+
+NEGATION = re.compile(r"\b(not|never)\b|out of scope|don.t touch", re.I)
+BOUNDARY = re.compile(r"\.(?=\s|$)|;|\n")
+
+
+def _excluded(text: str, hint: str) -> bool:
+    """Every place the text names `hint` is a sentence that rules it out: it starts with
+    Not, or says out of scope, not, never or don't touch before the path."""
+    seen = []
+    start = text.find(hint)
+    while start != -1:
+        cut = max((m.end() for m in BOUNDARY.finditer(text, 0, start)), default=0)
+        seen.append(bool(NEGATION.search(text[cut:start])))
+        start = text.find(hint, start + len(hint))
+    return bool(seen) and all(seen)
 
 
 def _files(repo: Path) -> list[str]:
@@ -184,9 +205,18 @@ def compute_prefill(
             "notes": [*(request.get("notes") or []), issue],
         }
     )
+    text = "\n".join(
+        [str(request.get("title") or ""), str(request.get("request") or "")]
+        + [str(n) for n in request.get("notes") or []]
+        + [issue]
+    )
     pre = Prefill()
     for h in hints:
         if _is_file(repo, h):
+            if _excluded(text, h):
+                if h not in pre.out_of_scope:
+                    pre.out_of_scope.append(h)
+                continue
             if h not in pre.candidates and len(pre.candidates) < MAX_CANDIDATES:
                 pre.candidates.append(h)
         elif "/" in h or h.endswith(FILE_SUFFIXES):

@@ -25,9 +25,9 @@ You plan one job. You write a spec and a plan; you never write code.
    - More than 4 workers are reviewed in waves of 4: prefer fewer unless truly parallel.
 4. With an owner's amendment section, **amend** the approved spec, never redraft it:
    change only what the note asks, re-plan `plan.md`, write `.vigil/<job>/spec_changelog.md`.
-5. Keep what the `prefill` section and the skeleton `spec.md` and `plan.md` hold (vigild computed it:
-   candidate files, scope rules, `test_cmd` candidates); change a field only with a reason, a line in
-   `spec_changelog.md`. Write the goal, criteria and risks (`TODO(coord)`) and replace every `TODO(coord)`.
+5. Keep the scope rules and the runner, money and pinned flags that `prefill` and the skeleton hold. Its
+   candidate files are a start: narrow or widen them, a line in `spec_changelog.md` for each file
+   you add or remove. Write the goal, criteria and risks (`TODO(coord)`); replace every `TODO(coord)`.
 6. Stop. vigild runs the spec gate and files your spec in the owner's inbox.
 
 Rules:

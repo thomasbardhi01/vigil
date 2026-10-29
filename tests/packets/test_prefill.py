@@ -171,3 +171,47 @@ def test_classic_lean_and_fresh_packets_all_carry_the_prefill(repo: Path) -> Non
 def test_a_packet_without_a_prefill_is_unchanged(repo: Path) -> None:
     text = assemble_coord_classic(repo, request(NAMES), untrusted={}).text
     assert "3b. Prefill" not in text and "UNTRUSTED prefill" not in text
+
+
+DW38 = Path("/Users/thomasbardhi/vigil-data/coord/dogfood/dw-38.json")
+DW38_REQUEST = {
+    "title": "Amended spec items show the worker-contract diff (#38)",
+    "request": "Compute it in vigild/jobs/ownernote.py. (3) the coord prompt keeps every field "
+    "the note doesn't name byte-identical.",
+    "notes": [
+        "One worker. files_in_scope: vigild/jobs/ownernote.py, docs/feature-map.md "
+        "(the replan row only). Not vigild/jobs/runner.py.",
+        "test_cmd: uv run pytest -q tests/jobs/test_replan_note.py",
+    ],
+}
+
+
+def test_a_path_the_request_excludes_is_out_of_scope_not_a_candidate(repo: Path) -> None:
+    (repo / "vigild/jobs/ownernote.py").write_text("Z = 1\n")
+    pre = compute_prefill(repo, DW38_REQUEST, policy=policy(), money_globs=MONEY)
+    assert "vigild/jobs/ownernote.py" in pre.candidates
+    assert pre.out_of_scope == ["vigild/jobs/runner.py"]
+    assert "vigild/jobs/runner.py" not in pre.candidates
+    spec = parse_spec(pre.spec_md("t"))
+    assert "vigild/jobs/runner.py" not in spec.files_in_scope
+    assert spec.files_out_of_scope == ["vigild/jobs/runner.py"]
+    assert '"vigild/jobs/runner.py"' not in pre.plan_md("vi-0001").split('"out_of_scope"')[0]
+    assert "Named as out of scope" in pre.body()
+
+
+def test_no_other_files_does_not_exclude_the_named_ones(repo: Path) -> None:
+    req = request("Scope: vigild/budget.py and vigild/other.py. No other files.")
+    pre = compute_prefill(repo, req, policy=policy(), money_globs=MONEY)
+    assert pre.candidates == ["vigild/budget.py", "vigild/other.py"]
+    assert pre.out_of_scope == []
+
+
+def test_the_real_dw_38_request(repo: Path) -> None:
+    import json
+
+    if not DW38.exists():
+        pytest.skip("dw-38.json is on the coordinator's machine")
+    (repo / "vigild/jobs/ownernote.py").write_text("Z = 1\n")
+    pre = compute_prefill(repo, json.loads(DW38.read_text()), policy=policy(), money_globs=MONEY)
+    assert "vigild/jobs/ownernote.py" in pre.candidates
+    assert "vigild/jobs/runner.py" in pre.out_of_scope

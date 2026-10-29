@@ -127,7 +127,9 @@ def request_paths(intake: Mapping[str, Any]) -> list[str]:
         [str(intake.get("title") or ""), str(intake.get("request") or "")]
         + [str(n) for n in intake.get("notes") or []]
     )
-    found = [m.strip(".,;:") for m in _TICKED.findall(text)] + _PATHISH.findall(text)
+    found = [m.strip(".,;:") for m in _TICKED.findall(text)] + [
+        p.rstrip(".,;:") for p in _PATHISH.findall(text)
+    ]
     for key in ("files_in_scope", "scope"):
         extra = intake.get(key)
         if isinstance(extra, list):
