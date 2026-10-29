@@ -31,8 +31,9 @@ from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import public_view
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
-from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
+from vigild.intake.spec_gate import check_job_spec, check_task
 from vigild.jobs import decisions
+from vigild.jobs.acceptance import plan_runner_class
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
@@ -43,7 +44,7 @@ from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import is_bench_repo
 from vigild.router.rules import RoutingError, route
-from vigild.verifier import runner_overlap
+from vigild.verifier import runner_class
 
 
 class Runner(Protocol):
@@ -375,10 +376,11 @@ class JobService:
         # vigild computes the runner-file class; a caller's value is replaced
         task = task.model_copy(
             update={
-                "runner_file_change": runner_overlap(
+                "runner_file_change": runner_class(
                     task.spec.files_in_scope,
                     self.cfg.repo(task.repo).runner_config,
                     task.spec.test_cmd or "",
+                    (),  # a bare task has no approved spec, so no AC commands
                 )
             }
         )
@@ -581,11 +583,11 @@ class JobService:
         if plan is None:
             return {}
         runner_config = self.cfg.repo(self.store.get_job(job_id).repo).runner_config
-        out: dict[str, list[str]] = {}
-        for w in parse_plan(plan.content).workers:
-            if hit := runner_overlap(w.files_in_scope, runner_config, w.test_cmd):
-                out[w.task_id] = hit
-        return out
+        spec = self.store.get_artifact(job_id, "spec.md")
+        classes = plan_runner_class(
+            spec.content if spec else "", parse_plan(plan.content).workers, runner_config
+        )
+        return {t: hit for t, hit in classes.items() if hit}
 
     def _hidden_frozen(self, job_id: str) -> dict[str, bool]:
         """The host switch as it is when the spec is gated: recorded in `spec_gate.json`,
@@ -770,9 +772,7 @@ class JobService:
                         "must_fail_first": w.must_fail_first,
                         "must_fail_first_reason": w.must_fail_first_reason,
                         # round 3, F1: the spec lets this worker change how tests run
-                        "changes_how_tests_run": runner_files_named(
-                            w.files_in_scope, self.cfg.repo(job.repo).runner_config, w.test_cmd
-                        ),
+                        "changes_how_tests_run": flagged.get(w.task_id, []),
                         # owner ruling, 2026-10-23: hidden tests (names and
                         # categories only) and an owner look
                         "runner_file_change": flagged.get(w.task_id, []),

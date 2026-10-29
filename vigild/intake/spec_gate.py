@@ -22,7 +22,7 @@ from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc, ac_refs
 from vigild.shellwords import Command, parse
-from vigild.verifier import ReadFile, plan_reports, runner_overlap
+from vigild.verifier import ReadFile, plan_reports, runner_class
 
 BARE_DIR = "use dir/** (a bare directory matches only itself)"
 
@@ -100,11 +100,11 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
 
 
 def runner_files_named(
-    scope: Sequence[str], runner_config: Sequence[str], test_cmd: str
+    scope: Sequence[str], runner_config: Sequence[str], test_cmd: str, ac_cmds: Sequence[str] = ()
 ) -> list[str]:
     """The literal entries in a worker's scope that decide how tests run: the
     runner-file overlap, computed by the verifier's own matcher."""
-    return runner_overlap(scope, runner_config, test_cmd)
+    return runner_class(scope, runner_config, test_cmd, ac_cmds)
 
 
 MFF_REASON_RULE = (
