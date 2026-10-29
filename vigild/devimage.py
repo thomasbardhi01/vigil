@@ -7,7 +7,8 @@ review round 2). This replaces the nightly validation of a hand-built image.
   a Linux container, each with its reason.
 - **Key:** sha256 over the Dockerfile, each lockfile's blob id at the base
   commit (from vigild's mirror), and the suites. The image is
-  `vigil-dev/<name>:<key[:16]>` (a non-production data dir: `vigil-dev-<hash8>/...`, #128). A new key is a new image.
+  `vigil-dev/<name>:<key[:16]>` (a non-production data dir: `vigil-dev-<hash8>/...`,
+  #128). A new key is a new image.
 - **Build:** the context is only the lockfiles, copied from the base commit;
   no repo source goes into the image. The build has the network; nothing after
   it does.
