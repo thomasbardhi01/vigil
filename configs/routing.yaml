@@ -22,7 +22,7 @@ coord:
   - {name: tests-docs, when: labels, labels: [tests, docs], preset: claude-sonnet}
   - {name: fix-small, when: fix, sizes: [S, M], preset: claude-sonnet}
   - {name: default, when: always, preset: claude-opus}  # the quality default
-coord_packet: classic          # classic | lean (ADR-0005 part 1): lean once the spec replay passes
+coord_packet: lean             # classic | lean (ADR-0005 part 1): lean once the spec replay passes
 reviewer: claude-sonnet
 auditor: claude-opus
 
