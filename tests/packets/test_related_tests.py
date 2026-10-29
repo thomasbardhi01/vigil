@@ -94,9 +94,9 @@ def test_this_repo_budget_has_direct_and_indirect_tests() -> None:
     assert set(got) - direct  # at least one test reaches budget through another module
 
 
-def test_a_from_import_of_a_submodule_skips_the_package_init() -> None:
+def test_a_from_import_of_a_submodule_links_the_submodule_not_its_siblings() -> None:
     files = {
-        "p/__init__.py": "from p import fsm\n",
+        "p/__init__.py": "",
         "p/fsm.py": "X = 1\n",
         "p/decisions.py": "Y = 1\n",
         "tests/test_fsm.py": "from p import fsm\n",
@@ -105,8 +105,11 @@ def test_a_from_import_of_a_submodule_skips_the_package_init() -> None:
     }
     got = related_tests(files, ["p/fsm.py"])
     assert "tests/test_fsm.py" in got
-    assert "tests/test_dec.py" not in got
-    assert "tests/test_pkg.py" in related_tests(files, ["p/__init__.py"])  # init still fans out
+    assert "tests/test_dec.py" not in got  # a sibling submodule's importer is not related
+    # #107: `from p import decisions` runs p/__init__.py, so an __init__ change reaches
+    # every importer of the package, submodule importers included
+    init = related_tests(files, ["p/__init__.py"])
+    assert {"tests/test_pkg.py", "tests/test_dec.py", "tests/test_fsm.py"} <= set(init)
 
 
 def test_name_matches_rank_first_then_files_reached() -> None:

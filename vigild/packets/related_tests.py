@@ -79,14 +79,13 @@ def _imports(path: str, text: str, modules: Mapping[str, str]) -> set[str]:
                 if node.level - 1 > len(pkg.split(".") if pkg else []):
                     continue
                 base = ".".join([*up, *([base] if base else [])])
-            # `from pkg import x` with `x` a submodule links x, not pkg/__init__.py
-            # (else a change to any module reaches every importer of the package).
-            # Only the package root is resolved: `from ... import y` beyond it,
-            # or a relative import above the root, silently links nothing.
+            # `from pkg import x` with `x` a submodule links x itself as well as pkg's
+            # __init__ chain (importing it runs pkg/__init__.py, so an __init__ change
+            # reaches it, #107); a sibling submodule is reached only if the __init__
+            # imports it. Only the package root is resolved: `from ... import y` beyond
+            # it, or a relative import above the root, silently links nothing.
             subs = [f"{base}.{a.name}" if base else a.name for a in node.names]
-            rest = [n for n in subs if n not in modules]
-            if rest or not node.names:
-                names.append(base)
+            names.append(base)
             deps.update(modules[n] for n in subs if n in modules)
     for name in names:
         parts = name.split(".")
