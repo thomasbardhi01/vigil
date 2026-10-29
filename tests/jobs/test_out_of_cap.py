@@ -115,7 +115,22 @@ def test_a_fix_round_on_the_dregs_does_the_same(world: World) -> None:
     before = _failures(w)
 
     r = _fix(w, item["id"], task_id=task, findings=["audit:0"])
-    assert r.status_code == 200, r.text
+    if r.status_code != 200:  # diagnostic (CI-only 409 on #162): say what the task holds
+        from vigild.jobs.fixfindings import selectable
+
+        arts = {
+            n: (a.content[:300] if (a := w.store.get_artifact(job, n, task)) else None)
+            for n in ("review.json", "audit.json")
+        }
+        evs = [
+            (e["type"], e["data"][:160])
+            for e in w.store.q(
+                "SELECT type, data FROM events WHERE job_id=? ORDER BY id DESC LIMIT 12", (job,)
+            )
+        ]
+        raise AssertionError(
+            f"{r.text}\nselectable={selectable(w.store, job, task)}\nartifacts={arts}\nevents={evs}"
+        )
 
     assert len(_workers(w, "w1")) == 1  # the first session only
     assert len(w.store.q("SELECT 1 FROM reservations WHERE task_id=?", (task,))) == rows
