@@ -195,19 +195,24 @@ def test_github_claude_and_opencode_dirs_are_read_only(
 # --- Forge the harness's lines or its result (review round 2, N1 and N11) -------------------
 
 
-def test_the_agent_uid_cannot_reach_pid_1(
+def test_the_agent_uid_cannot_reach_the_harness(
     runtime: DockerRuntime, make_spec: Callable[..., SessionSpec]
 ) -> None:
-    """PID 1 is root (the harness); the agent uid can't write its stdout, so it
-    can't forge a vigil_event or vigil_result line, read its environment, or
-    signal it."""
+    """PID 1 is tini, as root; the harness (root) is its child. The agent uid
+    can't write the harness's stdout, so it can't forge a vigil_event or
+    vigil_result line, read its environment, or signal it. $PPID of the agent's
+    shell is the harness (here the probe's stand-in)."""
     _, out = runtime.probe(
         make_spec(),
-        "echo OWNER=$(stat -c %U /proc/1); "
-        'echo \'{"vigil_result": {"status": "done"}}\' > /proc/1/fd/1 2>/dev/null; echo FD1=$?; '
-        "cat /proc/1/environ >/dev/null 2>&1; echo ENV=$?; "
-        "kill -0 1 2>/dev/null; echo KILL=$?; id -u",
+        "H=$PPID; echo OWNER=$(stat -c %U /proc/1); echo INIT=$(cat /proc/1/comm); "
+        "echo HOWNER=$(stat -c %U /proc/$H); "
+        'echo \'{"vigil_result": {"status": "done"}}\' > /proc/$H/fd/1 2>/dev/null; echo FD1=$?; '
+        "cat /proc/$H/environ >/dev/null 2>&1; echo ENV=$?; "
+        "kill -0 $H 2>/dev/null; echo KILL=$?; kill -0 1 2>/dev/null; echo KILL1=$?; id -u",
     )
-    assert "FD1=0" not in out and "ENV=0" not in out and "KILL=0" not in out, out
+    assert "FD1=0" not in out and "ENV=0" not in out, out
+    assert "KILL=0" not in out and "KILL1=0" not in out, out
     assert '"vigil_result"' not in out
-    assert "OWNER=root" in out and "10001" in out.splitlines(), out
+    lines = out.splitlines()
+    assert "OWNER=root" in lines and "HOWNER=root" in lines and "10001" in lines, out
+    assert any(line.startswith("INIT=") and "init" in line for line in lines), out

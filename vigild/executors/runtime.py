@@ -146,9 +146,11 @@ def worker_kwargs(
     return {
         "image": spec.image or cfg.vigild.images.claude_executor,
         "name": f"vigil-{spec.session_id}",
-        # PID 1 is the harness, as root with only these capabilities; the CLI,
-        # test_cmd and git run as `uid` with none (review round 2, N1 and N11).
+        # The harness is root with only these capabilities, as the child of
+        # Docker's tini (PID 1), which reaps orphans; the CLI, test_cmd and git
+        # run as `uid` with none (review round 2, N1 and N11; #112).
         "user": "0:0",
+        "init": True,
         "network": network,
         "environment": env,
         "mounts": mounts,
@@ -170,7 +172,7 @@ def worker_kwargs(
 
 
 def as_agent(cfg: Config, command: str) -> str:
-    """A shell line that runs `command` as the agent uid under a root PID 1,
+    """A shell line that runs `command` as the agent uid under a root harness,
     the way the harness runs the agent (`exit` keeps sh from exec'ing)."""
     uid = cfg.vigild.container.uid
     drop = f"setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all"
@@ -726,7 +728,7 @@ class DockerRuntime:
 
     def probe(self, spec: SessionSpec, command: str, timeout: int = 120) -> tuple[int, str]:
         """Run `command` as the agent uid in the session's exact container,
-        network and proxy, under a root PID 1 standing in for the harness. The
+        network and proxy, as a root process standing in for the harness, under tini. The
         security tests and `vigil doctor` use it."""
         import docker.errors
 
