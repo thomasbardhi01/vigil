@@ -7,7 +7,8 @@ review round 2). This replaces the nightly validation of a hand-built image.
   a Linux container, each with its reason.
 - **Key:** sha256 over the Dockerfile, each lockfile's blob id at the base
   commit (from vigild's mirror), and the suites. The image is
-  `vigil-dev/<name>:<key[:16]>`. A new key is a new image.
+  `vigil-dev/<name>:<key[:16]>` (a non-production data dir: `vigil-dev-<hash8>/...`,
+  #128). A new key is a new image.
 - **Build:** the context is only the lockfiles, copied from the base commit;
   no repo source goes into the image. The build has the network; nothing after
   it does.
@@ -125,6 +126,16 @@ class Validation:
 OnFailure = Callable[[str, str, dict[str, Any]], None]
 
 
+def image_prefix(data_path: Path, kind: str) -> str:
+    """`vigil-dev` / `vigil-session` for production (the default data dir); any
+    other data dir gets `vigil-<kind>-<sha256(resolved path)[:8]>`, so a test or
+    scratch build never moves a tag production's records name (#128)."""
+    resolved = data_path.expanduser().resolve()
+    if resolved == (Path.home() / "vigil-data").resolve():
+        return f"vigil-{kind}"
+    return f"vigil-{kind}-{hashlib.sha256(str(resolved).encode()).hexdigest()[:8]}"
+
+
 class DevImages:
     def __init__(
         self,
@@ -162,9 +173,9 @@ class DevImages:
         h.update(b"\0" + json.dumps(pol.dev_suites, sort_keys=True).encode())
         return h.hexdigest()
 
-    def tag(self, repo: str, key: str) -> str:
+    def tag(self, repo: str, key: str, kind: str = "dev") -> str:
         name = re.sub(r"[^a-z0-9._-]", "-", repo.split("/")[-1].lower())
-        return f"vigil-dev/{name}:{key[:16]}"
+        return f"{image_prefix(self.cfg.vigild.data_path, kind)}/{name}:{key[:16]}"
 
     def newest_validated(self, repo: str, stages: tuple[str, ...]) -> dict[str, Any] | None:
         """The newest passing record of these stages (`validate` is a dev image,
@@ -424,7 +435,7 @@ class SessionImages:
         return hashlib.sha256(f"{dev_tag}\0{layer_digest()}\0{sha}".encode()).hexdigest()
 
     def tag(self, repo: str, key: str) -> str:
-        return self.dev.tag(repo, key).replace("vigil-dev/", "vigil-session/", 1)
+        return self.dev.tag(repo, key, "session")
 
     def resolve(self, repo: str, base_sha: str) -> str:
         """The built session image, or a refusal. Never builds (ADR-0004 §5)."""
