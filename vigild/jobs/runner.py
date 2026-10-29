@@ -1327,7 +1327,10 @@ class JobRunner:
         if not rows:
             return {}
         tasks = json.loads(rows[0]["data"]).get("tasks")
-        return tasks if isinstance(tasks, dict) else {}
+        if not isinstance(tasks, dict):
+            return {}
+        # an event written before #118 may hold an int per task: those are dropped
+        return {tid: t for tid, t in tasks.items() if isinstance(t, dict)}
 
     def _abandoned(self, job_id: str) -> bool:
         try:
@@ -3802,7 +3805,14 @@ class JobRunner:
                     f"{job_id}: findings remain after {limit} review rounds and an escalation",
                     {
                         "kind": "review_rounds",
-                        "tasks": {tid: outcomes[tid][1] for tid in over},
+                        "tasks": {
+                            tid: {
+                                "title": self.store.get_task(tid).contract["spec"].get("goal"),
+                                "state": self.store.get_task(tid).state,
+                                "findings": outcomes[tid][1],
+                            }
+                            for tid in over
+                        },
                         "actions": ["replan", "abandon"],
                     },
                 )
