@@ -2964,6 +2964,12 @@ class JobRunner:
                 f"{task_id}: worker session {out.status}",
                 {"error": out.error or ""},
             )
+        if not self.store.q("SELECT 1 FROM model_calls WHERE session_id=? LIMIT 1", (s.id,)):
+            # no work, never green (#102): the gateway metered nothing for this session
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: session did no metered work",
+                {"error": "the session has no model_calls row; nothing is published"},
+            )  # fmt: skip
         try:
             head = self.workspace.import_result(
                 job.repo,

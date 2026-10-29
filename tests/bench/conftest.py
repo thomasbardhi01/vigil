@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from tests.harness import LocalTestRunner
-from tests.jobs.test_coord_loop import KEY, StandIn
+from tests.jobs.test_coord_loop import KEY, StandIn, _meter_once
 from tests.test_devimage import FakeDocker, FakeSuites
 from vigild.budget import Budget
 from vigild.config import Config, RepoPolicy, Secrets
@@ -96,6 +96,7 @@ def world(
     )
     images = DevImages(cfg, store, FakeDocker(), ws, FakeSuites())
     standin = StandIn()
+    standin.meter = lambda spec: _meter_once(store, cfg, spec)
     runner = JobRunner(
         cfg, store, budget, gateway, standin, ws,
         GitHubPublisher(app, app.http, ws),  # the real one: a bench job must never use it

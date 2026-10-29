@@ -310,7 +310,8 @@ stateDiagram-v2
   (decision `vault-host-git`), reads `worker_report.json` from there, checks stage-3 acceptance
   (decision `reading-session-files`), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
   instead files a question for its coord and your inbox, and its task
-  waits. Work that can't start (a dependency failed or waits, or the repo
+  waits. A worker session with no `model_calls` row did no metered work: its task fails
+  before the import and pages (retry, re-plan, abandon), and nothing is published (#102). Work that can't start (a dependency failed or waits, or the repo
   is at its WIP limit) pages you and blocks the job.
 - **Inside review** (decision `review-ladder`). Each published PR is reviewed, and audited where
   the ladder samples; findings send the task back to building as a fix round
@@ -436,6 +437,10 @@ code. Hosted non-Claude output (Jev) has no value of its own and is tagged
 - **revert + fix-job rate:** fix jobs per shipped job;
 - **cost per merged PR:** metered spend per merged PR;
 - **median spec→merge.**
+
+A session with no `model_calls` row is never $0 in a report: `kpis.py`, the
+job tree and the batch roll-up list it under `cost_missing_sessions` /
+`missing_sessions`, by session id, outside every sum (#102).
 
 The raw data is stored from phase 1. The ladder, routing and the cost
 model read these numbers from phase 2.

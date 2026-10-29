@@ -149,6 +149,19 @@ def session_cost(store: Store, session_id: str) -> float:
     return float(row[0]["c"])
 
 
+def unmetered_sessions(store: Store, job_id: str | None = None) -> list[str]:
+    """Sessions that ended with no `model_calls` row (#102), by id: their cost is unknown,
+    not $0, so every report lists them as missing and keeps them out of its sums. A
+    deps session has no model by design and is never listed."""
+    sql = (
+        "SELECT id FROM sessions WHERE ended_at IS NOT NULL AND role != 'deps'"
+        " AND NOT EXISTS (SELECT 1 FROM model_calls m WHERE m.session_id = sessions.id)"
+    )
+    rows = store.q(sql + (" AND job_id=?" if job_id else "") + " ORDER BY created_at, id",
+                   (job_id,) if job_id else ())  # fmt: skip
+    return [str(r["id"]) for r in rows]
+
+
 def last_call_truncated(store: Store, session_id: str) -> bool:
     """Did the session's final model call stop at max_tokens? Then its last
     turn was cut off at the output cap and the session is not done."""

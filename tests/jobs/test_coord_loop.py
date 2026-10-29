@@ -233,6 +233,10 @@ class StandIn:
     lock: threading.Lock = field(default_factory=threading.Lock)
     barrier: threading.Barrier | None = None
     renumber: bool = True  # a re-plan's draft avoids the ids the job has (finding #4)
+    # what the gateway does for a worker's first call (#102): one `model_calls` row for a
+    # session that has none after `on_session`; set by `world`, off for the no-work test
+    meter: Callable[[SessionSpec], None] | None = None
+    meter_workers: bool = True
 
     def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
         assert gateway_token.startswith("vgw_")
@@ -242,6 +246,8 @@ class StandIn:
         self.specs.append(spec)
         if self.on_session:
             self.on_session(spec)
+        if self.meter and self.meter_workers and spec.role is Role.WORKER:
+            self.meter(spec)
         if spec.role in (Role.REVIEWER, Role.AUDITOR):
             answer = (self.review if spec.role is Role.REVIEWER else self.audit)(spec)
             return ExecOutcome("done", 0, {"status": "done", "structured_output": answer})
@@ -384,6 +390,20 @@ def build_first(images: DevImages, sessions: SessionImages) -> None:
     sessions.resolve = lambda repo, base: sessions.ensure_fresh(repo, base)  # type: ignore[method-assign]
 
 
+def _meter_once(store: Store, cfg: Config, spec: SessionSpec) -> None:
+    """One zero-token `model_calls` row for a session that has none, as the gateway writes."""
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    if store.q("SELECT 1 FROM model_calls WHERE session_id=?", (spec.session_id,)):
+        return
+    record_call(
+        store, PriceTable(cfg.prices), session_id=spec.session_id, task_id=spec.task_id,
+        job_id=spec.job_id, purpose="session", provider="anthropic",
+        backend_preset="claude-sonnet", model="claude-sonnet-5-5", usage=CallUsage(),
+    )  # fmt: skip
+
+
 @dataclass
 class World:
     client: TestClient
@@ -419,6 +439,7 @@ def world(
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     images = DevImages(cfg, store, FakeDocker(), ws, FakeSuites())
     standin, publisher, tests = StandIn(), BarePublisher(ws), LocalTestRunner()
+    standin.meter = lambda spec: _meter_once(store, cfg, spec)
     runner = JobRunner(
         cfg,
         store,
