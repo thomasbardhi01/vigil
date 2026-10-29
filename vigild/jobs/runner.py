@@ -89,6 +89,7 @@ from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.evidence import executor_block, failure_diagnostic, without_executor
 from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
+from vigild.jobs.integrity import Finding, finding_id
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
@@ -3005,6 +3006,12 @@ class JobRunner:
                 f"{task_id}: worker session {out.status}",
                 {"error": out.error or ""},
             )
+        if not self.store.q("SELECT 1 FROM model_calls WHERE session_id=? LIMIT 1", (s.id,)):
+            # no work, never green (#102): the gateway metered nothing for this session
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: session did no metered work",
+                {"error": "the session has no model_calls row; nothing is published"},
+            )  # fmt: skip
         try:
             head = self.workspace.import_result(
                 job.repo,
@@ -3164,6 +3171,7 @@ class JobRunner:
             cost=session_cost(self.store, s.id),
             runner_config=self.cfg.repo(job.repo).runner_config,
             session_base=session_base,
+            on_findings=lambda found: self._integrity_findings(job_id, task_id, s.id, found),
         )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
@@ -4082,6 +4090,36 @@ class JobRunner:
             log.exception("review of %s failed", t.id)
             return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
 
+    def _integrity_findings(
+        self, job_id: str, task_id: str, session_id: str, found: list[Finding]
+    ) -> None:
+        """#131, report-only: each finding is an `integrity_finding` event (a stable
+        `finding_id` so coord can count false positives) and, with the rest, vigild's own
+        record that the reviewer's packet fences as advisory text."""
+        rows = []
+        for f in found:
+            row = {
+                "finding_id": finding_id(job_id, task_id, f),
+                "rule": f.rule,
+                "location": f"{f.path}:{f.line}" if f.line else f.path,
+                "snippet": f.snippet,
+                "job_id": job_id,
+                "task_id": task_id,
+                "session_id": session_id,
+            }
+            rows.append(row)
+            self.store.add_event(
+                "integrity_finding",
+                redact(row),
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=session_id,
+                task_id=task_id,
+            )
+        self.store.add_artifact(
+            job_id, "integrity_findings.json", json.dumps(rows), Provenance.HUMAN, task_id=task_id
+        )
+
     def _review_setup(self, job: Any, t: Any) -> tuple[Task, Any, bool]:
         """A task's contract, its review shape, and whether it changes how tests run
         (the verifier's own record says so): shared by a real review and a replay."""
@@ -4116,6 +4154,11 @@ class JobRunner:
             "the request": job.request,
             "the worker's report": report.content if report else "(none)",
         }
+        found = self.store.get_artifact(job.id, "integrity_findings.json", t.id)
+        if found:  # #131: advisory, rules-only; the reviewer weighs them
+            untrusted["integrity findings (rules-only, advisory)"] = "\n".join(
+                f"{r['rule']} {r['location']}: {r['snippet']}" for r in json.loads(found.content)
+            )
         rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
         return ReviewInputs(rules=rules, request=request, untrusted=untrusted, diff=diff)
 

@@ -122,7 +122,12 @@ def test_the_roll_up_adds_up(client: TestClient, tokens: Tokens, store: Store) -
     assert per[a]["spent_usd"] == 0.25 and per[a]["held_usd"] == 0.5
     assert per[a]["total_usd"] == 0.75 and per[b]["total_usd"] == 0.125
     assert per[a]["state"] == "spec_pending"
-    assert out["cost"] == {"spent_usd": 0.375, "held_usd": 0.5, "total_usd": 0.875}
+    assert out["cost"] == {
+        "spent_usd": 0.375,
+        "held_usd": 0.5,
+        "total_usd": 0.875,
+        "cost_unknown_sessions": [],
+    }
     assert out["name"] == "docs" and out["batch_id"] == ids["batch_id"]
     # a job outside the batch is not counted
     assert sum(j["total_usd"] for j in out["jobs"]) == out["cost"]["total_usd"]
