@@ -302,17 +302,82 @@ def test_an_unrelated_failure_at_before_is_not_must_fail_first(
     assert rec["ids"]["checked"] is True and rec["ids"]["failing_before"] == []
 
 
-def test_a_collection_error_at_before_is_unknown(ws: Workspace, tmp_path: Path) -> None:
+NEW_MODULE_TEST = "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
+
+
+def _new_module(c: Path) -> None:
+    (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+def test_a_collection_error_in_the_workers_new_test_counts_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """#161: the most common test-first shape. The new module imports code the base lacks,
+    so the before run fails at collection (pytest exit 2); the module's ids come from after."""
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail" and rec["before"]["exit"] == 2
+    fac = rec["before"]["failed_at_collection"]
+    assert fac["modules"] == ["tests.test_new"] and "newmod" in fac["error"]
+    assert len(fac["error"]) <= 400
+    assert rec["after"]["outcome"] == "pass"
+    assert rec["ids"] == {
+        "checked": True,
+        "failing_before": ["tests.test_new::test_thing"],
+        "not_passing_after": [],
+    }
+    from vigild.jobs.acceptance import check_tests
+
+    spec = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+    assert check_tests(spec, rec) == []
+
+
+def test_a_collection_error_in_a_base_test_file_stays_unknown(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A file the worker did not add or change can't be what fails before, even beside
+    the worker's own erroring module."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_broken.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
+
+
+def test_a_collection_error_in_a_conftest_stays_unknown(ws: Workspace, tmp_path: Path) -> None:
     def edit(c: Path) -> None:
-        (c / "tests" / "test_new.py").write_text(
-            "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
-        )
-        (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+        _new_module(c)
+        (c / "tests" / "conftest.py").write_text("import no_such_module_anywhere\n")
 
     base, head = _session(ws, tmp_path, edit)
-    rec = _verify(ws, base, head, "pytest -q tests/test_new.py")
-    assert rec["before"]["outcome"] == "unknown"  # pytest exit 2: collection error
-    assert rec["after"]["outcome"] == "pass"
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] != "fail"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+
+
+def test_a_workers_test_that_errors_at_collection_after_still_fails(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)  # src/newmod.py never added
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["after"]["outcome"] != "pass"
+    assert rec["ids"]["failing_before"] == []  # after has no ids for the module
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
 
 
 def test_zero_tests_through_a_pipe_is_unknown_at_head(ws: Workspace, tmp_path: Path) -> None:

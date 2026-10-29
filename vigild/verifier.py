@@ -689,6 +689,7 @@ class Verifier:
                 [(head, tests), pin],
             )  # fmt: skip
             before["applied"] = tests
+            self._collection_failure(before, tests, test_cmd)
             record["before"] = before
         after = self._run(repo, image, f"{task_id}-after", head, test_cmd, command, [pin])
         if not after["_report"] and after["outcome"] == "pass":
@@ -1075,6 +1076,30 @@ class Verifier:
         return out
 
     @staticmethod
+    def _collection_failure(before: dict[str, Any], tests: list[str], test_cmd: str) -> None:
+        """#161: a pytest collection error (exit 2, a JUnit `<error>` on a module, no
+        classname) counts as failing before only when every erroring module is one of the
+        worker's own new or changed test files (`tests`, never a conftest). Any other
+        error, a failing case or another exit leaves the outcome `unknown`."""
+        cases: list[Case] = before.get("_cases") or []
+        if before["exit"] != 2 or not before["_report"] or not runs_pytest(test_cmd):
+            return
+        mods = [c for c in cases if c.status == "error" and not c.file]
+        mine = [t for t in tests if t.rsplit("/", 1)[-1] != "conftest.py"]
+        if not mods or any(c.status != "error" or c.file for c in cases):
+            return
+        names = [c.id.removeprefix("::") for c in mods]
+        if not all(belongs(Case("", n, "error"), mine) for n in names):
+            return
+        before["outcome"] = "fail"
+        before["failed_at_collection"] = {
+            "modules": sorted(names),
+            "error": redact("\n".join(ln for ln in before["tail"].splitlines() if ln[:1] == "E"))[
+                :400
+            ],
+        }
+
+    @staticmethod
     def _ids(before: dict[str, Any], after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
         b, a = before.get("_cases"), after.get("_cases")
         if not before.get("_report") or not after.get("_report"):
@@ -1082,6 +1107,12 @@ class Verifier:
         failing = sorted(
             c.id for c in b or [] if c.status in ("failure", "error") and belongs(c, tests)
         )
+        fac = before.get("failed_at_collection")
+        if fac:  # the before run has no ids for these modules; the after run's are the tests'
+            mapped = [
+                t for t in tests if any(belongs(Case("", n, "error"), [t]) for n in fac["modules"])
+            ]
+            failing = sorted(c.id for c in a or [] if belongs(c, mapped))
         passing = {c.id for c in a or [] if c.status == "pass"}
         return {
             "checked": True,
