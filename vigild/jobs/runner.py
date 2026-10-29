@@ -1462,6 +1462,7 @@ class JobRunner:
         # a session whose containers are gone is over; one with a container that would not
         # go (named in `containers_failed`) stays as it is, so the owner sees it
         failed = [str(n) for n in removed.get("failed", [])]
+        unreachable = [str(h) for h in removed.get("hosts_unreachable", [])]
         stuck = {
             sid
             for sid in {s.id for s in self.store.list_sessions(job_id)}
@@ -1488,6 +1489,12 @@ class JobRunner:
             "containers_removed": removed["containers"],
             "networks_removed": removed["networks"],
             "containers_failed": failed,
+            "kill_errors": {str(k): str(v) for k, v in removed.get("kill_errors", {}).items()},
+            "unowned": [str(n) for n in removed.get("unowned", [])],
+            "hosts_unreachable": unreachable,
+            # clean: nothing of the job is known to be left, on any host. A stuck verifier,
+            # probe or deps container counts, as does a host that could not be reached
+            "clean": not purge_failed and not failed and not unreachable,
         }
 
     def _replan_notes(self, job_id: str) -> list[str]:

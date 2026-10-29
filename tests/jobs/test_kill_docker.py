@@ -68,7 +68,7 @@ def test_a_running_job_leaves_no_container_network_or_reservation(
         return {**kw, "entrypoint": ["sleep", "600"], "command": []}
 
     monkeypatch.setattr(rt, "worker_kwargs", sleeping)
-    runtime = DockerRuntime(w.runner.cfg)
+    runtime = DockerRuntime(w.runner.cfg, recorded=w.store.recorded_container_ids)
     client = runtime.client
     bystander = client.containers.run(
         w.runner.cfg.vigild.images.claude_executor,

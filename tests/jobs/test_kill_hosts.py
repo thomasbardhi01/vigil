@@ -13,10 +13,10 @@ from typing import Any
 
 from tests.jobs.test_coord_loop import World, _request, auth, world  # noqa: F401
 from tests.jobs.test_kill import Hung, _kill, _spec_item
-from vigild.config import Config
+from vigild.config import Config, SandboxHost
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.executors.hosts import HostExecutor, Hosts
-from vigild.executors.runtime import JOB_LABEL, LABEL
+from vigild.executors.runtime import JOB_LABEL, LABEL, instance_labels
 from vigild.jobs.model import Role
 
 
@@ -70,10 +70,15 @@ class OnHosts(Hung):
     daemon: Daemon
     hostexec: HostExecutor
     stuck_egress = False
+    stuck_verifier = False
 
     def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
         if spec.role is Role.WORKER:
-            lab = {LABEL: spec.session_id, JOB_LABEL: spec.job_id}
+            lab = {
+                LABEL: spec.session_id,
+                JOB_LABEL: spec.job_id,
+                **instance_labels(self.hostexec.hosts.cfg),
+            }
             Thing(self.daemon.networks.things, f"vigil-{spec.session_id}", lab, self.stopped.set)
             Thing(self.daemon.containers.things, f"vigil-{spec.session_id}", lab, self.stopped.set)
             egress = Thing(
@@ -83,6 +88,14 @@ class OnHosts(Hung):
                 self.stopped.set,
             )
             egress.stuck = self.stuck_egress
+            if self.stuck_verifier:  # a verifier checkout of the job: no session id in its name
+                v = Thing(
+                    self.daemon.containers.things,
+                    "frosty_curie",
+                    {**lab, LABEL: "verify-pa-1-w1-base-ab12"},
+                    self.stopped.set,
+                )
+                v.stuck = True
         return super().run(spec, gateway_token, on_event)
 
     def stop_job(self, job_id: str, session_ids: list[str]) -> int:
@@ -92,11 +105,14 @@ class OnHosts(Hung):
         return self.hostexec.purge_job(job_id, session_ids)
 
 
-def _running(w: World, cfg: Config, *, stuck_egress: bool = False) -> Any:
+def _running(
+    w: World, cfg: Config, *, stuck_egress: bool = False, stuck_verifier: bool = False
+) -> Any:
     daemon = Daemon()
     hosts = Hosts(cfg, make_client=lambda h: daemon)
     hung = OnHosts(w.standin, want=1)
     hung.daemon, hung.hostexec, hung.stuck_egress = daemon, HostExecutor(hosts), stuck_egress
+    hung.stuck_verifier = stuck_verifier
     w.runner.executor = hung
     job = _request(w)
     item = _spec_item(w)
@@ -139,3 +155,106 @@ def test_a_container_that_will_not_go_is_named_and_its_session_not_called_stoppe
     assert body["containers_failed"] == [f"vigil-{sid}-egress"]
     assert body["containers_removed"] == 1
     assert sid not in body["sessions_stopped"]
+
+
+def test_a_stuck_verifier_container_makes_the_kill_unclean_and_is_named(
+    world: World, cfg: Config
+) -> None:
+    w = world
+    job, hung, _daemon, t = _running(w, cfg, stuck_verifier=True)
+    (sid,) = hung.entered
+    body = _kill(w, job).json()
+    t.join(20)
+    assert body["containers_failed"] == ["frosty_curie"]
+    assert body["clean"] is False
+    assert sid in body["sessions_stopped"], "the session's own containers did go"
+
+
+def test_a_kill_with_nothing_stuck_is_clean(world: World, cfg: Config) -> None:
+    w = world
+    job, _hung, _daemon, t = _running(w, cfg)
+    body = _kill(w, job).json()
+    t.join(20)
+    assert body["clean"] is True and body["hosts_unreachable"] == []
+    assert body["unowned"] == []
+
+
+def test_an_inbox_abandon_removes_the_jobs_leftover_containers_like_a_kill(
+    world: World, cfg: Config
+) -> None:
+    """The FSM lets the inbox abandon only a job that is not building, but such a job may
+    still have a verifier or deps container up; abandoning stops and purges them."""
+    w = world
+    daemon = Daemon()
+    hostexec = HostExecutor(Hosts(cfg, make_client=lambda h: daemon))
+
+    class Ex:  # the usual stand-in runs; the kill hooks are the real HostExecutor's
+        def __getattr__(self, name: str) -> Any:
+            return getattr(w.standin, name)
+
+        def stop_job(self, job_id: str, session_ids: list[str]) -> int:
+            return hostexec.stop_job(job_id, session_ids)
+
+        def purge_job(self, job_id: str, session_ids: list[str]) -> dict[str, Any]:
+            return hostexec.purge_job(job_id, session_ids)
+
+    w.runner.executor = Ex()
+    job = _request(w)
+    lab = {LABEL: "verify-pa-1-w1-base-ab12", JOB_LABEL: job, **instance_labels(cfg)}
+    killed: list[str] = []
+    Thing(daemon.containers.things, "verifier", lab, lambda: killed.append("verifier"))
+    Thing(daemon.containers.things, "other", {**lab, JOB_LABEL: "vi-9999"}, lambda: None)
+    item = w.runner.jobs.page(job, "p", {"actions": ["abandon"]})  # type: ignore[union-attr]
+    w.runner.jobs.abandon(item.id)  # type: ignore[union-attr]
+    assert set(killed) == {"verifier"}
+    assert daemon.names() == ["other"], "only this job's container went"
+    (ev,) = [e for e in w.store.events() if e.job_id == job and e.type == "job_killed"]
+    assert ev.data["containers_removed"] == 1 and ev.data["clean"] is True
+
+
+# --- every configured host, not only the ones this process has used ------------------------
+
+
+def _remote(cfg: Config) -> SandboxHost:
+    h = SandboxHost(
+        name="gpu", docker_context="gpu", arch="amd64", memory_gb=8, cpus=4, disk_budget_gb=50,
+        uses=["bench"], gateway_url="http://10.0.0.5:8788", engine_pin="27.0.0",
+        private_address="10.0.0.9",
+    )  # fmt: skip
+    cfg.sandbox_hosts.gateway_bind = "10.0.0.5"
+    cfg.sandbox_hosts.hosts.append(h)
+    return h
+
+
+def test_a_kill_reaches_a_remote_host_this_process_never_used(cfg: Config) -> None:
+    h = _remote(cfg)
+    local_d, remote_d = Daemon(), Daemon()
+    mine = instance_labels(cfg)
+    lab = {LABEL: "s-1", JOB_LABEL: "vi-0001", **mine}
+    killed: list[str] = []
+    Thing(remote_d.containers.things, "vigil-s-1", lab, lambda: killed.append("worker"))
+    Thing(remote_d.networks.things, "vigil-s-1", lab, lambda: None)
+    hosts = Hosts(cfg, make_client=lambda host: remote_d if host.name == h.name else local_d)
+    assert hosts._runtimes == {}, "no runtime was ever built in this process"
+    ex = HostExecutor(hosts)
+    assert ex.stop_job("vi-0001", ["s-1"]) == 1 and killed == ["worker"]
+    out = ex.purge_job("vi-0001", ["s-1"])
+    assert out["containers"] == 1 and out["networks"] == 1 and out["failed"] == []
+    assert out["hosts_unreachable"] == [] and remote_d.names() == []
+
+
+def test_a_host_that_cannot_be_reached_is_reported_not_counted_as_success(cfg: Config) -> None:
+    h = _remote(cfg)
+
+    class Down:
+        containers = networks = None
+
+        def __getattr__(self, name: str) -> Any:
+            raise ConnectionError("ssh: connect to host gpu: timed out")
+
+    hosts = Hosts(cfg, make_client=lambda host: Down() if host.name == h.name else Daemon())
+    ex = HostExecutor(hosts)
+    assert ex.stop_job("vi-0001", []) == 0
+    out = ex.purge_job("vi-0001", [])
+    assert out["hosts_unreachable"] == ["gpu"]
+    assert out["failed"] == []

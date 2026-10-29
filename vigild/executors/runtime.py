@@ -28,10 +28,12 @@ from typing import Any
 from vigild.config import Config, SandboxHost
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
+from vigild.redact import redact
 from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
 JOB_LABEL = "dev.vigil.job"  # the job a container works for (kill, issue #52)
+INSTANCE_LABEL = "dev.vigil.instance"  # which vigild made it: job ids are per database (#162)
 _JOB: contextvars.ContextVar[str] = contextvars.ContextVar("vigil_job", default="")
 
 
@@ -49,6 +51,12 @@ def job_scope(job_id: str) -> Iterator[None]:
 
 def current_job() -> str:
     return _JOB.get()
+
+
+def instance_labels(cfg: Config) -> dict[str, str]:
+    from vigild.devimage import instance_id
+
+    return {INSTANCE_LABEL: instance_id(cfg.vigild.data_path)}
 
 
 def job_labels(job_id: str) -> dict[str, str]:
@@ -164,6 +172,7 @@ def worker_kwargs(
             LABEL: spec.session_id,
             "dev.vigil.role": spec.role.value,
             **job_labels(spec.job_id),
+            **instance_labels(cfg),
         },
         "working_dir": "/work",
         **_hardening(cfg, host),
@@ -190,6 +199,7 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec, host: SandboxHost | None = None
             LABEL: spec.session_id,
             "dev.vigil.role": "egress",
             **job_labels(spec.job_id),
+            **instance_labels(cfg),
         },
         **_hardening(cfg, host),
         "mem_limit": "128m",
@@ -383,6 +393,7 @@ def verifier_kwargs(
             LABEL: f"verify-{source.parent.name}",
             "dev.vigil.role": "verifier",
             **job_labels(current_job()),
+            **instance_labels(cfg),
         },
         **_hardening(cfg, host),
         "cap_add": list(SUBJECT_CAPS if subject else VERIFIER_CAPS),
@@ -438,6 +449,7 @@ def deps_kwargs(
             LABEL: f"deps-{work.name}",
             "dev.vigil.role": "deps",
             **job_labels(current_job()),
+            **instance_labels(cfg),
         },
         **_hardening(cfg, host),
     }
@@ -634,6 +646,15 @@ def require_local_files(host: SandboxHost, mounts: list[dict[str, Any]]) -> None
         )
 
 
+def _record(on_event: EventSink, kind: str, thing: Any) -> None:
+    """Say which Docker object a session made, by its id (globally unique): the runner
+    stores it, and a kill removes exactly those first (#162)."""
+    tid = getattr(thing, "id", None)
+    if isinstance(tid, str) and tid:
+        name = str(getattr(thing, "name", ""))
+        on_event({"type": "container", "data": {"kind": kind, "id": tid, "name": name}})
+
+
 class DockerRuntime:
     def __init__(
         self,
@@ -641,14 +662,18 @@ class DockerRuntime:
         client: Any = None,
         host: SandboxHost | None = None,
         prune_ok: Callable[[str], bool] | None = None,
+        recorded: Callable[[str], set[str]] | None = None,
     ) -> None:
         import docker
 
+        # the Docker ids vigild recorded for a job's sessions (none known: labels only)
+        self.recorded = recorded or (lambda job_id: set())
         self.prune_ok = prune_ok or (lambda session: False)  # unknown: prune nothing
         self.cfg = cfg
         self.client = client or docker.from_env()
         self.host = host or cfg.sandbox_hosts.local
         self._killed: dict[str, set[str]] = {}  # job -> containers its kill stopped
+        self._kill_errors: dict[str, dict[str, str]] = {}  # job -> container -> why kill failed
         self._killed_lock = threading.Lock()
 
     @contextmanager
@@ -662,8 +687,13 @@ class DockerRuntime:
             net_name,
             driver="bridge",
             internal=True,
-            labels={LABEL: spec.session_id, **job_labels(spec.job_id)},
+            labels={
+                LABEL: spec.session_id,
+                **job_labels(spec.job_id),
+                **instance_labels(self.cfg),
+            },
         )
+        _record(on_event, "network", net)
         proxy = collector = None
         try:
             require_image(self.client, self.cfg.vigild.images.egress_proxy)
@@ -679,6 +709,7 @@ class DockerRuntime:
             else:
                 pk["mounts"] = _docker_mounts(pk["mounts"])
                 proxy = self.client.containers.run(detach=True, **pk)
+            _record(on_event, "egress", proxy)
             net.connect(proxy, aliases=[self.cfg.egress.proxy.alias])
             try:
                 collector = self.client.containers.get(self.cfg.vigild.collector.container)
@@ -706,6 +737,7 @@ class DockerRuntime:
             require_local_files(self.host, wk["mounts"])
             wk["mounts"] = _docker_mounts(wk["mounts"])
             worker = self.client.containers.create(**wk)
+            _record(on_event, "worker", worker)
             try:
                 sock = worker.attach_socket(params={"stdin": 1, "stream": 1})
                 worker.start()
@@ -724,7 +756,10 @@ class DockerRuntime:
             from vigild.executors.disk import enforce_budget
 
             enforce_budget(
-                self.client, int(self.host.disk_budget_gb * (1 << 30)), may_prune=self.prune_ok
+                self.client,
+                int(self.host.disk_budget_gb * (1 << 30)),
+                may_prune=self.prune_ok,
+                instance=instance_labels(self.cfg)[INSTANCE_LABEL],
             )
         require_image(self.client, spec.image or self.cfg.vigild.images.claude_executor)
 
@@ -757,63 +792,95 @@ class DockerRuntime:
     def stop(self, session_id: str) -> None:
         """Kill a live session's containers (the gateway calls this when
         metering fails); `run` then sees the worker exit and cleans up."""
-        for c in self.client.containers.list(filters={"label": f"{LABEL}={session_id}"}):
+        mine = f"{INSTANCE_LABEL}={instance_labels(self.cfg)[INSTANCE_LABEL]}"
+        for c in self.client.containers.list(filters={"label": [f"{LABEL}={session_id}", mine]}):
             with contextlib.suppress(Exception):
                 c.kill()
 
+    def _of_job(self, labels: Mapping[str, str], cid: str, job_id: str, recorded: set[str]) -> bool:
+        """Whether a container or network is this vigild's and belongs to the job. First
+        the Docker ids vigild recorded for the job's sessions (unique across daemons'
+        users, so a scratch data dir can never reach another vigild's). Then the labels,
+        which must carry BOTH the job and this vigild's instance (job ids are per
+        database, #162). A pre-label object is never matched by its job label alone."""
+        if cid and cid in recorded:
+            return True
+        return (
+            labels.get(JOB_LABEL) == job_id
+            and labels.get(INSTANCE_LABEL) == instance_labels(self.cfg)[INSTANCE_LABEL]
+        )
+
     @staticmethod
-    def _of_job(labels: Mapping[str, str], job_id: str, session_ids: set[str]) -> bool:
-        """Whether a container or network belongs to the job: it carries the job's label
-        (a verifier checkout, a hidden-test probe, a deps build, a session's sidecar and
-        network), or it is labelled for one of the job's sessions."""
-        return labels.get(JOB_LABEL) == job_id or labels.get(LABEL, "") in session_ids
+    def _unowned(labels: Mapping[str, str], cid: str, job_id: str, recorded: set[str]) -> bool:
+        """A pre-label object that names the job but is not in the recorded set:
+        reported as `unowned`, never removed."""
+        return (
+            INSTANCE_LABEL not in labels and labels.get(JOB_LABEL) == job_id and cid not in recorded
+        )
 
     def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
         """Kill every running container of a job (kill, #52): its sessions' and
         sidecars', its verifier's, probes' and deps builds'. Found by vigil's labels
-        only. The sessions' own `run` then sees the exit and cleans up; `purge_job`
-        removes what is left and counts these too, though `run` got to them first."""
-        sids = set(session_ids)
+        only, and only this vigild's. The sessions' own `run` then sees the exit and
+        cleans up; `purge_job` removes what is left and counts these too, though `run`
+        got to them first. A kill that errors is recorded (`purge_job` reports it, if
+        the container is still there)."""
+        rec = set(self.recorded(job_id))
         n = 0
         for c in self.client.containers.list(filters={"label": LABEL}):
-            if self._of_job(c.labels or {}, job_id, sids):
+            name = str(c.name)
+            if self._of_job(c.labels or {}, str(c.id), job_id, rec):
                 with self._killed_lock:
-                    self._killed.setdefault(job_id, set()).add(str(c.name))
-                with contextlib.suppress(Exception):  # it may have exited already
+                    self._killed.setdefault(job_id, set()).add(name)
+                try:
                     c.kill()
                     n += 1
+                except Exception as e:  # it may have exited already: purge looks again
+                    with self._killed_lock:
+                        self._kill_errors.setdefault(job_id, {})[name] = redact(
+                            f"{type(e).__name__}: {e}"
+                        )[:300]
         for net in self.client.networks.list(filters={"label": LABEL}):
-            if self._of_job((getattr(net, "attrs", None) or {}).get("Labels") or {}, job_id, sids):
+            labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
+            if self._of_job(labels, str(net.id), job_id, rec):
                 with self._killed_lock:  # `run` may remove it before the purge does
                     self._killed.setdefault(job_id, set()).add(f"net:{net.name}")
         return n
 
-    def _job_names(self, job_id: str, sids: set[str]) -> set[str]:
+    def _job_names(self, job_id: str, rec: set[str]) -> set[str]:
         return {
             str(c.name)
             for c in self.client.containers.list(all=True, filters={"label": LABEL})
-            if self._of_job(c.labels or {}, job_id, sids)
+            if self._of_job(c.labels or {}, str(c.id), job_id, rec)
         }
 
     def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, Any]:
         """Remove every container and network of a job that is still there, by vigil's
         labels only (kill, #52), then look again: `failed` names each container or
         network that is still there. `containers` counts the ones this kill took down,
-        including those `run`'s own cleanup removed first. Never touches another job's,
-        nor anything unlabelled."""
-        sids = set(session_ids)
+        including those `run`'s own cleanup removed first. `kill_errors` says why a
+        `kill` of a container that is still there failed; `unowned` names the
+        pre-label containers that name the job but are not among the recorded ids: never
+        removed.
+        Never touches another job's or another vigild's, nor anything unlabelled."""
+        rec = set(self.recorded(job_id))
         with self._killed_lock:
             killed = self._killed.pop(job_id, set())
+            kill_errors = self._kill_errors.pop(job_id, {})
         seen = {n for n in killed if not n.startswith("net:")}
         seen_nets = {n[4:] for n in killed if n.startswith("net:")}
+        skipped: set[str] = set()
         for c in self.client.containers.list(all=True, filters={"label": LABEL}):
-            if self._of_job(c.labels or {}, job_id, sids):
+            labels = c.labels or {}
+            if self._of_job(labels, str(c.id), job_id, rec):
                 seen.add(str(c.name))
                 with contextlib.suppress(Exception):
                     c.remove(force=True)
+            elif self._unowned(labels, str(c.id), job_id, rec):
+                skipped.add(str(c.name))
         for net in self.client.networks.list(filters={"label": LABEL}):
             labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
-            if self._of_job(labels, job_id, sids):
+            if self._of_job(labels, str(net.id), job_id, rec):
                 seen_nets.add(str(net.name))
                 with contextlib.suppress(Exception):
                     net.reload()
@@ -822,7 +889,7 @@ class DockerRuntime:
                         with contextlib.suppress(Exception):
                             net.disconnect(cid, force=True)
                     net.remove()
-        left = self._job_names(job_id, sids)
+        left = self._job_names(job_id, rec)
         net_left = {
             str(n.name)
             for n in self.client.networks.list(filters={"label": LABEL})
@@ -832,6 +899,8 @@ class DockerRuntime:
             "containers": len(seen - left),
             "networks": len(seen_nets - net_left),
             "failed": sorted(left | net_left),
+            "kill_errors": {n: e for n, e in sorted(kill_errors.items()) if n in left},
+            "unowned": sorted(skipped),
         }
 
     def run_deps(
@@ -874,11 +943,22 @@ class DockerRuntime:
     def reap(self) -> int:
         """At startup: remove every container and network a session left behind."""
         n = 0
+        mine = instance_labels(self.cfg)[INSTANCE_LABEL]
+        rec = set(self.recorded(""))
+
+        def ours(labels: Mapping[str, str], cid: str) -> bool:
+            return labels.get(INSTANCE_LABEL) == mine or cid in rec
+
         for c in self.client.containers.list(all=True, filters={"label": LABEL}):
+            if not ours(c.labels or {}, str(c.id)):
+                continue  # another vigild's, or pre-label and not recorded: not ours
             with contextlib.suppress(Exception):
                 c.remove(force=True)
                 n += 1
         for net in self.client.networks.list(filters={"label": LABEL}):
+            labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
+            if not ours(labels, str(net.id)):
+                continue
             with contextlib.suppress(Exception):
                 net.remove()
         return n
