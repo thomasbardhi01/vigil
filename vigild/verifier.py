@@ -723,7 +723,11 @@ class Verifier:
                 "note": "neither base nor before produced a report: what ran can't be compared",
             }
         if before is not None:
-            record["ids"] = self._ids(before, after, tests)
+            record["ids"] = self._ids(
+                before, after, tests,
+                base["_cases"] if base["_report"] else None,
+                base2["_cases"] if base2 and base2["_report"] else None,
+            )  # fmt: skip
         else:
             # #31 item 1: no "before" run, so name the worker's tests from the after run
             record["ids"] = self._ids_after(
@@ -1076,44 +1080,65 @@ class Verifier:
         return out
 
     @staticmethod
+    def _module_path(name: str) -> str:
+        """The repo path of a JUnit collection-error name: `tests.test_a` is
+        `tests/test_a.py` (a path-style name is taken as it is)."""
+        return name if name.endswith(".py") else name.replace(".", "/") + ".py"
+
+    @staticmethod
     def _collection_failure(before: dict[str, Any], tests: list[str], test_cmd: str) -> None:
         """#161: a pytest collection error (exit 2, a JUnit `<error>` on a module, no
-        classname) counts as failing before only when every erroring module is one of the
-        worker's own new or changed test files (`tests`, never a conftest). Any other
-        error, a failing case or another exit leaves the outcome `unknown`."""
+        classname) counts as failing before only when every erroring module is, by exact
+        path, one of the worker's own new or changed test files (`tests`, never a
+        conftest). Any other error, a failing case or another exit leaves the outcome
+        `unknown`. A stub import is as cheap as `assert False`: must-fail-first proves
+        only that the base lacks something the test needs."""
         cases: list[Case] = before.get("_cases") or []
         if before["exit"] != 2 or not before["_report"] or not runs_pytest(test_cmd):
             return
         mods = [c for c in cases if c.status == "error" and not c.file]
-        mine = [t for t in tests if t.rsplit("/", 1)[-1] != "conftest.py"]
+        mine = {t for t in tests if t.rsplit("/", 1)[-1] != "conftest.py"}
         if not mods or any(c.status != "error" or c.file for c in cases):
             return
         names = [c.id.removeprefix("::") for c in mods]
-        if not all(belongs(Case("", n, "error"), mine) for n in names):
+        if not all(Verifier._module_path(n) in mine for n in names):
             return
         before["outcome"] = "fail"
         before["failed_at_collection"] = {
-            "modules": sorted(names),
+            "modules": sorted(redact(n) for n in names),
             "error": redact("\n".join(ln for ln in before["tail"].splitlines() if ln[:1] == "E"))[
                 :400
             ],
         }
 
     @staticmethod
-    def _ids(before: dict[str, Any], after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
+    def _ids(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        tests: list[str],
+        base: list[Case] | None = None,
+        base2: list[Case] | None = None,
+    ) -> dict[str, Any]:
         b, a = before.get("_cases"), after.get("_cases")
         if not before.get("_report") or not after.get("_report"):
             return {"checked": False, "note": "test ids not checked: the runner gave no report"}
         failing = sorted(
             c.id for c in b or [] if c.status in ("failure", "error") and belongs(c, tests)
         )
-        fac = before.get("failed_at_collection")
-        if fac:  # the before run has no ids for these modules; the after run's are the tests'
-            mapped = [
-                t for t in tests if any(belongs(Case("", n, "error"), [t]) for n in fac["modules"])
-            ]
-            failing = sorted(c.id for c in a or [] if belongs(c, mapped))
         passing = {c.id for c in a or [] if c.status == "pass"}
+        fac = before.get("failed_at_collection")
+        if fac:
+            # The before run never executed these files, so only after-run ids the base
+            # runs lack can have "failed before"; without a base report none can be told.
+            files = [Verifier._module_path(n) for n in fac["modules"]]
+            mine = [c for c in a or [] if belongs(c, files)]
+            seen = {c.id for c in base or []} | {c.id for c in base2 or []}
+            failing = sorted(c.id for c in mine if base is not None and c.id not in seen)
+            return {
+                "checked": True,
+                "failing_before": failing,
+                "not_passing_after": sorted(c.id for c in mine if c.status != "pass"),
+            }
         return {
             "checked": True,
             "failing_before": failing,

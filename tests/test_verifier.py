@@ -380,6 +380,106 @@ def test_a_workers_test_that_errors_at_collection_after_still_fails(
     assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
 
 
+def _newmod_only(c: Path) -> None:
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+SPEC = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+
+
+def test_only_new_ids_in_an_edited_base_file_count_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """The before run never executed the edited file, so a test that passes on the base
+    can't have "failed before"; only ids the base runs lack count."""
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n\n" + old + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_old::test_fresh"]
+    assert rec["ids"]["not_passing_after"] == []
+
+
+def test_an_import_only_edit_of_a_base_file_proves_nothing(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text("from src.newmod import thing\n\n" + old)
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["failing_before"] == []
+    assert check_tests(SPEC, rec)
+
+
+def test_a_module_is_attributed_by_exact_path_not_by_suffix(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A pre-broken base tests/test_a.py must not be taken for the worker's pkg/tests/test_a.py."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_a.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        (c / "pkg" / "tests").mkdir(parents=True)
+        (c / "pkg" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests pkg")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+
+
+def test_the_collection_error_text_is_redacted(ws: Workspace, tmp_path: Path) -> None:
+    secret = "ghs_" + "a1B2c3D4e5F6g7H8i9J0"
+
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(
+            f'raise ImportError("{secret}")\n\n\ndef test_x():\n    pass\n'
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    fac = rec["before"]["failed_at_collection"]
+    assert secret not in str(fac) and secret not in str(rec["before"])
+
+
+def test_ids_cover_only_the_erroring_worker_module(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        _new_module(c)
+        (c / "tests" / "test_clean.py").write_text("def test_clean():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_new::test_thing"]
+
+
+def test_collection_errors_beside_passing_cases_stay_unknown(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q --continue-on-collection-errors tests")
+    assert (
+        "failed_at_collection" not in rec["before"]
+    )  # passing cases ran: not a collection-only exit
+    assert not rec["ids"].get("failing_before")
+    assert check_tests({**SPEC, "test_cmd": rec["test_cmd"]}, rec)
+
+
 def test_zero_tests_through_a_pipe_is_unknown_at_head(ws: Workspace, tmp_path: Path) -> None:
     """`pnpm test 2>&1 | tail` that runs no test: pipefail carries the
     runner's exit, and "no tests" is not a pass."""
