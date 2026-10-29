@@ -395,6 +395,8 @@ def dev_image(
     from vigild.server import _github_app, build, build_runner
 
     v = build()
+    data = _data_dir(None)  # what build() resolves: VIGIL_DATA_DIR, else the config
+    typer.echo(f"data dir: {data}")
     runner = build_runner(v, _github_app(v))
     images = runner.dev_images
     ok = True
@@ -408,6 +410,14 @@ def dev_image(
     except StaleDevImage as e:
         ok = False
         typer.echo(f"fail  {repo}  {e}")
+    except Exception as e:
+        # cut short: no record, so vigild would still say "not built"
+        stage = getattr(images, "stage", "") or "start"
+        typer.echo(
+            f"fail  {repo}  stopped at {stage}: {type(e).__name__}: {str(e)[:300]}; "
+            f"no record was written to {data}"
+        )
+        raise typer.Exit(1) from e
     finally:
         runner.close()  # the docker client, or its pool's __del__ writes to a closed stderr
     last = images.latest(repo)

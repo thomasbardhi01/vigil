@@ -769,9 +769,12 @@ class JobRunner:
         self._page(None, title, body)
 
     def on_rebuild(self, repo: str, base_sha: str) -> None:
-        """The owner asked for a failed dev image to be built again."""
+        """The owner asked for a failed dev image to be built again. The page's
+        `base_sha` is where it failed, possibly behind a fix that has since merged, so
+        the build is at main's tip (the same commit `vigil dev-image` builds at)."""
 
         def go(_: str) -> None:
+            base_sha = self.workspace.head_sha(repo, "main")
             if self.session_images is not None:
                 self.session_images.ensure_fresh(repo, base_sha, force=True)
             else:

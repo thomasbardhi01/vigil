@@ -157,6 +157,7 @@ class DevImages:
         self.clock = clock
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self.stage = ""  # where a build is now; the CLI names it if the build is cut short
 
     # --- identity -------------------------------------------------------------------
 
@@ -276,6 +277,7 @@ class DevImages:
         pol = self.cfg.repo(repo)
         tag = self.tag(repo, key)
         ctx = Path(tempfile.mkdtemp(prefix="vigil-devctx-"))
+        self.stage = "build"
         try:
             self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx, source)
             ok, out = self.docker.build(ctx, self.dockerfile(repo), tag, timeout_s=BUILD_SECONDS)
@@ -285,6 +287,7 @@ class DevImages:
         if not ok or image_id is None:
             failed: dict[str, Any] = {"build": out[-TAIL:]}
             return self._record(repo, key, tag, None, False, "build", failed, base_sha)
+        self.stage = "validate"
         src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source=source)
         suites: dict[str, dict[str, Any]] = {}
         try:
@@ -488,6 +491,7 @@ class SessionImages:
             return tag
 
     def _build(self, repo: str, key: str, tag: str, dev_tag: str, base_sha: str) -> Validation:
+        self.dev.stage = "session-build"
         ok, out = self.dev.docker.build(
             EXECUTOR_LAYER,
             EXECUTOR_LAYER / "Dockerfile",
@@ -505,6 +509,7 @@ class SessionImages:
         if not ok or image_id is None:
             fail: dict[str, Any] = {"build": out[-TAIL:]}
             return self.dev._record(repo, key, tag, None, False, "session-build", fail, base_sha)
+        self.dev.stage = "session-validate"
         code, check = self.dev.docker.run_check(tag, SESSION_CHECK)
         body: dict[str, Any] = {"check": check[-TAIL:], "base": dev_tag}
         return self.dev._record(
