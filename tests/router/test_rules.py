@@ -196,7 +196,7 @@ def _load() -> Config:
     return config_mod.load()
 
 
-def test_a_built_task_with_vi_0004s_shape_routes_to_the_tower() -> None:
+def test_a_built_task_with_a_related_test_routes_to_the_tower() -> None:
     files = {"vigild/workspace.py": "x", "tests/test_workspace.py": "x"}
     t = _built(files, ["vigild/workspace.py", "tests/jobs/test_new.py"], labels=["tests"], size="S")
     r = route(t, _load())
@@ -208,3 +208,12 @@ def test_a_built_feature_task_with_no_test_at_the_base_is_rule4() -> None:
         {"vigild/a.py": "x"}, ["vigild/a.py", "tests/test_a.py"], labels=["feature"], size="M"
     )
     assert route(t, _load()).tier_reason == "rule4:new-feature-no-tests"
+
+
+def test_a_built_task_with_vi_0004s_exact_shape_routes_to_the_tower() -> None:
+    files = {"tests/security/conftest.py": "x"}
+    scope = ["tests/security/conftest.py", "tests/security/test_teardown_labels.py"]
+    t = _built(files, scope, labels=["tests"], size="S")
+    assert t.has_existing_tests is True
+    r = route(t, _load())
+    assert r.tier_reason.startswith("rule6") and r.preset == "tower-qwen"

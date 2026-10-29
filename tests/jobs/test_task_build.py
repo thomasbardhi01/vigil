@@ -56,9 +56,16 @@ def test_an_in_scope_test_file_at_the_base() -> None:
     assert t.has_existing_tests is True
 
 
-def test_vi_0004_shape_a_source_file_with_a_related_test_and_a_new_test() -> None:
+def test_a_source_file_with_a_related_test_and_a_new_test() -> None:
     files = {"tests/test_workspace.py": "x", "vigild/workspace.py": "x"}
     _, t = build(files, ["vigild/workspace.py", "tests/jobs/test_new_thing.py"])
+    assert t.has_existing_tests is True
+
+
+def test_vi_0004_exact_shape_existing_conftest_and_a_new_test() -> None:
+    files = {"tests/security/conftest.py": "x"}
+    scope = ["tests/security/conftest.py", "tests/security/test_teardown_labels.py"]
+    _, t = build(files, scope, labels=["tests"], size="S")
     assert t.has_existing_tests is True
 
 
