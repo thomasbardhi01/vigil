@@ -56,7 +56,7 @@ def job_tree(store: Store, job_id: str) -> dict[str, Any]:
             "fix_depth": job.fix_depth,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
-            "cost_usd": round(sum(s.cost_usd for s in sessions), 6),
+            "cost_usd": round(sum(n["cost_usd"] for n in nodes.values()), 6),  # booked included
             "cost_unknown_sessions": unknown,
         },
         "lineage": {"parent": job.parent_job_id, "children": store.child_jobs(job_id)},

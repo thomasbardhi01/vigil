@@ -107,3 +107,19 @@ def test_no_reservation_in_the_ledger_notes_zero(store: Store) -> None:
     assert job_tree(store, job.id)["job"]["cost_unknown_sessions"] == [
         {"session_id": "s-none", "note": "cost unknown; booked at reservation $0.00"}
     ]
+
+
+def test_a_booking_with_no_session_cost_still_counts_in_tree_and_kpi_totals(store: Store) -> None:
+    """The owner's ruling (2026-10-29): the ledger is booked money and stays in every
+    total. An unmetered session's own `cost_usd` is 0; its reservation is in the ledger."""
+    job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    for f, t in (("building", "in_review"), ("in_review", "ready"), ("ready", "merged")):
+        store.add_event("state", {"from": f, "to": t}, "human", job_id=job.id)
+    _session(store, job.id, "s-ok", 1.5, 1)
+    _session(store, job.id, "s-none", 0.25, 0)
+    store.x("UPDATE sessions SET cost_usd=0 WHERE id='s-none'")
+    store.x("UPDATE sessions SET pr_url='https://x/1' WHERE id='s-ok'")
+    tree = job_tree(store, job.id)
+    assert {n["id"]: n["cost_usd"] for n in tree["sessions"]}["s-none"] == 0.25
+    assert tree["job"]["cost_usd"] == 1.75
+    assert compute(store)["cost_per_merged_pr"] == 1.75
