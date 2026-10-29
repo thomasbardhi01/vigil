@@ -282,6 +282,8 @@ def assemble_worker(
             untrusted["plan.md"] = fresh_fix["plan"][:FRESH_PLAN_CHARS]
         if fresh_fix.get("changelog"):
             untrusted["spec_changelog.md"] = fresh_fix["changelog"][:FRESH_CHANGELOG_CHARS]
+        if fresh_fix.get("history"):  # an escalation: every round, not just the latest
+            untrusted["review history"] = fresh_fix["history"]
     if fix_round:
         contract_part += (
             f"\n**Fix round {fix_round['round']}.** Your branch already holds your earlier "
@@ -337,6 +339,33 @@ FRESH_DIFF_CHARS = 30_000
 FRESH_VERIFIER_CHARS = 6_000
 FRESH_PLAN_CHARS = 12_000
 FRESH_CHANGELOG_CHARS = 6_000
+FRESH_FINDINGS_CHARS = 16_000
+
+
+def round_findings(rounds: list[dict[str, Any]], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every review round's findings, oldest first (#101). The newest rounds are in full
+    up to `cap` characters (the newest always is); older ones are listed by round, index
+    and severity under a dropped note."""
+    ordered = sorted(rounds, key=lambda r: int(r.get("round") or 0))
+    full: list[dict[str, Any]] = []
+    used = 0
+    for r in reversed(ordered):
+        size = len(json.dumps(r.get("findings") or [], indent=1))
+        if full and used + size > cap:
+            break
+        full.append(r)
+        used += size
+    dropped = ordered[: len(ordered) - len(full)]
+    out = ""
+    if dropped:
+        out += "Older rounds, dropped to keep this packet small (round:index severity):\n"
+        for r in dropped:
+            for i, f in enumerate(r.get("findings") or []):
+                out += f"- round {r.get('round')}:{i} {f.get('severity')}\n"
+        out += "\n"
+    for r in reversed(full):
+        out += f"Round {r.get('round')}:\n{json.dumps(r.get('findings') or [], indent=1)}\n\n"
+    return out
 
 
 def _review_parts(
