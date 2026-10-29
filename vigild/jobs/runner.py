@@ -2351,15 +2351,18 @@ class JobRunner:
                 if not admitted:
                     return {}
                 retrying = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                # a publish refusal's retry republishes its recorded head (#152): it
+                # reserves nothing and starts no session
+                republish = [t for t in retrying if self._republish_inputs(t) is not None]
                 try:
-                    held = self._reserve_wave(job_id, admitted)
+                    held = self._reserve_wave(job_id, [t for t in admitted if t not in republish])
                 except Refused:
                     return None
                 for tid in admitted:
                     self.store.update_task(tid, state="running")  # its place in the stack
             routed_before = {tid: self.store.get_task(tid) for tid in retrying}
             try:
-                for tid in retrying:
+                for tid in (t for t in retrying if t not in republish):
                     # another attempt; the third is routed by rule 5 (escalated)
                     attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
                     self._reroute(job_id, tid, attempt=attempt + 1)
@@ -2389,7 +2392,9 @@ class JobRunner:
             # a worker the day had no room for waits in its own thread (the budget
             # queue), so the others run and free the money
             return {
-                tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
+                tid: functools.partial(self._republish, job_id, tid)
+                if tid in republish
+                else functools.partial(self._run_worker, job_id, tid, *held[tid])
                 if tid in held
                 else functools.partial(self._run_queued_worker, job_id, tid)
                 for tid in admitted
@@ -3282,31 +3287,48 @@ class JobRunner:
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
+        pub = {
+            "head": head, "base_sha": base_sha, "branch": branch, "body": body,
+            "owner_review": bool(overlap and not hidden_on), "pr_url": pr_url,
+            "runner_file_change": overlap,
+        }  # fmt: skip
+        return self._publish_task(job, s, task_id, pub)
+
+    def _publish_task(self, job: Job, s: SessionRow, task_id: str, pub: dict[str, Any]) -> bool:
+        """Publish a verified, accepted head and open the task's PR. On a refusal the
+        inputs are kept (`publish_refused`), so a retry can republish without a session."""
+        contract = self.store.get_task(task_id).contract
+        job_id = job.id
         try:
             url = self._publish(
                 job,
                 repo=job.repo,
-                head=head,
-                base_sha=base_sha,
-                branch=branch,
+                head=pub["head"],
+                base_sha=pub["base_sha"],
+                branch=pub["branch"],
                 base=job.base,
                 title=(
                     OWNER_REVIEW_TITLE
-                    if overlap and not hidden_on
+                    if pub["owner_review"]
                     else pr_title(job_id, contract["spec"]["goal"])
                 ),
-                body=body,
+                body=pub["body"],
                 scope=[
                     *contract["spec"]["files_in_scope"],
                     *artifact_paths(job_id, task_id),
                     *vigild_paths(job_id),
                 ],
-                existing=pr_url,
+                existing=pub["pr_url"],
             )
         except PublishError as e:
+            self.store.add_event(
+                "publish_refused", redact(pub), Provenance.HUMAN,
+                job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+        head, branch, overlap = pub["head"], pub["branch"], pub["runner_file_change"]
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
-        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        facts = self._pub_facts(job.repo, branch, pub["base_sha"])  # vault git: outside the tx
         # #34: the state and the event with its URL land together, or neither does
         with self.store.tx():
             self.store.update_task(task_id, state="pr_open")
@@ -3325,6 +3347,48 @@ class JobRunner:
                 task_id=task_id,
             )
         return True
+
+    def _republish_inputs(self, task_id: str) -> dict[str, Any] | None:
+        """What a task's last publish refusal kept, if that refusal is its latest failure:
+        its result was imported, verified and accepted, so only the publish is retried."""
+        rows = self.store.q(
+            "SELECT type, data FROM events WHERE task_id=? "
+            "AND type IN ('task_failed','publish_refused') ORDER BY id DESC LIMIT 2",
+            (task_id,),
+        )
+        if len(rows) < 2 or rows[1]["type"] != "publish_refused":
+            return None
+        if json.loads(rows[0]["data"]).get("title") != f"{task_id}: publish refused":
+            return None
+        if self._last_worker(task_id) is None:
+            return None
+        pub: dict[str, Any] = json.loads(rows[1]["data"])
+        return pub
+
+    def _republish(self, job_id: str, task_id: str) -> bool:
+        """Retry after a publish refusal (#152): republish the recorded vault head. No
+        worker session, no reservation, no verifier run; the title is recomputed."""
+        job = self.store.get_job(job_id)
+        pub = self._republish_inputs(task_id)
+        s = self._last_worker(task_id)
+        assert pub is not None and s is not None  # dispatch checked, before it set `running`
+        try:
+            ok = self._publish_task(job, s, task_id, pub)
+        except Exception as e:  # vigild trouble: the task fails, nothing is left running
+            log.exception("republish %s failed", task_id)
+            return self._fail(
+                job_id,
+                s,
+                task_id,
+                f"{task_id}: vigild error",
+                {"error": f"{type(e).__name__}: {e}"},
+            )
+        result = self._task_pr(task_id) if ok else self._why.get(task_id, {}).get("error")
+        self.store.add_event(
+            "republish", {"task": task_id, "head": pub["head"], "result": result},
+            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+        )  # fmt: skip
+        return ok
 
     # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 
