@@ -53,6 +53,7 @@ class Runner(Protocol):
     def on_resume(self, job_id: str, *, replan: bool = False) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]: ...
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
     def fix_check(self, job_id: str, task_id: str) -> str | None: ...
     def fix_escalation(self, job_id: str, task_id: str) -> str | None: ...
@@ -582,10 +583,13 @@ class JobService:
         plan = self.store.get_artifact(job_id, "plan.md")
         if plan is None:
             return {}
-        runner_config = self.cfg.repo(self.store.get_job(job_id).repo).runner_config
+        job = self.store.get_job(job_id)
         spec = self.store.get_artifact(job_id, "spec.md")
         classes = plan_runner_class(
-            spec.content if spec else "", parse_plan(plan.content).workers, runner_config
+            spec.content if spec else "",
+            parse_plan(plan.content).workers,
+            self.cfg.repo(job.repo).runner_config,
+            self.runner.base_reader(job.repo, job.base),
         )
         return {t: hit for t, hit in classes.items() if hit}
 
