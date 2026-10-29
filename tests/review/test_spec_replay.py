@@ -302,6 +302,8 @@ def test_the_replay_gate_reads_files_at_the_base_sha_not_the_branch_tip(
     ws = w.runner.workspace
     work = tmp_path / "tipwork"
     git(tmp_path, "clone", "-q", str(w.bare), str(work))
+    git(work, "config", "user.email", "t@vigil.invalid")  # the dev image has no global identity
+    git(work, "config", "user.name", "t")
     (work / "docs" / "runbook.md").unlink()  # present at the base, gone at the tip
     (work / "added.txt").write_text("new\n")  # absent at the base, present at the tip
     git(work, "add", "-A")
@@ -592,6 +594,8 @@ def test_the_replay_gate_must_read_the_base_not_the_tip_end_to_end(
     jobs.dirs = lambda repo, base: lambda path: ws.mirror_is_dir(repo, base, path)
     work = tmp_path / "tipwork"
     git(tmp_path, "clone", "-q", str(w.bare), str(work))
+    git(work, "config", "user.email", "t@vigil.invalid")  # the dev image has no global identity
+    git(work, "config", "user.name", "t")
     (work / "fresh").mkdir()
     (work / "fresh" / "x.txt").write_text("x\n")  # a directory only the tip has
     git(work, "rm", "-rq", "docs")  # a directory only the base has

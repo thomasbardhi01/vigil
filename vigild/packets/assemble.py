@@ -31,6 +31,7 @@ from vigild.jobs.model import Role
 from vigild.jobs.ownernote import spec_body as spec_text
 from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
+from vigild.packets.prefill import Prefill
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 DEFAULT_BUDGET_CHARS = 120_000
@@ -40,6 +41,7 @@ TITLES = {
     "context_pack": "2. Context pack",
     "contract": "3. Contract",
     "feature_index": "1a. Feature-map index (one line per row)",
+    "prefill": "3b. Prefill (vigild's own computation, paths read at base_sha)",
     "owner": "3a. Owner's amendment (from the owner, not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
@@ -282,6 +284,8 @@ def assemble_worker(
             untrusted["plan.md"] = fresh_fix["plan"][:FRESH_PLAN_CHARS]
         if fresh_fix.get("changelog"):
             untrusted["spec_changelog.md"] = fresh_fix["changelog"][:FRESH_CHANGELOG_CHARS]
+        if fresh_fix.get("history"):  # an escalation: every round, not just the latest
+            untrusted["review history"] = fresh_fix["history"]
     if fix_round:
         contract_part += (
             f"\n**Fix round {fix_round['round']}.** Your branch already holds your earlier "
@@ -337,6 +341,43 @@ FRESH_DIFF_CHARS = 30_000
 FRESH_VERIFIER_CHARS = 6_000
 FRESH_PLAN_CHARS = 12_000
 FRESH_CHANGELOG_CHARS = 6_000
+FRESH_FINDINGS_CHARS = 16_000
+
+
+def round_findings(rounds: list[dict[str, Any]], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every review round's findings, oldest first (#101). The newest rounds are in full
+    up to `cap` characters (the newest always is); older ones are listed by round, index
+    and severity under a dropped note."""
+    ordered = sorted(rounds, key=lambda r: int(r.get("round") or 0))
+    full: list[dict[str, Any]] = []
+    used = 0
+    for r in reversed(ordered):
+        size = len(json.dumps(r.get("findings") or [], indent=1))
+        if full and used + size > cap:
+            break
+        full.append(r)
+        used += size
+    dropped = ordered[: len(ordered) - len(full)]
+    out = ""
+    if dropped:
+        out += "Older rounds, dropped to keep this packet small (round:index severity):\n"
+        for r in dropped:
+            for i, f in enumerate(r.get("findings") or []):
+                out += f"- round {r.get('round')}:{i} {f.get('severity')}\n"
+        out += "\n"
+    for r in reversed(full):
+        body = json.dumps(r.get("findings") or [], indent=1)
+        if len(body) > cap:  # a hard bound: even the newest round is cut
+            body = body[:cap] + "\n(truncated)"
+        out += f"Round {r.get('round')}:\n{body}\n\n"
+    return out
+
+
+def joined_histories(parts: list[str], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every task's review history for the replan coord (#101). Each part is bounded by
+    `round_findings`; the join is bounded too, at `cap` characters."""
+    text = "\n".join(parts)
+    return text if len(text) <= cap else text[:cap] + "\n(truncated)"
 
 
 def _review_parts(
@@ -608,6 +649,8 @@ def _assemble_coord(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -621,7 +664,10 @@ def _assemble_coord(
     3. the job: the contract, the notes, gate errors, untrusted text, the schema.
 
     `extra_paths` is the hook for vigild's pre-fill (part 5): paths it found
-    that the request doesn't name. `fresh` is a replan that starts the coord from
+    that the request doesn't name. `prefill` is that pre-fill, which every
+    variant carries as its own fenced part (`skeleton`: the coord's clone holds a
+    spec.md and plan.md skeleton, true on a first draft only).
+    `fresh` is a replan that starts the coord from
     nothing (#78): the stable block (so the cached prefix is shared) but no
     scope excerpts, only the contract, the owner's note and spec (`amend`) and
     the untrusted failures and plan.md the caller passes. `amend` is (the spec to
@@ -669,6 +715,7 @@ def _assemble_coord(
         **({"feature_index": index} if lean else {}),
         "context_pack": pack,
         "contract": contract,
+        **({"prefill": prefill.section(job_id, skeleton=skeleton)} if prefill else {}),
     }
     if amend is not None:
         previous, baseline, owner_notes = amend
@@ -720,6 +767,8 @@ def assemble_coord_classic(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
 ) -> Packet:
@@ -733,6 +782,8 @@ def assemble_coord_classic(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
         budget_chars=budget_chars,
     )
@@ -746,6 +797,8 @@ def assemble_coord_lean(
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
     extra_paths: list[str] | None = None,
+    prefill: Prefill | None = None,
+    skeleton: bool = False,
     fresh: bool = False,
 ) -> Packet:
     """The lean coord packet (ADR-0005 part 1)."""
@@ -757,6 +810,8 @@ def assemble_coord_lean(
         gate_errors=gate_errors,
         amend=amend,
         extra_paths=extra_paths,
+        prefill=prefill,
+        skeleton=skeleton,
         fresh=fresh,
     )
 
