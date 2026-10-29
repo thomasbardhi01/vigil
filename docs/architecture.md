@@ -316,7 +316,13 @@ stateDiagram-v2
   across the fleet, each in its own container, clone and `vigil/<task>`
   branch. After a worker exits, vigild imports its result into the vault
   (decision `vault-host-git`), reads `worker_report.json` from there, checks stage-3 acceptance
-  (decision `reading-session-files`), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
+  (decision `reading-session-files`; it includes the rules-only completion-integrity
+  check, `vigild/jobs/integrity.py`: added TODOs and skips with no reason, stubs, self-referential
+  report text and deleted guards; report-only since the owner's ruling of 2026-10-29: each
+  finding is an `integrity_finding` event and an advisory fenced section of the reviewer's
+  packet, never an acceptance error, until `ENFORCE` in `vigild/jobs/integrity.py` is flipped
+  to True by a one-line PR carrying the false-positive count; enforcing, findings page the job
+  like a weakened test, but `self-referential-evidence` alone never does), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
   instead files a question for its coord and your inbox, and its task
   waits. A worker session with no `model_calls` row did no metered work: its task fails
   before the import and pages (retry, re-plan, abandon), and nothing is published (#102). Work that can't start (a dependency failed or waits, or the repo
