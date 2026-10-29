@@ -220,6 +220,29 @@ def test_a_job_from_before_the_event_carried_a_base_uses_the_clone_record(world:
     assert len(_sessions(w, since)) == 1
 
 
+def test_the_clone_record_is_the_approved_coord_sessions_own_when_clone_ids_repeat(
+    world: World,
+) -> None:
+    """Clone ids are per coord attempt and reused (pa-0003: coord1, coord2, coord1), so the
+    count of coord sessions doesn't name a clone; the approved session's own clone does."""
+    w = world
+    job = _approved(w)
+    w.store.x("UPDATE events SET data=json_remove(data, '$.base_sha') WHERE type='packet'")
+    w.store.x(
+        "INSERT INTO sessions (id, job_id, task_id, role, parent_session_id, backend_preset,"
+        " status, container_id, branch, pr_url, clone_path, cost_usd, tokens_in, tokens_out,"
+        " started_at, ended_at, created_at, detail, provenance)"
+        " SELECT 's-earlier-draft', job_id, task_id, role, parent_session_id, backend_preset,"
+        " 'revise', container_id, branch, pr_url, clone_path, cost_usd, tokens_in, tokens_out,"
+        " started_at, ended_at, '2000-01-01T00:00:00+00:00', detail, provenance"
+        " FROM sessions WHERE job_id=? AND role='coord' ORDER BY created_at DESC LIMIT 1",
+        (job,),
+    )  # an earlier draft in the same clone: two coord sessions, one clone
+    r = _post(w, job)
+    assert r.status_code == 200, r.text
+    assert r.json()["base_source"] == "clone_record"
+
+
 def test_a_later_redrafts_base_is_never_taken_as_the_approved_ones(world: World) -> None:
     w = world
     job = _approved(w)
