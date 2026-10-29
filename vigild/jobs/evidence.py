@@ -13,6 +13,7 @@ from vigild.redact import redact
 UNKNOWN_OUTPUT = "withheld (unknown output)"
 MAX_BYTES = 2000
 _CAP = re.compile(r"out of (budget|cap)|budget.{0,20}(exceed|cap)|over (the )?cap", re.I)
+_PARTIAL_MARK = re.compile(r"\[(r(e(d(a(c(t(e(d)?)?)?)?)?)?)?)?$")  # a cut "[redacted]"
 _REFUSED = re.compile(r"refus", re.I)
 
 
@@ -46,11 +47,15 @@ def failure_diagnostic(status: str, exit_code: int | None, error: str | None) ->
     else:
         return UNKNOWN_OUTPUT
     line = f"{kind}: {redact(text)}"
-    return line.encode()[:MAX_BYTES].decode(errors="ignore")
+    cut = line.encode()[:MAX_BYTES].decode(errors="ignore")
+    return _PARTIAL_MARK.sub("", cut) if len(line.encode()) > MAX_BYTES else cut  # no split marker
 
 
 def executor_block(
-    detail: dict[str, Any], end_head: str, failure: str | None = None
+    detail: dict[str, Any],
+    end_head: str,
+    prior_failure: str | None = None,
+    prior_session_id: str | None = None,
 ) -> dict[str, Any]:
     """The `executor` block, from the session's stored launch record."""
     return {
@@ -59,5 +64,6 @@ def executor_block(
         "launch_head": detail.get("launch_head"),
         "end_head": end_head,
         "lineage": detail.get("lineage"),
-        "failure_diagnostic": failure,
+        "prior_failure_diagnostic": prior_failure,
+        "prior_failure_session_id": prior_session_id if prior_failure else None,
     }

@@ -237,7 +237,18 @@ class ExecutorEvidence(Strict):
     launch_head: str | None = None
     end_head: str | None = None
     lineage: Lineage | None = None
-    failure_diagnostic: str | None = Field(default=None, max_length=2000)
+    prior_failure_diagnostic: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Screened output of an EARLIER session's failure, carried forward; it is not "
+            "this session's own outcome. `prior_failure_session_id` names that session."
+        ),
+    )
+    prior_failure_session_id: str | None = Field(
+        default=None,
+        description="The session whose failure `prior_failure_diagnostic` describes.",
+    )
 
 
 class WorkerReport(Strict):

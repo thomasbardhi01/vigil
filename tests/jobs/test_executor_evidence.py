@@ -10,11 +10,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from tests.jobs.test_coord_loop import World, _approve, _work, world  # noqa: F401
+from tests.conftest import auth
+from tests.jobs.test_coord_loop import (  # noqa: F401
+    World,
+    _approve,
+    _failure_item,
+    _work,
+    world,
+)
 from vigild.contract.models import WorkerReport
-from vigild.executors.base import SessionSpec
+from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.jobs.artifacts import read_worker_report
 from vigild.jobs.evidence import UNKNOWN_OUTPUT, failure_diagnostic
+from vigild.jobs.model import Role
 
 OLD_REPORT = {
     "task_id": "pa-0001-w1",
@@ -57,7 +65,7 @@ def test_the_stored_report_carries_vigilds_records(world: World) -> None:
     assert ex.end_head == w.runner._task_head(task)
     assert ex.lineage is not None
     assert ex.lineage.mode == "fresh" and ex.lineage.parent_session_id is None
-    assert ex.failure_diagnostic is None
+    assert ex.prior_failure_diagnostic is None and ex.prior_failure_session_id is None
 
 
 def test_a_workers_own_executor_block_is_replaced(world: World) -> None:
@@ -121,3 +129,39 @@ def test_a_report_stored_before_106_still_loads(tmp_path: Any) -> None:
     d.mkdir(parents=True)
     (d / "worker_report.json").write_text(json.dumps(OLD_REPORT))
     assert read_worker_report(tmp_path, "pa-0001", "pa-0001-w1").executor is None
+
+
+def test_a_retry_labels_the_earlier_failure_as_prior(world: World) -> None:
+    w = world
+    real = w.standin.run
+    tries = [0]
+
+    def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+        if spec.role is Role.WORKER and str(spec.task_id).endswith("w1"):
+            tries[0] += 1
+            if tries[0] == 1:
+                return ExecOutcome("timeout", None, {}, "over 40 min")
+        return real(spec, token, sink)
+
+    w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    item = _failure_item(w, job)
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    first, second = [
+        s for s in w.store.list_sessions(job) if s.task_id == f"{job}-w1" and s.role is Role.WORKER
+    ]
+    ex = _stored(w, job).executor
+    assert ex is not None
+    assert ex.prior_failure_session_id == first.id != second.id
+    assert (ex.prior_failure_diagnostic or "").startswith("timeout")
+    assert "failure_diagnostic" not in ex.model_dump()
+
+
+def test_the_cut_never_leaves_half_a_redaction_marker() -> None:
+    secret = "ghp_" + "Z9y8X7w6" * 5
+    for pad in range(1975, 1995):
+        out = failure_diagnostic("failed", 1, "x" * pad + secret + " tail" * 50)
+        assert out is not None and len(out.encode()) <= 2000
+        assert not out.endswith(("[", "[r", "[re", "[red", "[reda", "[redac", "[redact"))
+        assert not out.endswith(("[redacte", "[redacted"))

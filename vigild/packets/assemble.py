@@ -308,7 +308,9 @@ def assemble_worker(
     if fix_context and fix_context.get("failure_log"):
         untrusted["failure-log"] = fix_context["failure_log"]
     report = artifact_path(Path("."), contract["job_id"], "worker_report.json", contract["task_id"])
-    schema = json.dumps(WorkerReport.model_json_schema(), indent=1, sort_keys=True)
+    schema_doc = WorkerReport.model_json_schema()
+    schema_doc["properties"].pop("executor", None)  # vigild's own field; a worker never writes it
+    schema = json.dumps(schema_doc, indent=1, sort_keys=True)
     output = (
         f"End by writing `{report.as_posix()}` (relative to the repo root), valid against this "
         f"schema, with `provenance` set to `claude`. Then commit.\n\n```json\n{schema}\n```\n\n"

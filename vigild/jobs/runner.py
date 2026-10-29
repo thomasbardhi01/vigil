@@ -3153,6 +3153,7 @@ class JobRunner:
                         self.store.get_session(s.id).detail,
                         head,
                         prev.detail.get("failure_diagnostic") if prev else None,
+                        prev.id if prev else None,
                     )
                 ),
             }
