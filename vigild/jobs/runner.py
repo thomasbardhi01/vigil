@@ -78,6 +78,7 @@ from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
+from vigild.jobs import decisions
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
@@ -95,6 +96,7 @@ from vigild.packets.assemble import (
     assemble_hidden_test_author,
     assemble_review,
     assemble_worker,
+    joined_histories,
     round_findings,
 )
 from vigild.packets.fence import fence
@@ -1328,7 +1330,10 @@ class JobRunner:
         if not rows:
             return {}
         tasks = json.loads(rows[0]["data"]).get("tasks")
-        return tasks if isinstance(tasks, dict) else {}
+        if not isinstance(tasks, dict):
+            return {}
+        # an event written before #118 may hold an int per task: those are dropped
+        return {tid: t for tid, t in tasks.items() if isinstance(t, dict)}
 
     def _abandoned(self, job_id: str) -> bool:
         try:
@@ -1596,6 +1601,7 @@ class JobRunner:
                 job_id=job_id,
                 session_id=coord.id,
             )
+            decisions.add(self.store, job_id, "vigild", "gate", gate_errors[0])
         if self.store.get_job(job_id).source == "bench":
             # tagged, and the run goes on with no owner step: bench measures spec quality
             self._bench_failure(job_id, "spec", stage="spec_gate", errors=gate_errors or [])
@@ -1676,16 +1682,11 @@ class JobRunner:
         if replan:
             # vigild's summary goes in the contract; the failure details carry
             # worker and test output, so they go in the untrusted section
-            # a `review_rounds` page carries a finding count per task, not a dict
             request["replan"] = {
-                tid: (
-                    {"title": t.get("title"), "state": t.get("state")}
-                    if isinstance(t, dict)
-                    else {"findings": t}
-                )
-                for tid, t in replan.items()
+                tid: {"title": t.get("title"), "state": t.get("state")} for tid, t in replan.items()
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
+        untrusted |= decisions.section(self.store, job_id)  # ADR-0005 part 4: fenced data
         # A replan starts the coord fresh at every attempt (#78, #101, ADR-0005):
         # spec.md, plan.md, spec_changelog.md, the note, the failures. Nothing is forked.
         fresh = bool(replan or amend)
@@ -1703,7 +1704,7 @@ class JobRunner:
                 if hist := self._findings_history(task, None):
                     histories.append(f"Task {task.id}:\n{hist}")
             if histories:  # the review rounds that led here (#101), every task's
-                untrusted["review history"] = "\n".join(histories)
+                untrusted["review history"] = joined_histories(histories)
         self.workspace.write_task(clone, request)
         # a fresh replan (#78) is not affected by the switch: it is always the classic one
         assemble = assemble_coord if fresh else COORD_PACKETS[self.cfg.routing.coord_packet]
@@ -1772,6 +1773,17 @@ class JobRunner:
                 job_id, f"{job_id}: coord result unusable", {"error": str(e)}, resumable=True
             )
             return None
+        # the coord's decisions: a vault blob, never read from the clone
+        log = self.workspace.read_blob(job.repo, head, f".vigil/{job_id}/{decisions.NAME}")
+        if log:
+            n_kept, n_dropped = decisions.ingest_coord(self.store, job_id, log)
+            self.store.add_event(
+                "decisions",
+                {"kept": n_kept, "dropped": n_dropped, "attempt": attempt},
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=coord.id,
+            )
         drafts: dict[str, str] = {}
         kept = self.store.get_artifact(job_id, "spec.md")
         human = kept is not None and kept.provenance == Provenance.HUMAN.value
@@ -2836,8 +2848,8 @@ class JobRunner:
             if escalated or attempt >= self.cfg.routing.escalate_attempt:
                 fresh_fix["history"] = self._findings_history(t, fix_round)
         packet = assemble_worker(
-            clone, contract, untrusted={}, approval_edits=edits, fix_round=fix_round,
-            fresh_fix=fresh_fix,
+            clone, contract, untrusted=decisions.section(self.store, job_id),
+            approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
         )  # fmt: skip
         resume = self._resume_from(prev.id) if prev and forks else None
         if after_deps:
@@ -3813,7 +3825,14 @@ class JobRunner:
                     f"{job_id}: findings remain after {limit} review rounds and an escalation",
                     {
                         "kind": "review_rounds",
-                        "tasks": {tid: outcomes[tid][1] for tid in over},
+                        "tasks": {
+                            tid: {
+                                "title": self.store.get_task(tid).contract["spec"].get("goal"),
+                                "state": self.store.get_task(tid).state,
+                                "findings": outcomes[tid][1],
+                            }
+                            for tid in over
+                        },
                         "actions": ["replan", "abandon"],
                     },
                 )
@@ -4054,7 +4073,10 @@ class JobRunner:
             inputs.diff,
             inputs.untrusted,
         )
-        packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
+        # the reviewer sees the decisions log; the auditor reviews independently, without it
+        packet = assemble_review(
+            rules, request, diff=diff, untrusted=untrusted | decisions.section(self.store, job.id)
+        )
         out, why = self._read_only_session(
             job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
             self.cfg.budgets.review_session_usd, shape.value,
@@ -4164,6 +4186,7 @@ class JobRunner:
                  "tier_reason": r.tier_reason},
                 Provenance.HUMAN, job_id=job_id, task_id=task_id,
             )  # fmt: skip
+            decisions.add(self.store, job_id, "vigild", "escalation", f"{task_id}: {r.tier_reason}")
             most = self.cfg.vigild.breakers.max_escalations_per_day
             if escalations_today(self.store) > most:
                 self.breakers.trip(

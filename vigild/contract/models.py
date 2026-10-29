@@ -395,3 +395,13 @@ class Audit(AuditOutput):
         if not counted:
             return 1.0
         return sum(1 for f in counted if f.matched is not None) / len(counted)
+
+
+class DecisionLine(Strict):
+    """One line of a job's `decisions.jsonl` (ADR-0005 part 4). `by` says who wrote it;
+    vigild sets it, whatever the coord's file says."""
+
+    ts: str
+    by: Literal["coord", "vigild"]
+    kind: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
+    text: Annotated[str, Field(max_length=300)]

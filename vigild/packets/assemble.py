@@ -371,6 +371,13 @@ def round_findings(rounds: list[dict[str, Any]], cap: int = FRESH_FINDINGS_CHARS
     return out
 
 
+def joined_histories(parts: list[str], cap: int = FRESH_FINDINGS_CHARS) -> str:
+    """Every task's review history for the replan coord (#101). Each part is bounded by
+    `round_findings`; the join is bounded too, at `cap` characters."""
+    text = "\n".join(parts)
+    return text if len(text) <= cap else text[:cap] + "\n(truncated)"
+
+
 def _review_parts(
     rules: str,
     role: Role,

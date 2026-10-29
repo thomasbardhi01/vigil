@@ -14,7 +14,7 @@ from tests.conftest import auth
 from tests.jobs.test_coord_loop import World, _approve, _failure_item, world  # noqa: F401
 from tests.review.test_review_stage import CLEAN_REVIEW, MEDIUM, _rounds, _workers
 from vigild.jobs.model import Role
-from vigild.packets.assemble import FRESH_FINDINGS_CHARS, round_findings
+from vigild.packets.assemble import FRESH_FINDINGS_CHARS, joined_histories, round_findings
 
 FIRST_CALL_TOKENS = 20_000
 R1 = {**CLEAN_REVIEW, "verdict": "changes", "findings": [{**MEDIUM, "claim": "ROUND-ONE-CLAIM"}]}
@@ -114,3 +114,14 @@ def test_the_newest_round_is_bounded_too() -> None:
     text = round_findings([big])
     assert len(text) <= FRESH_FINDINGS_CHARS + 200
     assert "(truncated)" in text
+
+
+def test_the_replan_coords_joined_history_is_bounded() -> None:
+    """Each task's history is bounded; the replan coord joins every task's, so the join is too."""
+    parts = [
+        f"Task vi-1-w{i}:\n" + round_findings([_round(1, FRESH_FINDINGS_CHARS)]) for i in range(4)
+    ]
+    text = joined_histories(parts)
+    assert len(text) <= FRESH_FINDINGS_CHARS + 200
+    assert text.startswith("Task vi-1-w0:") and text.endswith("(truncated)")
+    assert joined_histories(["Task a:\nx", "Task b:\ny"]) == "Task a:\nx\nTask b:\ny"
