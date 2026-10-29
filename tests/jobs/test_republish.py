@@ -109,3 +109,18 @@ def test_a_422_keeps_githubs_reason() -> None:
         assert "422: Validation Failed" in str(e) and "title is too long" in str(e)
     else:
         raise AssertionError("a 422 was accepted")
+
+
+def test_redact_leaves_the_publish_fields_unchanged() -> None:
+    """The publish_refused event goes through redact; the republish reads head, base_sha
+    and branch back from it, so redact must not alter them (owner, 2026-10-29)."""
+    from vigild.redact import redact
+
+    pub = {
+        "head": "85b225ec2c71d9d5913ff2d60ba39ddfa1d606d9",
+        "base_sha": "36ed10c1e2f3a4b5c6d7e8f90123456789abcdef",
+        "branch": "vigil/vi-0005-w4",
+    }
+    assert redact(pub) == pub
+    for sha in ("0" * 40, "f" * 40, "abcdef0123456789" * 2 + "abcdef01"):
+        assert redact({"head": sha}) == {"head": sha}
