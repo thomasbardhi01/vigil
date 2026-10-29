@@ -61,6 +61,7 @@ from vigild.contract.models import (
     ReviewOutput,
     Size,
     Spec,
+    StoredAudit,
     Task,
     TestOutcome,
     Verify,
@@ -4012,7 +4013,7 @@ class JobRunner:
             rv = self.store.get_artifact(job_id, "review.json", t.id)
             au = self.store.get_artifact(job_id, "audit.json", t.id)
             review = json.loads(rv.content) if rv else {}
-            audit = Audit.model_validate_json(au.content) if au else None
+            audit = StoredAudit.model_validate_json(au.content) if au else None
             prs.append(
                 {
                     "task_id": t.id,

@@ -23,7 +23,8 @@ from vigild.executors.base import SessionSpec
 from vigild.jobs.model import Role
 
 MEDIUM = {"severity": "medium", "file": "docs/feature-map.md", "line": 3,
-          "claim": "the row has no unit", "fix": "say req/min"}  # fmt: skip
+          "claim": "the row has no unit", "fix": "say req/min",
+          "evidence": {"kind": "diff_line", "ref": "docs/feature-map.md:3"}, "confidence": 0.9}  # fmt: skip
 HIGH = {**MEDIUM, "severity": "high", "claim": "the limit is wrong"}
 
 
@@ -170,3 +171,36 @@ def test_an_escalated_attempt_starts_fresh_and_forks_nothing(world: World) -> No
     assert w.store.get_task(f"{job}-w1").tier_reason.startswith("rule5")  # type: ignore[union-attr]
     assert escalated.resume is None
     assert not [e for e in w.store.events(job_id=job) if e.type == "fork"]
+
+
+def test_a_finding_without_evidence_fails_the_review_like_a_malformed_review(world: World) -> None:
+    """#105: there is no re-ask loop for a malformed review; it fails the stage gate with the
+    parse reason naming the field, and the inbox retry runs the review again."""
+    w = world
+    bare = {k: v for k, v in MEDIUM.items() if k != "evidence"}
+    w.standin.review = lambda spec: {**CLEAN_REVIEW, "verdict": "changes", "findings": [bare]}
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job, "review_failed")
+    body = json.dumps(item["body"]["tasks"])
+    assert "no valid review.json" in body and "evidence" in body
+    assert w.store.get_artifact(job, "review.json", f"{job}-w1") is None
+
+
+def test_a_pre_105_audit_still_lets_the_ready_item_be_made(world: World) -> None:
+    """#105: an audit.json stored before evidence and confidence existed is read leniently."""
+    w = world
+    job = _approve(w)
+    tid = f"{job}-w1"
+    au = w.store.get_artifact(job, "audit.json", tid)
+    assert au is not None
+    legacy = {
+        **json.loads(au.content),
+        "findings": [{"severity": "low", "file": "a.py", "line": 1, "claim": "c", "fix": "f",
+                      "matched": 0}],
+    }  # fmt: skip
+    w.store.add_artifact(job, "audit.json", json.dumps(legacy), au.provenance, task_id=tid)
+    before = len(w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"])
+    w.runner._ready(job)
+    after = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"]
+    assert len(after) == before + 1

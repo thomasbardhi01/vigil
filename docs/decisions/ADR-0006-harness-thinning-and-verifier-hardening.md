@@ -53,6 +53,7 @@ G is docs only and can be done any time. H waits for the bench freeze to lift.
 - **Evidence:** each finding in `review.json` carries `evidence: test | diff_line | spec_criterion | runtime_log`, plus that evidence's locator: a test id, a file:line, an AC id, or a log excerpt id. A finding without evidence is refused at parse, and the reviewer is told why.
 - **Confidence:** `confidence` (0–1), as already relayed (omp research item A6).
 - **Packaging:** one PR, one schema change, `schemas/*.json` regenerated. Phase 7's auditor match rate gains confidence as a second dimension.
+- **Built (part):** #105. `Finding` has `evidence: {kind, ref}` and `confidence`; a finding without them, a `diff_line` ref that is not `path:line`, or a `spec_criterion` ref that is not an AC id is refused at parse. There is no re-ask loop for a malformed review, so it fails the stage gate (retry or abandon). The auditor's match rate is not built.
 
 ### D. Deny-and-continue
 - **The worker continues:** when the guard plugin refuses a tool call, the worker is told the call was refused and to find another route, and it carries on.
