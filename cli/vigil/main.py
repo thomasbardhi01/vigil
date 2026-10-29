@@ -401,6 +401,7 @@ def dev_image(
     images = runner.dev_images
     ok = True
     try:
+        images.stage = "fetch"  # the mirror fetch inside head_sha
         base = runner.workspace.head_sha(repo, "main")
         tag = images.ensure_fresh(repo, base, force=rebuild)
         typer.echo(f"pass  {repo}  {tag}")

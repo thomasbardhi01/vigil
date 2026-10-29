@@ -219,6 +219,7 @@ class DevImages:
         `source="vault"`: a commit only vigild's vault has (a deps job's head,
         plan 2a item 5): built from its lockfiles, its suites run on it."""
         with self._lock(repo):
+            self.stage = ""  # not a stale stage from an earlier build
             key = self.key(repo, base_sha, source)
             tag = self.tag(repo, key)
             last = self.latest(repo, key)

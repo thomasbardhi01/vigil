@@ -267,3 +267,31 @@ def test_a_build_stopped_mid_validation_exits_nonzero_and_says_no_record_was_wri
     assert "validate" in out.output and "docker went away" in out.output
     assert "no record was written" in out.output
     assert images.store.q("SELECT * FROM dev_images") == []
+
+
+def test_a_fetch_failure_names_the_fetch_stage(world: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    images, _, ws, _, _ = _cli_world(world, monkeypatch)
+
+    def no_fetch(*a: Any, **kw: Any) -> str:
+        raise RuntimeError("github is down")
+
+    monkeypatch.setattr(ws, "head_sha", no_fetch)
+    out = CliRunner().invoke(app, ["dev-image", "--repo", "o/fixture"])
+    assert out.exit_code != 0
+    assert "fetch" in out.output and "github is down" in out.output
+    assert "no record was written" in out.output
+    assert images.store.q("SELECT * FROM dev_images") == []
+
+
+def test_a_build_failure_names_the_build_stage(world: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    images, _, _, _, _ = _cli_world(world, monkeypatch)
+
+    def no_build(*a: Any, **kw: Any) -> str:
+        raise RuntimeError("docker build died")
+
+    monkeypatch.setattr(images.docker, "build", no_build)
+    out = CliRunner().invoke(app, ["dev-image", "--repo", "o/fixture"])
+    assert out.exit_code != 0
+    assert "build" in out.output and "docker build died" in out.output
+    assert "no record was written" in out.output
+    assert images.store.q("SELECT * FROM dev_images") == []
