@@ -39,8 +39,9 @@ FILE_SUFFIXES = (
 )  # fmt: skip
 
 RULES = (
-    "- Exact files only: every entry in `## Files in scope` and in a worker's "
-    "`files_in_scope` is one file path, never a directory or a glob.\n"
+    "- Exact files or `dir/**`: every entry in `## Files in scope` and in a worker's "
+    "`files_in_scope` is one file path or a directory's `dir/**`, never a bare directory "
+    "(it matches only itself).\n"
     "- Each worker's `files_in_scope` sits inside spec.md's `## Files in scope`.\n"
     "- A runner file named in scope is named by its exact path (vigild sets the task's "
     "runner-file flag and hidden tests follow); a money path named in scope is listed "
@@ -220,7 +221,7 @@ def compute_prefill(
             if h not in pre.candidates and len(pre.candidates) < MAX_CANDIDATES:
                 pre.candidates.append(h)
         elif "/" in h or h.endswith(FILE_SUFFIXES):
-            why = "a glob, and scope is exact files only" if set("*?[") & set(h) else "no such file"
+            why = "a glob; candidates are files" if set("*?[") & set(h) else "no such file"
             pre.dropped.append(f"`{h}` ({why} at base_sha)")
     pre.dropped = pre.dropped[:MAX_DROPPED]
     pre.money_paths = [c for c in pre.candidates if matches_any(c, money_globs)]

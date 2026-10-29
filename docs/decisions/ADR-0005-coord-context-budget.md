@@ -90,7 +90,7 @@ The single `coord: claude-opus` becomes rules, top to bottom, first match wins. 
 ### 5. vigild pre-fills the mechanical parts
 Before the coord runs, vigild computes these and writes them into the spec and plan skeleton the coord receives:
 - runner files, money paths and pinned paths;
-- the scope rules: exact files only, and each worker's scope inside spec.md's files in scope;
+- the scope rules: exact files or `dir/**` (never a bare directory, as the gate requires), and each worker's scope inside spec.md's files in scope;
 - `test_cmd` candidates: the repo's `dev_suites` and the test files that match the scope.
 
 The coord writes the goal, the acceptance criteria and the risks. The spec gate is unchanged: it still checks everything, including what vigild filled in.

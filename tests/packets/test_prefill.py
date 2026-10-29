@@ -104,7 +104,8 @@ def test_the_section_is_fenced_and_carries_the_rules(repo: Path) -> None:
     text = pre.section("vi-0001", skeleton=True)
     fenced = [m for m in FENCE_RE.finditer(text) if m.group(1) == "prefill"]
     assert len(fenced) == 1 and "`vigild/budget.py`" in fenced[0].group(3)
-    assert "Exact files only" in text and "inside spec.md" in text and "Money paths" in text
+    assert "Exact files or `dir/**`" in text and "never a bare directory" in text
+    assert "inside spec.md" in text and "Money paths" in text
     assert "changelog" in text and ".vigil/vi-0001/spec.md" in text
     assert ".vigil/vi-0001/spec.md" not in pre.section("vi-0001", skeleton=False)
 
@@ -165,7 +166,7 @@ def test_classic_lean_and_fresh_packets_all_carry_the_prefill(repo: Path) -> Non
     pre = compute_prefill(repo, request(NAMES), policy=policy(), money_globs=MONEY)
     for name, text in _packets(repo, pre).items():
         assert "<<<UNTRUSTED prefill " in text, name
-        assert "`vigild/budget.py`" in text and "Exact files only" in text, name
+        assert "`vigild/budget.py`" in text and "never a bare directory" in text, name
 
 
 def test_a_packet_without_a_prefill_is_unchanged(repo: Path) -> None:
