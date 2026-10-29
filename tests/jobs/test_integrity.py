@@ -127,3 +127,73 @@ def test_a_guard_with_a_replacement_or_a_new_negative_test_is_quiet() -> None:
             **_diff("tests/test_a.py", ["    with pytest.raises(ValueError):"])}  # fmt: skip
     assert _rules(both) == []
     assert _rules(_diff("a.py", [], removed=["x = 1"])) == []
+
+
+# fix round 1: false positives
+def test_js_skip_and_only_outside_test_files_are_quiet() -> None:
+    assert _rules(_diff("lib.js", ["const rest = cursor.skip(10);"])) == []
+    assert _rules(_diff("lib.ts", ["opt.only(1)"])) == []
+    assert _rules(_diff("a.test.ts", ["cursor.skip(10)"])) == []
+
+
+def test_a_comment_marker_inside_a_string_is_not_a_comment() -> None:
+    assert _rules(_diff("a.py", ['msg = "see # TODO list"'])) == []
+    assert _rules(_diff("a.js", ['u = "http://x.io/TODO"'])) == []
+    assert _rules(_diff("a.py", ['    """Flags a `# TODO` comment."""'])) == []
+    assert _rules(_diff("a.py", ["# TODO(alice) tidy"])) == ["todo-without-issue"]
+    assert _rules(_diff("a.py", ["x = 'it''s'  # TODO tidy"])) == ["todo-without-issue"]
+
+
+def test_not_implemented_in_protocols_abcs_and_test_doubles_is_quiet() -> None:
+    body = ["    def run(self) -> None:", "        raise NotImplementedError"]
+    assert _rules(_diff("a.py", body, ctx=["class P(Protocol):"])) == []
+    assert _rules(_diff("a.py", body, ctx=["class P(Base, metaclass=ABCMeta):"])) == []
+    assert _rules(_diff("a.py", body, ctx=["    @overload"])) == []
+    assert _rules(_diff("tests/test_fake.py", body)) == []
+    assert _rules(_diff("a.py", body)) == ["stub"]
+
+
+def test_not_implemented_reads_the_full_new_file_when_given() -> None:
+    d = _diff("a.py", ["        raise NotImplementedError"])
+    src = (
+        "class P(Protocol):\n"
+        + "\n" * 18
+        + "    def run(self) -> None:\n"
+        + "        raise NotImplementedError\n"
+    )
+    assert d["a.py"] and check(d) != []
+    assert (
+        check({"a.py": "@@ -1,0 +21,1 @@\n+        raise NotImplementedError\n"}, lambda p: src)
+        == []
+    )
+    assert [f.rule for f in check(
+        {"a.py": "@@ -1,0 +21,1 @@\n+        raise NotImplementedError\n"},
+        lambda p: src.replace("Protocol", "Base"))] == ["stub"]  # fmt: skip
+
+
+def test_a_deleted_or_moved_guard_is_quiet() -> None:
+    gone = {"a.py": "--- a/a.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-raise ValueError('x')\n"}
+    assert _rules(gone) == []
+    moved = {**_diff("a.py", [], removed=["validate(x)"]), **_diff("b.py", ["  validate(x)"])}
+    assert _rules(moved) == []
+    assert _rules(_diff("a.py", ["raise TypeError"], removed=["raise ValueError"])) == []
+    assert _rules(_diff("a.py", ["X = 1"], removed=["ALLOWED = 1"])) == []
+
+
+def test_a_not_found_test_does_not_hide_a_removed_guard() -> None:
+    both = {**_diff("a.py", [], removed=["    validate(x)"]),
+            **_diff("tests/test_a.py", ["def test_not_found():", "def test_fail_soft():"])}  # fmt: skip
+    assert _rules(both) == ["guard-removed"]
+
+
+def test_stubbed_and_reasonable_are_not_markers() -> None:
+    assert _rules(_diff("a.py", ["except E:", "    pass  # stubbed out"])) == []
+    assert _rules(_diff("t.py", ["@pytest.mark.skipif(not reasonable)"])) == ["skip-without-reason"]
+
+
+def test_self_referential_evidence_ignores_questions_and_named_tests() -> None:
+    r = _report(summary="Works as expected, see test_refuses_x.")
+    assert report_findings(r) == []
+    r = _report(summary="ok")
+    r2 = r.model_copy(update={"open_questions": ["is it manually verified?"]})
+    assert report_findings(r2) == []
