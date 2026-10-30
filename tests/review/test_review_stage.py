@@ -254,3 +254,21 @@ def test_a_model_cannot_mark_its_own_finding_invalid_to_skip_evidence(world: Wor
     job = _approve(w)
     assert w.store.get_job(job).state.value == "blocked"
     assert "evidence" in json.dumps(_failure_item(w, job, "review_failed")["body"]["tasks"])
+
+
+def test_a_well_formed_spec_section_naming_nothing_is_kept_invalid_and_blocks(world: World) -> None:
+    """#183: `goal:9` is well formed but the spec has no such Goal item."""
+    w = world
+    bad = {**HIGH, "evidence": {"kind": "spec_section", "ref": "goal:9"}}
+    w.standin.review = _rounds({"w1": [{**CLEAN_REVIEW, "verdict": "changes", "findings": [bad]}]})
+    job = _approve(w)
+    tid = f"{job}-w1"
+    assert not [i for i in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+                if i["body"].get("kind") == "review_failed"]  # fmt: skip
+    first = json.loads(w.store.get_artifact(job, "findings.json", tid).content)  # type: ignore[union-attr]
+    (f,) = first["findings"]
+    assert f["evidence_invalid"] is True and f["severity"] == "high"
+    assert "Goal item 9" in f["evidence_error"]
+    (ev,) = [e for e in _events(w, "evidence_invalid") if e["task_id"] == tid]
+    assert ev["finding"] == 0
+    assert len(_workers(w, "w1")) == 2  # blocked: a fix round ran

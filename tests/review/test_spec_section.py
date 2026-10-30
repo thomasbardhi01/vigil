@@ -51,3 +51,39 @@ def test_a_goal_that_is_prose_is_item_one() -> None:
 def test_a_section_the_spec_lacks_is_refused(ref: str) -> None:
     err = spec_section_error(ref, parse_spec(BARE))
     assert err is not None and "no" in err
+
+
+ODD = """# Spec: x
+
+## Goal
+Do it.
+
+## Non-Goals
+- nothing
+
+## acceptance criteria
+- AC1: ok
+
+## Files Out Of Scope
+- `b.py`
+"""
+NESTED = """# Spec: x
+
+## Goal
+- one
+  - sub a
+  - sub b
+- two
+    - sub c
+"""
+
+
+@pytest.mark.parametrize("ref", ["non_goals", "done_when", "files_out_of_scope"])
+def test_a_section_heading_in_odd_case_is_found(ref: str) -> None:
+    assert spec_section_error(ref, parse_spec(ODD)) is None
+
+
+def test_only_top_level_goal_items_count() -> None:
+    spec = parse_spec(NESTED)
+    assert spec_section_error("goal:2", spec) is None
+    assert spec_section_error("goal:3", spec) is not None

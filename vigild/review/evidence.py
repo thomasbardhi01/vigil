@@ -16,12 +16,20 @@ _SECTION = {
     "non_goals": ("Non-goals", "Non-goals"),
     "files_out_of_scope": ("Files out of scope", "Files out of scope"),
 }
-_ITEM = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+\S")
+_ITEM = re.compile(r"^(?:[-*]|\d+[.)])\s+\S")  # top level only: no indent
+
+
+def _key(name: str) -> str:
+    return re.sub(r"[\s_-]+", " ", name.strip().lower())
+
+
+def _section(spec: SpecDoc, name: str) -> str:
+    return next((b for h, b in spec.sections.items() if _key(h) == _key(name)), "")
 
 
 def goal_items(spec: SpecDoc) -> int:
     """Goal items: its list entries, or 1 for a Goal written as prose, or 0 for none."""
-    body = spec.sections.get("Goal", "")
+    body = _section(spec, "Goal")
     n = sum(1 for ln in body.splitlines() if _ITEM.match(ln))
     return n or (1 if body.strip() else 0)
 
@@ -35,7 +43,7 @@ def spec_section_error(ref: str, spec: SpecDoc) -> str | None:
             return f"the spec has no Goal item {n} (it has {have} item(s))"
         return None
     name, label = _SECTION[ref]
-    if not spec.sections.get(name, "").strip():
+    if not _section(spec, name).strip():
         return f"the spec has no {label} section"
     return None
 
