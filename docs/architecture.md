@@ -21,7 +21,7 @@ inference. The tower serves models and nothing else.
 
 | Component | Runs where | How | Job |
 |---|---|---|---|
-| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`), kept alive by a launchd agent (`deploy/launchd/dev.vigil.vigild.plist`) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
+| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`), kept alive by a launchd agent (`deploy/launchd/dev.vigil.vigild.plist`); updated by `scripts/deploy.sh` (idle check, ff-only pull of the production clone, restart, doctor, image rebuild) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `uv run python cli/vigil …`; `vigil mcp` runs on stdio under a Claude Code session (decision `vigil-mcp`) | thin clients of the REST API; `doctor` and `dev-image` in phase 1 |
 | Claude executor | Mac mini, one container per session | Docker Desktop, linux/arm64 image | Claude Agent SDK, headless; coord, worker, reviewer and auditor sessions |
 | OpenCode executor (phase 4) | Mac mini, one container per session | Docker Desktop, linux/arm64 image | `opencode serve` (v2) driven over HTTP |

@@ -819,6 +819,32 @@ GitHub). It logs to `~/vigil-data/logs/vigild.log`. The template is
 - The log isn't rotated; truncate it with `: > ~/vigil-data/logs/vigild.log`
   when it grows.
 
+### Deploy production vigild
+
+Production runs from its own clone, `~/vigil-prod` (`$VIGIL_PROD_DIR`), that
+only `scripts/deploy.sh` writes to. Coord never runs git there. The owner
+points the launchd plist's `WorkingDirectory` at it.
+
+```sh
+scripts/deploy.sh [--prod-dir DIR] [--data-dir DIR] [--no-rebuild] [--dry-run]
+```
+
+In order, stopping at the first failure:
+1. **Idle check.** No job `building` or `in_review`, no session `running` or
+   `starting`, no `dev.vigil.job` container. Otherwise it names them and
+   exits 2 having changed nothing.
+2. **Fast-forward** `origin/main` into the production clone; a dirty clone or
+   a non-fast-forward stops it.
+3. **Restart** with `launchctl kickstart -k`, then wait up to 60 s for
+   `127.0.0.1:8787`.
+4. **`vigil doctor`.** A fail line makes the exit non-zero; nothing is undone.
+5. **Rebuild** each configured repo's dev image (`--rebuild`) when the range
+   touched `images/`, `prompts/`, `pyproject.toml` or `uv.lock`.
+6. **Summary:** `production <old> -> <new>` and the range's log.
+
+`--dry-run` prints the steps and changes nothing. The morning report carries
+a line `production <sha> / main <sha>`; they differ when a deploy is pending.
+
 ### Start vigild
 
 ```sh
