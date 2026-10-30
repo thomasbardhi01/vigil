@@ -3500,7 +3500,9 @@ class JobRunner:
 
     def _owner_event(self, task_id: str) -> tuple[int, dict[str, Any]] | None:
         """The task's latest `owner_republish` event, if no `republish` event has consumed
-        it (the `republish` event records the id it consumed)."""
+        it (the `republish` event records the id it consumed) and the task has not failed
+        since: a later `task_failed` (a vigild error during the publish, say) ends the
+        owner's request, so a retry after it starts a session, never the old head."""
         rows = self.store.q(
             "SELECT id, data FROM events WHERE task_id=? AND type='owner_republish' "
             "ORDER BY id DESC LIMIT 1",
@@ -3509,6 +3511,11 @@ class JobRunner:
         if not rows:
             return None
         eid = int(rows[0]["id"])
+        if self.store.q(
+            "SELECT 1 FROM events WHERE task_id=? AND type='task_failed' AND id>? LIMIT 1",
+            (task_id, eid),
+        ):
+            return None
         for r in self.store.q(
             "SELECT data FROM events WHERE task_id=? AND type='republish' AND id>?", (task_id, eid)
         ):

@@ -241,6 +241,22 @@ def test_a_failed_transition_leaves_no_event(world: World, monkeypatch: Any) -> 
     assert w.store.get_inbox_item(item["id"]).status == "open"
 
 
+def test_an_owner_republish_followed_by_a_failure_is_not_reused(world: World) -> None:
+    """If the owner's publish dies on a vigild error (no `republish` event), the task's
+    later failure ends the owner's request: a retry starts a session, never the old head."""
+    w = world
+    job, tid, item = _failed(w)
+    w.store.add_event(
+        "owner_republish", {"task": tid, "head": "0" * 40, "inbox_item_id": item["id"]},
+        "human", job_id=job, task_id=tid,
+    )  # fmt: skip
+    w.store.add_event(
+        "task_failed", {"title": f"{tid}: vigild error"}, "human", job_id=job, task_id=tid
+    )
+    assert w.runner._owner_event(tid) is None
+    assert w.runner._republish_inputs(tid) is None  # a session, not a stale republish
+
+
 def test_a_consumed_republish_is_not_used_again(world: World) -> None:
     w = world
     job, tid, item = _failed(w)
