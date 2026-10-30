@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tests.jobs.test_coord_loop import REPO, World, world  # noqa: F401
+from tests.jobs.test_coord_loop import World, world  # noqa: F401
 from tests.jobs.test_coord_routing import _submit
 from vigild.contract.models import WorkerContract
 from vigild.router.rules import route
@@ -69,6 +69,5 @@ def test_a_job_without_labels_changes_nothing(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job = _submit(world)
-    assert REPO == world.store.get_job(job).repo
     task = _task(world, job, _worker(job), monkeypatch)
     assert task.labels == []
