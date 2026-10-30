@@ -256,9 +256,13 @@ def test_the_amended_spec_changelog_and_diff_are_stored_and_the_item_shows_them(
     diff = _art(w, job, "spec_diff.md").content
     assert "\n+- Touching the CLI.\n" in diff and "\n-" not in diff.split("@@", 1)[1]
     body = _spec_item(w)["body"]
-    assert body["amendment"] == {
+    amendment = body["amendment"]
+    assert {k: amendment[k] for k in ("changelog", "diff", "note_bytes")} == {
         "changelog": CHANGELOG, "diff": diff, "note_bytes": len(NOTE.encode()),
     }  # fmt: skip
+    # a re-planned worker has a new id, so the contract diff shows tasks added and removed
+    assert {e["field"] for e in amendment["contract_diff"]} == {"task"}
+    assert "spec: Non-goals" in amendment["unlisted"]
     # plan.md is re-planned from the amended spec, and the gate ran on the amended spec
     assert _art(w, job, "plan.md").provenance == "claude"
     assert json.loads(_art(w, job, "spec_gate.json").content)["ok"] is True
@@ -580,6 +584,82 @@ def test_the_coord_prompt_says_scope_paths_have_no_trailing_slash() -> None:
 
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
     assert "no trailing slash" in text and "out_of_scope" in text
+
+
+# --- the contract diff and what the changelog leaves out (#38) ----------------------------------
+
+
+def _plan_with_out_of_scope(j: str) -> str:
+    text = plan(j)
+    assert text.count('"labels": [\n    "docs"\n   ]') >= 1 or '"labels"' in text
+    return text.replace('"labels"', '"out_of_scope": ["secrets/**"],\n   "labels"', 1)
+
+
+def test_plan_previous_and_out_of_scope_change_are_shown_and_unlisted(world: World) -> None:
+    w = world
+    job = _request(w)
+    drafted = _art(w, job, "plan.md")
+    w.standin.coord_drafts = [lambda j: (AMENDED, _plan_with_out_of_scope(j))]
+    w.standin.coord_extra = lambda clone, j: (
+        clone / ".vigil" / j / "spec_changelog.md"
+    ).write_text("- Added to Non-goals.\n")
+    assert _replan(w, _spec_item(w)).status_code == 200
+    prev = _art(w, job, "plan_previous.md")
+    assert prev.content == drafted.content and prev.provenance == drafted.provenance
+    amendment = _spec_item(w)["body"]["amendment"]
+    (entry,) = amendment["contract_diff"]
+    assert entry == {
+        "task_id": f"{job}-w1",
+        "field": "out_of_scope",
+        "previous": [],
+        "amended": ["secrets/**"],
+    }
+    assert amendment["unlisted"] == [f"{job}-w1: out_of_scope"]
+
+
+def test_plan_previous_uses_the_plan_before_the_approval(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    job, item = _held(w)
+    approval = w.store.get_artifact(job, "approval.json")
+    before = w.store.q(
+        "SELECT content FROM artifacts WHERE job_id=? AND name='plan.md' AND id < ?"
+        " ORDER BY id DESC LIMIT 1",
+        (job, approval.id),
+    )[0]["content"]
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    assert _art(w, job, "plan_previous.md").content == before
+
+
+def test_no_plan_previous_means_no_contract_diff(world: World) -> None:
+    w = world
+    job = _request(w)
+    item = _spec_item(w)
+    w.store.x("DELETE FROM artifacts WHERE job_id=? AND name='plan.md'", (job,))
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    assert _art(w, job, "plan_previous.md") is None
+    amendment = _spec_item(w)["body"]["amendment"]
+    assert amendment["contract_diff"] is None and amendment["changelog"] == CHANGELOG
+
+
+def test_replan_without_a_note_has_no_plan_previous(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    r = w.client.post(f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert _art(w, job, "plan_previous.md") is None
+
+
+def test_coord_prompt_keeps_plan_fields_byte_identical() -> None:
+    text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("4."))
+    end = next(i for i, ln in enumerate(lines) if ln.startswith("5."))
+    rule = "\n".join(lines[start:end])
+    assert "byte-identical" in rule and "spec_changelog.md" in rule
+    assert len(lines) <= 40
 
 
 # --- a coord token's note is the coord's, never the owner's (owner, 2026-10-29) -------------
