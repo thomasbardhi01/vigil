@@ -271,6 +271,28 @@ def test_wip_never_pauses_a_fix_round(world: World) -> None:
     assert len(w1) == 2  # the fix round ran under the open WIP breaker
 
 
+def _join_all(threads: list[threading.Thread], deadline: float) -> None:
+    """Join every thread under one overall deadline; fail if any is still alive."""
+    end = time.monotonic() + deadline
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not alive, f"dispatch did not finish within {deadline:g}s: {alive}"
+
+
+def test_dispatch_deadline_names_an_unfinished_dispatch() -> None:
+    release = threading.Event()
+    t = threading.Thread(target=release.wait, args=(30,))
+    t.start()
+    try:
+        with pytest.raises(AssertionError, match="dispatch did not finish"):
+            _join_all([t], 0.2)
+    finally:
+        release.set()
+        t.join(5)
+    assert not t.is_alive()
+
+
 def test_two_jobs_competing_for_one_wip_slot_get_one_pr(world: World) -> None:
     """B10: the room check and the move to running were not atomic across jobs."""
     from vigild.scheduler import wip
@@ -298,8 +320,7 @@ def test_two_jobs_competing_for_one_wip_slot_get_one_pr(world: World) -> None:
         threads = [threading.Thread(target=w.runner.dispatch, args=(j,)) for j in (a, b)]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(20)
+        _join_all(threads, 120)
     finally:
         wip.room = real_room  # type: ignore[assignment]
     assert len(w.publisher.prs) == 1
