@@ -21,6 +21,7 @@ from tests.jobs.test_coord_loop import World, _request, auth, world  # noqa: F40
 from tests.jobs.test_kill import _kill, _open_reservations, _spec_item
 from vigild.executors import runtime as rt
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
+from vigild.executors.hosts import HostExecutor, Hosts
 from vigild.executors.runtime import LABEL, DockerRuntime
 from vigild.jobs.model import JobState, Role
 
@@ -33,8 +34,12 @@ class Sleepers:
 
     def __init__(self, inner: Any, runtime: DockerRuntime) -> None:
         self.inner, self.runtime = inner, runtime
-        self.stop_job = runtime.stop_job
-        self.purge_job = runtime.purge_job
+        # the kill hooks the runner really has (#160): the HostExecutor's, over this runtime
+        hosts = Hosts(runtime.cfg, make_client=lambda h: runtime.client)
+        hosts._runtimes[runtime.host.name] = runtime
+        self.hostexec = HostExecutor(hosts)
+        self.stop_job = self.hostexec.stop_job
+        self.purge_job = self.hostexec.purge_job
 
     def run(self, spec: SessionSpec, token: str, on_event: EventSink) -> ExecOutcome:
         if spec.role is not Role.WORKER:
@@ -63,7 +68,7 @@ def test_a_running_job_leaves_no_container_network_or_reservation(
         return {**kw, "entrypoint": ["sleep", "600"], "command": []}
 
     monkeypatch.setattr(rt, "worker_kwargs", sleeping)
-    runtime = DockerRuntime(w.runner.cfg)
+    runtime = DockerRuntime(w.runner.cfg, recorded=w.store.recorded_container_ids)
     client = runtime.client
     bystander = client.containers.run(
         w.runner.cfg.vigild.images.claude_executor,
@@ -106,6 +111,14 @@ def test_a_running_job_leaves_no_container_network_or_reservation(
         assert w.store.get_job(job).state is JobState.ABANDONED
         for sid in sids:
             assert _labelled(client, sid) == ([], [])  # nothing of the job is left
+            names = {c.name for c in client.containers.list(all=True)}
+            assert not names & {f"vigil-{sid}", f"vigil-{sid}-egress"}  # `docker ps -a`
+        # #160: the worker and the sidecar of each session, counted and gone, rows ended
+        assert body["containers_removed"] == 4 and body["networks_removed"] == 2
+        assert body["containers_failed"] == [] and sorted(body["sessions_stopped"]) == sids
+        for s in w.store.list_sessions(job):
+            if s.id in sids:
+                assert s.status == "killed" and s.ended_at
         assert _open_reservations(w) == [] and body["reservations_open"] == []
         # #60: no page or item on the killed job, and no session row left running
         assert not [q for q in w.store.list_inbox() if q.job_id == job]

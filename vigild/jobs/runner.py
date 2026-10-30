@@ -1457,18 +1457,33 @@ class JobRunner:
         for r in rows:
             if not r["session_id"]:
                 self.budget.settle(int(r["id"]), 0.0)  # nothing metered: the hold goes back
-        # a session row nothing is running any more
-        if idle:
-            for s in self.store.list_sessions(job_id):
-                if s.status in LIVE_SESSION:
-                    self.store.update_session(s.id, status="killed", ended_at=iso())
         purge = getattr(self.executor, "purge_job", None)
-        removed = {"containers": 0, "networks": 0}
+        removed: dict[str, Any] = {"containers": 0, "networks": 0}
+        purge_failed = False
         if purge is not None:
             try:
                 removed = purge(job_id, sids)
             except Exception:
+                purge_failed = True
                 log.exception("kill %s: removing its containers failed", job_id)
+        # a session whose containers are gone is over; one with a container that would not
+        # go (named in `containers_failed`) stays as it is, so the owner sees it
+        failed = [str(n) for n in removed.get("failed", [])]
+        unreachable = [str(h) for h in removed.get("hosts_unreachable", [])]
+        stuck = {
+            sid
+            for sid in {s.id for s in self.store.list_sessions(job_id)}
+            if any(n in (f"vigil-{sid}", f"vigil-{sid}-egress") for n in failed)
+        }
+        for s in self.store.list_sessions(job_id):
+            if (
+                s.status in LIVE_SESSION
+                and s.id not in stuck
+                and not purge_failed
+                and (idle or purge is not None)
+            ):
+                self.store.update_session(s.id, status="killed", ended_at=iso())
+        stopped = [sid for sid in stopped if sid not in stuck and not purge_failed]
         still = set(self.budget.open_reservation_ids())
         return {
             "sessions_stopped": stopped,
@@ -1480,6 +1495,13 @@ class JobRunner:
             "reservations_open": [r for r in held if r in still],
             "containers_removed": removed["containers"],
             "networks_removed": removed["networks"],
+            "containers_failed": failed,
+            "kill_errors": {str(k): str(v) for k, v in removed.get("kill_errors", {}).items()},
+            "unowned": [str(n) for n in removed.get("unowned", [])],
+            "hosts_unreachable": unreachable,
+            # clean: nothing of the job is known to be left, on any host. A stuck verifier,
+            # probe or deps container counts, as does a host that could not be reached
+            "clean": not purge_failed and not failed and not unreachable,
         }
 
     def _replan_notes(self, job_id: str) -> list[str]:
