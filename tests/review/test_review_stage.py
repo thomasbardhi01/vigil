@@ -15,6 +15,7 @@ from tests.jobs.test_coord_loop import (
     CLEAN_REVIEW,
     World,
     _approve,
+    _events,
     _failure_item,
     _spend,
 )
@@ -204,3 +205,52 @@ def test_a_pre_105_audit_still_lets_the_ready_item_be_made(world: World) -> None
     w.runner._ready(job)
     after = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"]
     assert len(after) == before + 1
+
+
+def _bad_evidence(severity: str) -> dict[str, Any]:
+    ev = {"kind": "spec_criterion", "ref": "Goal 3"}
+    return {**MEDIUM, "severity": severity, "evidence": ev}
+
+
+def test_a_high_finding_with_invalid_evidence_is_kept_and_blocks_ready(world: World) -> None:
+    """#183: the stage completes; the finding is kept, marked, recorded, and still a high one."""
+    w = world
+    bad = _bad_evidence("high")
+    w.standin.review = _rounds({"w1": [{**CLEAN_REVIEW, "verdict": "changes", "findings": [bad]}]})
+    job = _approve(w)
+    tid = f"{job}-w1"
+    assert not [i for i in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+                if i["body"].get("kind") == "review_failed"]  # fmt: skip
+    first = json.loads(w.store.get_artifact(job, "findings.json", tid).content)  # type: ignore[union-attr]
+    (f,) = first["findings"]
+    assert f["severity"] == "high" and f["evidence_invalid"] is True and f["evidence"] is None
+    assert "spec_criterion" in f["evidence_error"] and "Goal 3" in f["evidence_error"]
+    (ev,) = [e for e in _events(w, "evidence_invalid") if e["task_id"] == tid]
+    assert ev["finding"] == 0 and ev["role"] == "reviewer" and "AC id" in ev["error"]
+    # it blocked like a valid high one: a fix round ran before the task could be reviewed
+    assert len(_workers(w, "w1")) == 2 and w.store.get_task(tid).contract["review_rounds"] == 1
+
+
+def test_a_low_finding_with_invalid_evidence_acts_like_a_valid_low_one(world: World) -> None:
+    w = world
+    w.standin.review = _rounds({"w1": [{**CLEAN_REVIEW, "findings": [_bad_evidence("low")]}]})
+    job = _approve(w)
+    tid = f"{job}-w1"
+    assert w.store.get_job(job).state.value == "ready" and w.store.get_task(tid).state == "reviewed"
+    assert len(_workers(w, "w1")) == 1  # a low finding sends nothing back, valid evidence or not
+    rv = json.loads(w.store.get_artifact(job, "review.json", tid).content)  # type: ignore[union-attr]
+    assert rv["findings"][0]["evidence_invalid"] is True
+    assert len([e for e in _events(w, "evidence_invalid") if e["task_id"] == tid]) == 1
+
+
+def test_a_model_cannot_mark_its_own_finding_invalid_to_skip_evidence(world: World) -> None:
+    w = world
+    bare = {k: v for k, v in MEDIUM.items() if k != "evidence"}
+    w.standin.review = lambda spec: {
+        **CLEAN_REVIEW,
+        "verdict": "changes",
+        "findings": [{**bare, "evidence_invalid": True}],
+    }
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    assert "evidence" in json.dumps(_failure_item(w, job, "review_failed")["body"]["tasks"])

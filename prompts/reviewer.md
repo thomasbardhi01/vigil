@@ -19,9 +19,12 @@ End with structured output: `{"verdict": "clean" | "changes", "findings": [{"sev
 "low|medium|high", "file", "line", "claim", "fix", "evidence": {"kind", "ref"},
 "confidence"}], "checklist": {...}}`. Every finding names a file and line and says how to
 fix it. Every finding also carries `evidence`: `kind` is `test` (ref: a test id),
-`diff_line` (ref: `path:line`), `spec_criterion` (ref: an AC id such as `AC3`) or
-`runtime_log` (ref: a log excerpt id), and `confidence` is a number from 0 to 1. A finding
-with no evidence, or a ref that does not fit its kind, makes the whole review invalid.
+`diff_line` (ref: `path:line`), `spec_criterion` (ref: an AC id such as `AC3`; AC ids only),
+`spec_section` (ref: `goal:N`, `done_when`, `non_goals` or `files_out_of_scope`) or
+`runtime_log` (ref: a log excerpt id), and `confidence` is a number from 0 to 1. For a
+Goal, Non-goal, done-when or out-of-scope point cite `spec_section` plus the offending
+`diff_line`. A finding with no evidence is invalid; one whose ref does not fit its kind is
+marked invalid but still counts at its severity.
 `confidence` is your probability that the finding is real and would change the merge
 decision. Example finding:
 `{"severity": "medium", "file": "vigild/a.py", "line": 12, "claim": "AC2's bound is not
