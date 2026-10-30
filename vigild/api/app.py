@@ -454,6 +454,8 @@ def reset(request: Request, item_id: int) -> dict[str, Any]:
         out = _svc(request).jobs.reset(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
+    except Forbidden as e:
+        raise HTTPException(403, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     # `queued`: the job's last run is still finishing; it picks up after (B4)

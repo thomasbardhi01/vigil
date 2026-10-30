@@ -399,3 +399,46 @@ def test_start_refuses_a_coord_token_equal_to_another(tmp_path: Any, other: str)
         build(env_file=env, data_dir=tmp_path / "d")
     assert other in str(e.value) and "VIGIL_COORD_TOKEN" in str(e.value)
     assert "shared-fake-value-000" not in str(e.value)
+
+
+# --- breaker resets (review round 2) ----------------------------------------------------
+
+
+def _breaker_page(store: Store, kind: str) -> int:
+    """An open breaker of `kind` and its page, as `Breakers.trip` leaves them."""
+    with store.tx():
+        store.x(
+            "INSERT INTO breakers (kind, scope, state, count, held, detail, updated_at)"
+            " VALUES (?, 'repo:o/fixture', 'open', 3, '[]', '{}', '2026-10-29T00:00:00+00:00')",
+            (kind,),
+        )
+        (row,) = store.q("SELECT id FROM breakers WHERE kind=?", (kind,))
+        item = store.create_inbox_item(
+            "questions", "page", None, f"{kind} tripped",
+            {"kind": "breaker", "breaker": row["id"], "breaker_kind": kind,
+             "actions": ["reset", "abandon"]},
+        )  # fmt: skip
+    return item.id
+
+
+@pytest.mark.parametrize("kind", ["daily_cap", "monthly_cap", "fix_depth"])
+def test_the_coord_token_resets_only_a_repo_failures_breaker(
+    client: TestClient, tokens: Tokens, store: Store, kind: str
+) -> None:
+    """The owner's ruling lets coord reset `repo_failures` only; a money or depth
+    breaker is the owner's."""
+    item = _breaker_page(store, kind)
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.coord))
+    assert r.status_code == 403, r.text
+    assert store.get_inbox_item(item).status == "open"
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.admin))
+    assert r.status_code == 200, r.text
+
+
+def test_the_coord_token_may_reset_a_repo_failures_breaker(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    item = _breaker_page(store, "repo_failures")
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.coord))
+    assert r.status_code == 200, r.text
+    assert store.get_inbox_item(item).resolved_by == "coord"

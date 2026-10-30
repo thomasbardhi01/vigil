@@ -1426,6 +1426,15 @@ class JobService:
                 item.body.get("actions") or []
             ):
                 raise Conflict(f"inbox item {item_id} doesn't offer reset")
+            if actor is Actor.COORD:
+                # the owner's ruling lets coord reset `repo_failures` only (a traced
+                # run of failures); a money, depth or backend breaker is the owner's.
+                # The kind is the breaker row's, not the page's.
+                rows = self.store.q(
+                    "SELECT kind FROM breakers WHERE id=?", (item.body.get("breaker"),)
+                )
+                if not rows or rows[0]["kind"] != "repo_failures":
+                    raise Forbidden("the coord token resets a repo_failures breaker only")
             self.store.add_event(
                 "reset", {"inbox_item_id": item_id, "breaker": item.body.get("breaker")},
                 Provenance.HUMAN, job_id=item.job_id,
