@@ -37,8 +37,8 @@ from vigild.jobs.acceptance import plan_runner_class
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
-from vigild.jobs.model import InboxItem, Job, JobState
-from vigild.jobs.ownernote import NOTE_MAX_BYTES
+from vigild.jobs.model import ArtifactRow, InboxItem, Job, JobState
+from vigild.jobs.ownernote import NOTE_MAX_BYTES, contract_diff, unlisted_changes
 from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
 from vigild.redact import redact
@@ -732,11 +732,18 @@ class JobService:
         note = self.store.get_artifact(job_id, "owner_note.md")
         if spec is None or diff is None or log is None or note is None or diff.id < spec.id:
             return {}
+        plan = self.store.get_artifact(job_id, "plan.md")
+        before = self.store.get_artifact(job_id, "plan_previous.md")
+        contract: list[dict[str, Any]] | None = None
+        if plan is not None and before is not None:
+            contract = contract_diff(before.content, plan.content)
         return {
             "amendment": {
                 "changelog": log.content,
                 "diff": diff.content,
                 "note_bytes": len(note.content.encode()),
+                "contract_diff": contract,
+                "unlisted": unlisted_changes(log.content, contract or [], diff.content),
             }
         }
 
@@ -1191,6 +1198,22 @@ class JobService:
             if spec is not None:
                 self.store.add_artifact(
                     job_id, "spec_previous.md", spec.content, Provenance(spec.provenance)
+                )
+            # the plan as of the same baseline (same SQL as spec_before, for plan.md)
+            if approval is None:
+                plan = self.store.get_artifact(job_id, "plan.md")
+            else:
+                rows = self.store.q(
+                    "SELECT * FROM artifacts WHERE job_id=? AND name='plan.md' AND task_id IS NULL"
+                    " AND id < ? ORDER BY id DESC LIMIT 1",
+                    (job_id, approval.id),
+                )
+                plan = ArtifactRow(**dict(rows[0])) if rows else None
+                if plan is None:
+                    plan = self.store.get_artifact(job_id, "plan.md")
+            if plan is not None:
+                self.store.add_artifact(
+                    job_id, "plan_previous.md", plan.content, Provenance(plan.provenance)
                 )
         self.store.add_event("replan", data, Provenance.HUMAN, job_id=job_id)
         first = (note or "").strip().splitlines()

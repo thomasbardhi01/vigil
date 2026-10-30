@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import difflib
 import re
+from typing import Any
 
-from vigild.jobs.artifacts import MD_PROV
+from vigild.jobs.artifacts import MD_PROV, parse_plan
 
 NOTE_MAX_BYTES = 8192
 
@@ -93,3 +94,73 @@ def author_contract(note: str) -> str:
         else:
             i += 1
     return "\n\n".join(sections) if sections else note.strip()
+
+
+CONTRACT_FIELDS = (
+    "test_cmd",
+    "files_in_scope",
+    "out_of_scope",
+    "must_fail_first",
+    "must_fail_first_reason",
+    "max_cost_usd",
+    "depends_on",
+    "labels",
+    "goal",
+    "done_when",
+    "verify_level",
+)
+
+
+def contract_diff(previous_plan: str, amended_plan: str) -> list[dict[str, Any]]:
+    """Every changed worker-contract field between two plan.md texts, matched by
+    task_id: {"task_id", "field", "previous", "amended"}. A task in only one plan is
+    one entry with field "task"; a differing `verify` list is one with task_id None."""
+    old, new = parse_plan(previous_plan), parse_plan(amended_plan)
+    a = {w.task_id: w.model_dump(mode="json") for w in old.workers}
+    b = {w.task_id: w.model_dump(mode="json") for w in new.workers}
+    out: list[dict[str, Any]] = []
+    for tid in [*a, *(t for t in b if t not in a)]:
+        if tid not in b or tid not in a:
+            out.append(
+                {"task_id": tid, "field": "task", "previous": a.get(tid), "amended": b.get(tid)}
+            )
+            continue
+        for f in CONTRACT_FIELDS:
+            if a[tid][f] != b[tid][f]:
+                out.append(
+                    {"task_id": tid, "field": f, "previous": a[tid][f], "amended": b[tid][f]}
+                )
+    va = [v.model_dump(mode="json") for v in old.verify]
+    vb = [v.model_dump(mode="json") for v in new.verify]
+    if va != vb:
+        out.append({"task_id": None, "field": "verify", "previous": va, "amended": vb})
+    return out
+
+
+def _names(changelog: str, word: str) -> bool:
+    return re.search(rf"(?<![\w]){re.escape(word)}(?![\w])", changelog, re.I) is not None
+
+
+def unlisted_changes(changelog: str, contract: list[dict[str, Any]], spec_diff: str) -> list[str]:
+    """The changes the changelog doesn't list. A contract change is listed when the
+    changelog has its field name as a whole token; a spec change when it names the `##`
+    section the diff changes (a change before any heading seen in the diff is "spec")."""
+    out = [
+        f"{c['task_id'] or 'plan'} {c['field']}: changed, not in the changelog"
+        for c in contract
+        if not _names(changelog, str(c["field"]))
+    ]
+    section = ""
+    changed: list[str] = []
+    for line in spec_diff.splitlines():
+        if line.startswith(("---", "+++", "@@")):
+            continue
+        text = line[1:]
+        if text.startswith("## "):
+            section = text[3:].strip()
+        if line[:1] in ("+", "-") and section not in changed:
+            changed.append(section)
+    for sec in changed:
+        if not sec or not _names(changelog, sec):
+            out.append(f"spec {sec or '(no section)'}: changed, not in the changelog")
+    return out

@@ -256,7 +256,11 @@ def test_the_amended_spec_changelog_and_diff_are_stored_and_the_item_shows_them(
     diff = _art(w, job, "spec_diff.md").content
     assert "\n+- Touching the CLI.\n" in diff and "\n-" not in diff.split("@@", 1)[1]
     body = _spec_item(w)["body"]
-    assert body["amendment"] == {
+    amendment = dict(body["amendment"])
+    # a replan after a build renumbers the workers: visible as removed and added tasks
+    assert {e["field"] for e in amendment.pop("contract_diff")} == {"task"}
+    assert "spec Non-goals: changed, not in the changelog" in amendment.pop("unlisted")
+    assert amendment == {
         "changelog": CHANGELOG, "diff": diff, "note_bytes": len(NOTE.encode()),
     }  # fmt: skip
     # plan.md is re-planned from the amended spec, and the gate ran on the amended spec
@@ -580,3 +584,79 @@ def test_the_coord_prompt_says_scope_paths_have_no_trailing_slash() -> None:
 
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
     assert "no trailing slash" in text and "out_of_scope" in text
+
+
+# --- the contract diff (#38) --------------------------------------------------------------------
+
+
+def _arm_plan_change(w: World) -> None:
+    """The amended plan widens worker 1's out_of_scope; the changelog never says so."""
+
+    def draft(j: str) -> tuple[str, str]:
+        text = plan(j)
+        raw = json.loads(text.split("```json\n")[1].split("```")[0])
+        raw["workers"][0]["out_of_scope"] = ["vigild/db.py"]
+        block = "```json\n" + json.dumps(raw, indent=1) + "\n```\n"
+        return AMENDED, text.split("```json\n")[0] + block
+
+    w.standin.coord_drafts = [draft]
+    w.standin.coord_extra = lambda clone, j: (
+        clone / ".vigil" / j / "spec_changelog.md"
+    ).write_text("- Touching the CLI is a non-goal (Non-goals).\n")
+
+
+def test_plan_previous_is_stored_with_the_plans_provenance(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    approved = _art(w, job, "plan.md")
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    prev = _art(w, job, "plan_previous.md")
+    assert prev.content == approved.content and prev.provenance == approved.provenance
+
+
+def test_plan_previous_of_a_never_approved_job_is_the_current_draft(world: World) -> None:
+    w = world
+    job = _request(w)
+    drafted = _art(w, job, "plan.md")
+    _arm(w)
+    assert _replan(w, _spec_item(w)).status_code == 200
+    prev = _art(w, job, "plan_previous.md")
+    assert prev.content == drafted.content and prev.provenance == drafted.provenance
+
+
+def test_an_out_of_scope_change_the_changelog_omits_is_shown_and_listed(world: World) -> None:
+    w = world
+    job = _request(w)
+    _arm_plan_change(w)
+    assert _replan(w, _spec_item(w)).status_code == 200
+    amendment = _spec_item(w)["body"]["amendment"]
+    (entry,) = amendment["contract_diff"]
+    assert entry["field"] == "out_of_scope" and entry["task_id"] == f"{job}-w1"
+    assert entry["previous"] == [] and entry["amended"] == ["vigild/db.py"]
+    assert amendment["unlisted"] == [f"{job}-w1 out_of_scope: changed, not in the changelog"]
+    assert amendment["changelog"].startswith("- Touching the CLI")
+
+
+def test_an_amendment_with_no_plan_previous_shows_a_null_contract_diff(
+    world: World, monkeypatch: Any
+) -> None:
+    w = world
+    _request(w)
+    _arm(w)
+    real = w.store.add_artifact
+
+    def add(job_id: str, name: str, *a: Any, **kw: Any) -> Any:
+        return None if name == "plan_previous.md" else real(job_id, name, *a, **kw)
+
+    monkeypatch.setattr(w.store, "add_artifact", add)  # a replan stored before this change
+    assert _replan(w, _spec_item(w)).status_code == 200
+    amendment = _spec_item(w)["body"]["amendment"]
+    assert amendment["contract_diff"] is None
+    assert amendment["changelog"] == CHANGELOG and "Touching the CLI" in amendment["diff"]
+
+
+def test_the_coord_prompt_keeps_plan_fields_byte_identical() -> None:
+    text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
+    rule4 = text.split("4. ")[1].split("\n5. ")[0]
+    assert "byte-identical" in rule4 and "spec_changelog.md" in rule4 and "by name" in rule4
