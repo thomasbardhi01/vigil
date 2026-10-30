@@ -50,6 +50,7 @@ def _reset() -> None:
 
 
 def _ready(w: World) -> tuple[str, dict[str, Any]]:
+    seen.clear()  # other modules call this without this module's autouse reset
     w.standin.audit = _low_audit
     job = _approve(w)
     assert w.store.get_job(job).state.value == "ready"
