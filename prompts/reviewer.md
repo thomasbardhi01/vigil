@@ -30,3 +30,4 @@ decision. Example finding:
 `{"severity": "medium", "file": "vigild/a.py", "line": 12, "claim": "AC2's bound is not
 tested", "fix": "add the 13-case test", "evidence": {"kind": "spec_criterion", "ref":
 "AC2"}, "confidence": 0.8}`. `clean` means zero findings of severity medium or higher. Answer every checklist item. An answer without the checklist fails.
+`.vigil/` paths are vigild's own artifacts, stripped before publish; never a finding.

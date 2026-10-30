@@ -645,6 +645,24 @@ class Workspace:
             base_sha, head,
         )  # fmt: skip
 
+    def published_diff(self, repo: str, base_sha: str, head: str) -> str:
+        """`full_diff` as it will be published: without the top-level `.vigil`, the
+        entry `public_commit` replaces with the base's. What a reviewer reads. (Git runs
+        with literal pathspecs, so the kept paths are listed rather than excluded.)"""
+        if not SHA.match(base_sha) or not SHA.match(head):
+            raise WorkspaceError("bad sha")
+        kept = [
+            path
+            for _, path in self.changed(repo, base_sha, head)
+            if path.partition("/")[0].lower() != VIGIL_DIR
+        ]
+        if not kept:
+            return ""
+        return self._git(
+            self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            base_sha, head, "--", *kept,
+        )  # fmt: skip
+
     def read_blob(self, repo: str, head: str, path: str, max_bytes: int = MAX_BLOB) -> str | None:
         """A regular file's content at `head`; None for a symlink, a submodule,
         a missing path or one over the cap."""
