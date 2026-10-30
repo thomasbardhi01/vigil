@@ -234,3 +234,124 @@ def test_closing_a_pr_patches_its_state_with_a_one_repo_write_token() -> None:
         pass
     else:
         raise AssertionError("a PR of another repo was closed")
+
+
+def test_a_branch_that_moved_on_the_remote_is_refused_before_any_push_or_record(
+    setup: tuple[Workspace, str, str, Path],
+) -> None:
+    """#32: the remote tip is neither vigild's record nor behind the commit sent."""
+    ws, base, head, bare = setup
+    tree = git(bare, "rev-parse", f"{base}^{{tree}}")
+    outside = git(bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+                  "-p", base, "-m", "someone else's push")  # fmt: skip
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", outside)
+    pulls = FakePulls(bare)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, pulls)
+    assert type(raised.value).__name__ == "BranchMoved"
+    assert "moved on the remote" in str(raised.value)
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == outside  # not overwritten
+    assert ws.published_sha(REPO, BRANCH) is None  # no record written
+    assert pulls.prs == []
+
+
+def _other_commit(bare: Path, parent: str, msg: str) -> str:
+    tree = git(bare, "rev-parse", f"{parent}^{{tree}}")
+    return git(bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+               "-p", parent, "-m", msg)  # fmt: skip
+
+
+def test_a_push_after_the_tip_read_is_atomic_against_that_tip(
+    setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#198: something lands between `remote_tip` and the push: BranchMoved, no overwrite."""
+    ws, base, head, bare = setup
+    real = ws.remote_tip
+    landed: list[str] = []
+
+    def racing(repo: str, branch: str, token: str | None) -> str | None:
+        tip = real(repo, branch, token)
+        landed.append(_other_commit(bare, base, "lands in the gap"))
+        git(bare, "update-ref", f"refs/heads/{BRANCH}", landed[0])
+        return tip
+
+    monkeypatch.setattr(ws, "remote_tip", racing)
+    pulls = FakePulls(bare)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, pulls)
+    assert type(raised.value).__name__ == "BranchMoved"
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == landed[0]  # not overwritten
+    assert ws.published_sha(REPO, BRANCH) is None and pulls.prs == []
+
+
+def test_the_push_carries_a_lease_on_the_checked_tip(
+    setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws, base, head, bare = setup
+    calls: list[tuple[str, ...]] = []
+    real = ws._git
+
+    def spy(cwd: Path, *args: str, token: str | None = None) -> str:
+        if args[0] == "push":
+            calls.append(args)
+        return real(cwd, *args, token=token)
+
+    monkeypatch.setattr(ws, "_git", spy)
+    pulls = FakePulls(bare)
+    _pub(ws, base, head, pulls)  # first publish: the branch must not exist
+    assert f"--force-with-lease=refs/heads/{BRANCH}:" in calls[0]
+    first = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    vault = ws.vault(REPO)
+    from vigild.gitsafe import git as safe_git
+
+    idx = {"GIT_INDEX_FILE": str(ws.data_dir / "t198.idx")}
+    safe_git(vault, "read-tree", head, env=idx)
+    blob = safe_git(vault, "hash-object", "-w", "--stdin", stdin="# Feature map\nrate limit 2\n")
+    safe_git(vault, "update-index", "--cacheinfo", f"100644,{blob},docs/feature-map.md", env=idx)
+    tree = safe_git(vault, "write-tree", env=idx)
+    head2 = git(vault, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+                "-p", head, "-m", "second")  # fmt: skip
+    git(vault, "update-ref", "refs/vigil/second", head2)
+    _pub(ws, base, head2, pulls)  # fast-forwards the tip it checked
+    second = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert second != first and git(bare, "merge-base", "--is-ancestor", first, second) == ""
+    assert f"--force-with-lease=refs/heads/{BRANCH}:{first}" in calls[1]
+
+
+def test_a_protected_branch_rejection_is_not_branch_moved(
+    setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#198 review: only a stale lease is BranchMoved; a ruleset or hook refusal keeps its cause."""
+    from vigild.workspace import WorkspaceError
+
+    ws, base, head, _bare = setup
+
+    def refuse(*a: object, **k: object) -> None:
+        raise WorkspaceError(
+            "git push failed: ! [remote rejected] HEAD -> vigil/x (protected branch hook declined)"
+        )
+
+    monkeypatch.setattr(ws, "push", refuse)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, FakePulls(_bare))
+    assert type(raised.value).__name__ != "BranchMoved"
+    assert "protected branch" in str(raised.value)
+
+
+def test_a_non_fast_forward_is_refused_and_nothing_is_pushed(
+    setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#198: the lease would allow it when the tip matches; vigild never forces."""
+    ws, base, head, bare = setup
+    outside = _other_commit(bare, base, "recorded publish")
+    git(ws.vault(REPO), "fetch", "--quiet", str(bare), outside)
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", outside)
+    ws.record_published(REPO, BRANCH, outside)
+    monkeypatch.setattr(ws, "public_commit", lambda *a, **k: head)  # head does not descend
+    pulls = FakePulls(bare)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, pulls)
+    assert type(raised.value).__name__ != "BranchMoved"
+    assert BRANCH in str(raised.value) and "forced" in str(raised.value)
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == outside
+    assert pulls.prs == []

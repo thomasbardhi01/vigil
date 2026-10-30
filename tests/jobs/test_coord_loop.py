@@ -664,6 +664,25 @@ def test_a_dev_image_that_fails_refuses_dispatch_and_offers_rebuild(world: World
     assert [c[0] for c in w.standin.calls] == ["coord"]
 
 
+def test_a_flake_item_offers_rebuild_through_the_api(world: World) -> None:
+    w = world
+    base = w.runner.workspace.head_sha(REPO, "main")
+    w.runner.dev_image_flaked(
+        REPO,
+        f"{REPO}: dev image validate failed (tests); CI is green on this commit",
+        {"kind": "dev_image_flake", "repo": REPO, "key": "k1", "base_sha": base,
+         "actions": ["rebuild", "dismiss"]},
+    )  # fmt: skip
+    (item,) = [
+        p
+        for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if p["body"].get("kind") == "dev_image_flake"
+    ]
+    r = w.client.post(f"/api/inbox/{item['id']}/rebuild", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_inbox_item(item["id"]).status == "resolved"
+
+
 def test_ask_coord_files_a_question(world: World) -> None:
     w = world
 

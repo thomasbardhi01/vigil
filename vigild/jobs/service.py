@@ -38,7 +38,7 @@ from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
-from vigild.jobs.ownernote import NOTE_MAX_BYTES
+from vigild.jobs.ownernote import NOTE_MAX_BYTES, contract_diff, spec_diff, unlisted_changes
 from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
 from vigild.redact import redact
@@ -751,11 +751,24 @@ class JobService:
         note = self.store.get_artifact(job_id, "owner_note.md")
         if spec is None or diff is None or log is None or note is None or diff.id < spec.id:
             return {}
+        plan = self.store.get_artifact(job_id, "plan.md")
+        plan_prev = self.store.get_artifact(job_id, "plan_previous.md")
+        spec_prev = self.store.get_artifact(job_id, "spec_previous.md")
+        contract = (
+            contract_diff(plan_prev.content, plan.content)
+            if plan is not None and plan_prev is not None
+            else None
+        )
+        full = (
+            spec_diff(spec_prev.content, spec.content, context=10**6) if spec_prev else diff.content
+        )
         return {
             "amendment": {
                 "changelog": log.content,
                 "diff": diff.content,
                 "note_bytes": len(note.content.encode()),
+                "contract_diff": contract,
+                "unlisted": unlisted_changes(log.content, contract or [], full),
             }
         }
 
@@ -1311,6 +1324,20 @@ class JobService:
                 self.store.add_artifact(
                     job_id, "spec_previous.md", spec.content, Provenance(spec.provenance)
                 )
+            # the plan on the same baseline rule: before the approval, else the current one
+            plan = self.store.get_artifact(job_id, "plan.md")
+            if approval is not None:
+                rows = self.store.q(
+                    "SELECT * FROM artifacts WHERE job_id=? AND name='plan.md' AND task_id IS NULL"
+                    " AND id < ? ORDER BY id DESC LIMIT 1",
+                    (job_id, approval.id),
+                )
+                if rows:
+                    plan = type(approval)(**dict(rows[0]))
+            if plan is not None:
+                self.store.add_artifact(
+                    job_id, "plan_previous.md", plan.content, Provenance(plan.provenance)
+                )
         self.store.add_event("replan", data, Provenance.HUMAN, job_id=job_id)
         first = (note or "").strip().splitlines()
         decisions.add(self.store, job_id, "vigild", "replan", first[0] if first else "no note")
@@ -1535,7 +1562,7 @@ class JobService:
         """Build and validate a repo's failed dev image again (round 2)."""
         with self.store.tx():
             item = self._question(item_id)
-            if item.body.get("kind") != "dev_image" or "rebuild" not in (
+            if item.body.get("kind") not in ("dev_image", "dev_image_flake") or "rebuild" not in (
                 item.body.get("actions") or []
             ):
                 raise Conflict(f"inbox item {item_id} doesn't offer rebuild")

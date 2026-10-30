@@ -36,6 +36,7 @@ ALLOWED: Mapping[str, set[str]] = {
     "pull_requests": {"read", "write"},
     "metadata": {"read"},
     "issues": {"read"},
+    "checks": {"read"},  # CI's result for a commit (ci_test_result); never in a worker's token
 }
 TIMEOUT = 20.0
 
@@ -80,6 +81,9 @@ class InstallationToken:
 
 def _norm(repo: str) -> str:
     return repo.strip().lower()
+
+
+ACTIONS_APP = "github-actions"  # the only app whose CI check runs are trusted (#191)
 
 
 class GitHubApp:
@@ -245,3 +249,37 @@ class GitHubApp:
         # only a JSON true or false is an answer; null, a string or a missing
         # key count as private (review A3)
         return answer if isinstance(answer, bool) else True
+
+    def ci_test_result(self, repo: str, sha: str, job: str = "test") -> str:
+        """CI's `job` for the commit `sha`, read with a `checks: read` token (#191):
+        `success`, `failure`, `pending` (not finished or not started), or `unknown` when it
+        can't be read (no permission: 403 or 404, a repo vigild doesn't mint for, any
+        error). Only `success` is ever acted on. A re-run decides by its newest run."""
+        try:
+            with self.lease(repo, {"checks": "read", "metadata": "read"}) as tok:
+                r = self.http.get(
+                    f"{self.api}/repos/{repo.strip()}/commits/{sha}/check-runs",
+                    params={"per_page": 100},
+                    headers={
+                        "Authorization": f"Bearer {tok.token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    timeout=TIMEOUT,
+                )
+            if r.status_code != 200:
+                return "unknown"  # 403/404: the App lacks checks:read here, or no such commit
+            # only GitHub Actions' own run counts: any app with checks:write could post a
+            # run named `job`, and a forged success must never turn a failure into a flake
+            runs = [
+                c
+                for c in r.json().get("check_runs", [])
+                if c.get("name") == job and (c.get("app") or {}).get("slug") == ACTIONS_APP
+            ]
+        except GitHubError, TokenPolicyError, httpx2.HTTPError, ValueError, AttributeError:
+            return "unknown"
+        if not runs:
+            return "pending"
+        latest = max(runs, key=lambda c: int(c.get("id") or 0))
+        if latest.get("status") != "completed":
+            return "pending"
+        return "success" if latest.get("conclusion") == "success" else "failure"

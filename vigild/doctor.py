@@ -445,7 +445,7 @@ def run_checks(
     if docker is None:
         out.append(Check("Docker", None, "not checked"))
     else:
-        from vigild.devimage import DockerImages
+        from vigild.devimage import DockerImages, dev_image_note
 
         out.append(_safe("Docker", lambda: (bool(docker.ping()), "")))
         for image in (cfg.vigild.images.claude_executor, cfg.vigild.images.egress_proxy):
@@ -474,7 +474,7 @@ def run_checks(
                     return False, "never built (the first job builds it; or `vigil dev-image`)"
                 row = rows[0]
                 if not row["ok"]:
-                    return False, f"{row['image']} failed its {row['stage'] or 'check'}"
+                    return False, dev_image_note(row)
                 current = DockerImages(docker).image_id_of(row["image"])
                 if current != row["image_id"]:
                     return False, f"{row['image']} is gone or changed since it was validated"

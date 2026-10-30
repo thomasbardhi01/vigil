@@ -321,6 +321,9 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     runner.closers.append(client.close)
     runner.closers.append(hosts.close_remote)
     images.on_failure = runner.dev_image_failed
+    images.on_flake = runner.dev_image_flaked
+    if app is not None:
+        images.ci_result = app.ci_test_result  # CI's `test` job for the validated commit
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
 

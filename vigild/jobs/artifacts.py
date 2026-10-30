@@ -33,6 +33,7 @@ JOB_ARTIFACTS = {
     # changelog, and vigild's diff of the two
     "owner_note.md",
     "spec_previous.md",
+    "plan_previous.md",
     "spec_changelog.md",
     "spec_diff.md",
 }

@@ -663,13 +663,33 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
 
-    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+    def push(self, repo: str, head: str, branch: str, token: str | None, lease: str | None) -> None:
+        """Push `head` to `branch` only if the remote tip is still `lease` (the SHA
+        publish checked; None means the branch must not exist yet). The caller has
+        already refused a non-fast-forward: a lease alone would let git make one."""
         if is_bench_repo(repo):
             raise WorkspaceError(f"{repo} is a bench repo: nothing is pushed")
         self._git(
-            self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
+            self.vault(repo), "push", "--quiet", "--no-verify",
+            f"--force-with-lease=refs/heads/{branch}:{lease or ''}", self.remote_url(repo),
             f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
+
+    def remote_tip(self, repo: str, branch: str, token: str | None) -> str | None:
+        """The tip of `branch` on the remote right now, or None if it has none."""
+        if is_bench_repo(repo):
+            raise WorkspaceError(f"{repo} is a bench repo: there is no remote")
+        if not BRANCH.match(branch) or ".." in branch:
+            raise WorkspaceError(f"branch {branch!r} must be vigil/*")
+        out = self._git(
+            self.vault(repo), "ls-remote", self.remote_url(repo), f"refs/heads/{branch}",
+            token=token,
+        )  # fmt: skip
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref == f"refs/heads/{branch}" and SHA.match(sha):
+                return sha
+        return None
 
     # --- what reaches the target repo (Tier 1: `.vigil/` stays in the vault) ---------------
 
