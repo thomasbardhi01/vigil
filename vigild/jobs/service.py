@@ -1229,10 +1229,27 @@ class JobService:
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
             self._close_out(job.id, breakers)
+        self._stop_abandoned(job.id)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
+
+    def _stop_abandoned(self, job_id: str, wait: float = 30.0) -> None:
+        """An inbox or breaker abandon stops what the job still has running the way a kill
+        does (stop, revoke, drain, settle, remove the containers), then records the same
+        `job_killed` event. A step that fails is logged; the job is already abandoned, and
+        `vigil kill` finishes it (#162)."""
+        with self._kill_lock(job_id):
+            try:
+                effects = self._kill_effects(job_id, wait)
+            except KillFailed:
+                return  # logged by `_kill_failed`; no event, so a later kill runs it again
+            self.store.add_event(
+                "job_killed",
+                {"actor": Actor.OWNER.value, "channel": "inbox", "from": "abandon", **effects},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
 
     def _close_out(self, job_id: str, breakers: Any) -> None:
         """What giving a job up leaves behind, closed: its tasks that have no open PR are
