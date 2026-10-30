@@ -1086,6 +1086,13 @@ class Verifier:
         return name if name.endswith(".py") else name.replace(".", "/") + ".py"
 
     @staticmethod
+    def _exact_file(case: Case, files: set[str]) -> bool:
+        """Is a pytest case (`tests.test_a` or `tests.test_a.TestX`) in one of these
+        exact repo paths? `belongs` matches a suffix; this does not."""
+        parts = case.file.split(".")
+        return any("/".join(parts[:k]) + ".py" in files for k in range(1, len(parts) + 1))
+
+    @staticmethod
     def _collection_failure(before: dict[str, Any], tests: list[str], test_cmd: str) -> None:
         """#161: a pytest collection error (exit 2, a JUnit `<error>` on a module, no
         classname) counts as failing before only when every erroring module is, by exact
@@ -1130,14 +1137,15 @@ class Verifier:
         if fac:
             # The before run never executed these files, so only after-run ids the base
             # runs lack can have "failed before"; without a base report none can be told.
-            files = [Verifier._module_path(n) for n in fac["modules"]]
-            mine = [c for c in a or [] if belongs(c, files)]
-            seen = {c.id for c in base or []} | {c.id for c in base2 or []}
-            failing = sorted(c.id for c in mine if base is not None and c.id not in seen)
+            # Unstable base ids are settled as `_new_cases` settles them; a case's file
+            # is matched exactly, never by suffix.
+            files = {Verifier._module_path(n) for n in fac["modules"]}
+            mine = [c for c in a or [] if Verifier._exact_file(c, files)]
+            new = Verifier._new_cases(mine, base, base2, sorted(files)) if base is not None else []
             return {
                 "checked": True,
-                "failing_before": failing,
-                "not_passing_after": sorted(c.id for c in mine if c.status != "pass"),
+                "failing_before": sorted(c.id for c in new),
+                "not_passing_after": sorted(c.id for c in mine if c.status in ("failure", "error")),
             }
         return {
             "checked": True,

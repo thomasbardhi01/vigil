@@ -407,6 +407,37 @@ def test_only_new_ids_in_an_edited_base_file_count_as_failing_before(
     assert rec["ids"]["not_passing_after"] == []
 
 
+def test_an_old_skipped_test_in_the_erroring_file_does_not_block_acceptance(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """Only failures and errors after count against the worker; a skip the base
+    already had doesn't."""
+    from vigild.jobs.acceptance import check_tests
+
+    seed = fixture_repo["seed"]
+    old = (seed / "tests" / "test_old.py").read_text()
+    (seed / "tests" / "test_old.py").write_text(
+        "import pytest\n\n" + old
+        + "\n\n@pytest.mark.skip(reason='old')\ndef test_parked():\n    assert False\n"
+    )  # fmt: skip
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "an old skipped test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        text = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n" + text + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["not_passing_after"] == []
+    assert "tests.test_old::test_fresh" in rec["ids"]["failing_before"]
+    assert check_tests(SPEC, rec) == []
+
+
 def test_an_import_only_edit_of_a_base_file_proves_nothing(ws: Workspace, tmp_path: Path) -> None:
     from vigild.jobs.acceptance import check_tests
 
