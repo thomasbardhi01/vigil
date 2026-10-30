@@ -499,6 +499,17 @@ class Workspace:
         mirror = self.mirror(repo)
         return self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
 
+    def task_ref(self, repo: str, task_id: str) -> str | None:
+        """The commit `refs/vigil/<task>` names in the vault (the result vigild imported),
+        or None if there is no such ref. Read-only, through gitsafe."""
+        try:
+            return self._git(
+                self.vault(repo), "rev-parse", "--verify", "--quiet",
+                f"refs/vigil/{task_id}^{{commit}}",
+            )  # fmt: skip
+        except WorkspaceError:
+            return None
+
     def _origin(self, repo: str, source: str) -> Path:
         if source not in ("vault", "mirror"):
             raise WorkspaceError(f"bad source {source!r}")

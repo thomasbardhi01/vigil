@@ -275,6 +275,11 @@ def as_outcome(run: dict[str, Any] | None) -> TestOutcome:
     return TestOutcome.UNKNOWN
 
 
+class RepublishRefused(ValueError):
+    """The owner's republish can't go ahead: the verifier's record and the vault disagree,
+    or one is missing."""
+
+
 class JobRunner:
     def __init__(
         self,
@@ -3395,6 +3400,21 @@ class JobRunner:
             session_base=session_base,
             on_findings=lambda found: self._integrity_findings(job_id, task_id, s.id, found),
         )
+        # the stage's own verdict on this head, whatever follows (pass, fail, escalate): the
+        # owner's republish gates on it
+        self.store.add_event(
+            "acceptance",
+            {
+                "task": task_id,
+                "head": head,
+                "accepted": not errors,
+                "errors": [redact(str(e))[:300] for e in errors[:10]],
+            },
+            Provenance.HUMAN,
+            job_id=job_id,
+            session_id=s.id,
+            task_id=task_id,
+        )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
             self.store.add_event(
@@ -3416,20 +3436,41 @@ class JobRunner:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: stage 3 acceptance failed", {"errors": errors}
             )
+        pub = self._pub_inputs(
+            job, t, report, tests, head, base_sha, branch, overlap, hidden_on, pr_url
+        )
+        return self._publish_task(job, s, task_id, pub)
+
+    def _pub_inputs(
+        self,
+        job: Job,
+        t: Any,
+        report: WorkerReport,
+        tests: dict[str, Any] | None,
+        head: str,
+        base_sha: str,
+        branch: str,
+        overlap: list[str],
+        hidden_on: bool,
+        pr_url: str | None,
+    ) -> dict[str, Any]:
+        """What `_publish_task` needs for a verified, accepted head: the one place the PR
+        body and the owner-review flag are built, for the post-verify path and for the
+        owner's republish of a verified head."""
+        contract = t.contract
         runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests, hidden_on)
         body = (
-            f"{report.summary}\n\n{runner_note}Job `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
+            f"{report.summary}\n\n{runner_note}Job `{job.id}`, task `{t.id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
             f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
-        pub = {
+        return {
             "head": head, "base_sha": base_sha, "branch": branch, "body": body,
             "owner_review": bool(overlap and not hidden_on), "pr_url": pr_url,
             "runner_file_change": overlap,
         }  # fmt: skip
-        return self._publish_task(job, s, task_id, pub)
 
     def _publish_task(self, job: Job, s: SessionRow, task_id: str, pub: dict[str, Any]) -> bool:
         """Publish a verified, accepted head and open the task's PR. On a refusal the
@@ -3485,9 +3526,41 @@ class JobRunner:
             )
         return True
 
+    def _owner_event(self, task_id: str) -> tuple[int, dict[str, Any]] | None:
+        """The task's latest `owner_republish` event, if no `republish` event has consumed
+        it (the `republish` event records the id it consumed) and the task has not failed
+        since: a later `task_failed` (a vigild error during the publish, say) ends the
+        owner's request, so a retry after it starts a session, never the old head."""
+        rows = self.store.q(
+            "SELECT id, data FROM events WHERE task_id=? AND type='owner_republish' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        if not rows:
+            return None
+        eid = int(rows[0]["id"])
+        if self.store.q(
+            "SELECT 1 FROM events WHERE task_id=? AND type='task_failed' AND id>? LIMIT 1",
+            (task_id, eid),
+        ):
+            return None
+        for r in self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='republish' AND id>?", (task_id, eid)
+        ):
+            if json.loads(r["data"]).get("owner_event") == eid:
+                return None
+        return eid, json.loads(rows[0]["data"])
+
     def _republish_inputs(self, task_id: str) -> dict[str, Any] | None:
         """What a task's last publish refusal kept, if that refusal is its latest failure:
-        its result was imported, verified and accepted, so only the publish is retried."""
+        its result was imported, verified and accepted, so only the publish is retried.
+        The owner's republish (an unconsumed `owner_republish` event) comes first, its
+        inputs rebuilt from vigild's records."""
+        if self._owner_event(task_id) is not None:
+            try:
+                return self._owner_inputs(str(self.store.get_task(task_id).job_id), task_id)
+            except RepublishRefused:
+                log.warning("owner republish of %s no longer holds", task_id)
         rows = self.store.q(
             "SELECT type, data FROM events WHERE task_id=? "
             "AND type IN ('task_failed','publish_refused') ORDER BY id DESC LIMIT 2",
@@ -3509,6 +3582,7 @@ class JobRunner:
         pub = self._republish_inputs(task_id)
         s = self._last_worker(task_id)
         assert pub is not None and s is not None  # dispatch checked, before it set `running`
+        owner = self._owner_event(task_id)  # the owner's, consumed by this event
         try:
             ok = self._publish_task(job, s, task_id, pub)
         except Exception as e:  # vigild trouble: the task fails, nothing is left running
@@ -3521,11 +3595,72 @@ class JobRunner:
                 {"error": f"{type(e).__name__}: {e}"},
             )
         result = self._task_pr(task_id) if ok else self._why.get(task_id, {}).get("error")
+        data = {"task": task_id, "head": pub["head"], "result": result}
+        if owner is not None:
+            data["inbox_item_id"] = owner[1].get("inbox_item_id")
+            data["owner_event"] = owner[0]
         self.store.add_event(
-            "republish", {"task": task_id, "head": pub["head"], "result": result},
-            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            "republish", data, Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return ok
+
+    def _owner_inputs(self, job_id: str, task_id: str) -> dict[str, Any]:
+        """The publish inputs of a failed task's verified head, from vigild's records:
+        the verifier's `after.sha` must be the vault's `refs/vigil/<task>`, and a publish
+        attempt on record after that `tests.json` shows the head was accepted (the record
+        is written before acceptance, scope and integrity checks)."""
+        job = self.store.get_job(job_id)
+        t = self.store.get_task(task_id)
+        art = self.store.get_artifact(job_id, "tests.json", task_id)
+        try:
+            tests = json.loads(art.content) if art else None
+        except json.JSONDecodeError:
+            tests = None
+        after = ((tests or {}).get("after") or {}).get("sha")
+        if art is None or tests is None or not isinstance(after, str) or not after:
+            raise RepublishRefused(f"{task_id} has no verifier record with an after.sha")
+        ref = self.workspace.task_ref(job.repo, task_id)
+        if ref != after:
+            raise RepublishRefused(
+                f"{task_id}: the verifier's head is {after}, the vault's refs/vigil/{task_id} "
+                f"is {ref or 'missing'}"
+            )
+        verdict = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='acceptance' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        got = json.loads(verdict[0]["data"]) if verdict else None
+        if got is None or got.get("head") != after:
+            raise RepublishRefused(f"no acceptance verdict recorded for {after}")
+        if got.get("accepted") is not True:
+            first = (got.get("errors") or ["no reason recorded"])[0]
+            raise RepublishRefused(f"acceptance refused {after}: {first}")
+        raw = self.store.get_artifact(job_id, "worker_report.json", task_id)
+        if raw is None or self._last_worker(task_id) is None:
+            raise RepublishRefused(f"{task_id} has no worker report or session on record")
+        try:
+            report = WorkerReport.model_validate_json(raw.content)
+            base_sha = self.workspace.base_sha(task_id)
+        except (ValidationError, WorkspaceError, OSError, KeyError, ValueError) as e:
+            raise RepublishRefused(f"{task_id}: its record is unusable: {e}"[:300]) from e
+        overlap = [str(p) for p in tests.get("runner_files") or []]
+        return self._pub_inputs(
+            job, t, report, tests, after, base_sha, str(t.contract["branch"]), overlap,
+            not tests.get("hidden_disabled"),
+            self._task_pr(task_id) if self._task_head(task_id) else None,
+        )  # fmt: skip
+
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        """The owner's republish of a failed task's verified head: check vigild's records
+        and the vault (`_owner_inputs`), then record an `owner_republish` event the
+        dispatch that follows works from, restart or not. Refuses (`RepublishRefused`)
+        before anything is written."""
+        pub = self._owner_inputs(job_id, task_id)
+        self.store.add_event(
+            "owner_republish", {"task": task_id, "head": pub["head"], "inbox_item_id": item_id},
+            Provenance.HUMAN, job_id=job_id, task_id=task_id,
+        )  # fmt: skip
 
     # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 
