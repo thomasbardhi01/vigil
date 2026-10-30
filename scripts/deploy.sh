@@ -52,41 +52,91 @@ if [ -n "$busy" ]; then
 fi
 echo "idle"
 
-# 2. Fast-forward.
+# 2. Fetch, and decide from the range before merging anything.
 old="$(git_prod rev-parse HEAD)"
 if [ "$DRY" = 1 ]; then
   step "[dry-run] git -C $PROD_DIR fetch origin"
-  step "[dry-run] git -C $PROD_DIR merge --ff-only origin/main"
-  new="$(git_prod rev-parse origin/main)"
 else
-  step "fast-forward $PROD_DIR"
+  step "fetch $PROD_DIR"
   [ -z "$(git_prod status --porcelain)" ] || die "$PROD_DIR is dirty; nothing changed"
   git_prod fetch origin
-  git_prod merge --ff-only origin/main || die "not a fast-forward; nothing restarted"
-  new="$(git_prod rev-parse HEAD)"
 fi
+git_prod merge-base --is-ancestor HEAD origin/main || die "not a fast-forward; nothing changed"
+touched="$(git_prod diff --name-only HEAD origin/main | grep -E '^(images/|prompts/|pyproject\.toml$|uv\.lock$)' || true)"
 
-# 3. Restart.
 LABEL="gui/$(id -u)/dev.vigil.vigild"
-if [ "$DRY" = 1 ]; then
-  step "[dry-run] launchctl kickstart -k $LABEL"
-  step "[dry-run] wait up to 60 s for 127.0.0.1:8787"
-else
-  step "restart vigild"
-  launchctl kickstart -k "$LABEL"
-  up=0
+PLIST="$HOME/Library/LaunchAgents/dev.vigil.vigild.plist"
+rc=0
+rebuilt=""
+failed=""
+
+merge_ff() {
+  if [ "$DRY" = 1 ]; then
+    step "[dry-run] git -C $PROD_DIR merge --ff-only origin/main"
+  else
+    step "fast-forward $PROD_DIR"
+    git_prod merge --ff-only origin/main || die "merge failed; check whether vigild is running"
+  fi
+}
+
+wait_up() {
+  if [ "$DRY" = 1 ]; then
+    step "[dry-run] wait up to 60 s for 127.0.0.1:8787"
+    return 0
+  fi
   for _ in $(seq 1 60); do
-    if curl -s -o /dev/null --max-time 2 http://127.0.0.1:8787/api/health; then
-      up=1
-      break
-    fi
+    if curl -s -o /dev/null --max-time 2 http://127.0.0.1:8787/api/health; then return 0; fi
     sleep 1
   done
-  [ "$up" = 1 ] || die "vigild did not answer on 127.0.0.1:8787 within 60 s"
+  return 1
+}
+
+if [ -n "$touched" ] && [ "$REBUILD" = 1 ]; then
+  # Image inputs changed: vigild stays down while the images rebuild, so no job
+  # resumes against stale or half-built images.
+  if [ "$DRY" = 1 ]; then
+    step "[dry-run] launchctl bootout $LABEL"
+  else
+    step "stop vigild"
+    launchctl bootout "$LABEL"
+  fi
+  merge_ff
+  repos="$(grep -E '^  [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:' "$PROD_DIR/configs/repos.yaml" | tr -d ' :' || true)"
+  for repo in $repos; do
+    if [ "$DRY" = 1 ]; then
+      step "[dry-run] uv run python cli/vigil dev-image --repo $repo --rebuild"
+    else
+      step "rebuild $repo"
+      if (cd "$PROD_DIR" && uv run python cli/vigil dev-image --repo "$repo" --rebuild); then
+        rebuilt+="$repo "
+      else
+        failed+="$repo "
+        rc=1
+      fi
+    fi
+  done
+  if [ "$DRY" = 1 ]; then
+    step "[dry-run] launchctl bootstrap gui/$(id -u) $PLIST"
+  else
+    step "start vigild"
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  fi
+else
+  merge_ff
+  if [ "$DRY" = 1 ]; then
+    step "[dry-run] launchctl kickstart -k $LABEL"
+  else
+    step "restart vigild"
+    launchctl kickstart -k "$LABEL"
+  fi
+  [ -z "$touched" ] || echo "image inputs changed; --no-rebuild set, rebuild by hand"
 fi
+wait_up || die "vigild did not answer on 127.0.0.1:8787 within 60 s"
+for repo in $failed; do
+  echo "rebuild failed for $repo; vigild holds its dispatch (page: image not fresh after deploy)"
+done
 
 # 4. Doctor. A fail line makes the exit non-zero; nothing is undone.
-rc=0
 if [ "$DRY" = 1 ]; then
   step "[dry-run] (cd $PROD_DIR && uv run python cli/vigil doctor)"
 else
@@ -95,24 +145,8 @@ else
   printf '%s\n' "$out"
   if printf '%s\n' "$out" | grep -qE '^fail'; then rc=1; fi
 fi
-
-# 5. Rebuild dev images when the range touched an image input.
-rebuilt=""
-touched="$(git_prod diff --name-only "$old" "$new" | grep -E '^(images/|prompts/|pyproject\.toml$|uv\.lock$)' || true)"
-if [ -n "$touched" ] && [ "$REBUILD" = 1 ]; then
-  repos="$(grep -E '^  [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:' "$PROD_DIR/configs/repos.yaml" | tr -d ' :')"
-  for repo in $repos; do
-    if [ "$DRY" = 1 ]; then
-      step "[dry-run] uv run python cli/vigil dev-image --repo $repo --rebuild"
-    else
-      step "rebuild $repo"
-      (cd "$PROD_DIR" && uv run python cli/vigil dev-image --repo "$repo" --rebuild) || rc=1
-    fi
-    rebuilt+="$repo "
-  done
-elif [ -n "$touched" ]; then
-  echo "image inputs changed; --no-rebuild set, rebuild by hand"
-fi
+new="$(git_prod rev-parse HEAD)"
+[ "$DRY" = 0 ] || new="$(git_prod rev-parse origin/main)"
 
 # 6. Summary.
 if [ "$DRY" = 1 ]; then

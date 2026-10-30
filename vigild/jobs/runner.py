@@ -795,6 +795,7 @@ class JobRunner:
                 self.session_images.ensure_fresh(repo, base_sha, force=True)
             else:
                 self.dev_images.ensure_fresh(repo, base_sha, force=True)
+            self.release_stale_images()
 
         def safe(j: str) -> None:
             try:
@@ -907,6 +908,81 @@ class JobRunner:
         breaker paged once); resetting the breaker resumes it."""
         self._block(job_id, f"breaker {b.kind.value} ({b.scope})")
         self.breakers.hold(b, job_id)
+
+    # --- stale images after a deploy -------------------------------------------------------
+
+    def _image_state(self, repo: str) -> tuple[bool, str, str | None, str]:
+        """(fresh, session key at main, newest validated session key, main's tip):
+        the check doctor runs ("session image fresh")."""
+        from vigild.doctor import stale_image_checks
+
+        assert self.session_images is not None
+        tip = self.workspace.head_sha(repo, "main")
+        checks = stale_image_checks(self.dev_images, self.session_images, repo, tip)
+        key = self.session_images.key(self.dev_images.tag(repo, self.dev_images.key(repo, tip)))
+        newest = self.dev_images.newest_validated(repo, ("session-validate",))
+        return all(c.ok for c in checks), key, (newest["key"] if newest else None), tip
+
+    def hold_stale_images(self) -> list[str]:
+        """At start: a repo whose session image isn't fresh at main's key (a
+        deploy whose rebuild failed) gets a `stale_image` hold: one page,
+        "image not fresh after deploy", and its dispatch paused. Returns the
+        repos held."""
+        held: list[str] = []
+        if self.session_images is None:
+            return held
+        for repo in self.cfg.repos.repos:
+            try:
+                fresh, key, newest, tip = self._image_state(repo)
+            except Exception:
+                log.exception("stale-image check failed for %s", repo)
+                continue
+            if fresh:
+                continue
+            held.append(repo)
+            self.breakers.trip(
+                Kind.STALE_IMAGE,
+                f"repo:{repo}",
+                {"key": key, "newest_validated": newest},
+                actions=("rebuild", "dismiss"),
+                title=f"{repo}: image not fresh after deploy",
+                page={
+                    "kind": "dev_image",
+                    "repo": repo,
+                    "key": key,
+                    "base_sha": tip,
+                    "image": key[:16],
+                    "stage": "session-validate",
+                    "failed_suites": [],
+                    "detail": {"key": key, "newest_validated": newest},
+                },
+            )
+        return held
+
+    def release_stale_images(self) -> list[str]:
+        """A validated rebuild record for the key releases the hold, and the jobs
+        it held resume. Returns the repos released."""
+        released: list[str] = []
+        if self.session_images is None:
+            return released
+        for b in self.breakers.open_breakers():
+            if b.kind is not Kind.STALE_IMAGE:
+                continue
+            repo = b.scope.removeprefix("repo:")
+            try:
+                fresh = self._image_state(repo)[0]
+            except Exception:
+                log.exception("stale-image check failed for %s", repo)
+                continue
+            if not fresh:
+                continue
+            with self.store.lock:
+                if self.breakers._page_open(b):
+                    self.store.resolve_inbox_item(int(b.item_id or 0), "vigild")
+                held = self.breakers.reset(b.id)
+            self._resume_held(held, Actor.VIGILD, {"action": "image_fresh", "repo": repo})
+            released.append(repo)
+        return released
 
     def on_breaker_reset(self, breaker_id: int, item_id: int) -> dict[str, list[str]]:
         """The owner reset a breaker from the inbox: every job it held goes

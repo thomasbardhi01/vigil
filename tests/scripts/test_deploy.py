@@ -24,6 +24,7 @@ STUBS = {
     "uv": (
         'echo "uv $*" >> "$STUB_LOG"\n'
         'case "$*" in\n'
+        '  *"dev-image"*) exit "${STUB_DEVIMAGE_RC:-0}";;\n'
         '  *" doctor"*) echo "pass  everything"; exit "${STUB_DOCTOR_RC:-0}";;\n'
         "esac\n"
     ),
@@ -214,3 +215,50 @@ def test_dry_run_changes_nothing(tmp_path: Path) -> None:
     assert not e.called("launchctl")
     assert not e.called("uv")
     assert "kickstart" in r.stdout
+
+
+def _idx(calls: list[str], prefix: str) -> int:
+    return next(i for i, c in enumerate(calls) if c.startswith(prefix))
+
+
+def test_image_change_stops_vigild_before_merge_and_starts_after_rebuild(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    e.commit("Change the executor", {"images/claude-executor/Dockerfile": "FROM x\n"})
+    # the stub git wrapper is not used; record HEAD at bootout time via launchctl stub
+    (e.bin / "launchctl").write_text(
+        f'#!/bin/bash\necho "launchctl $* head=$(git -C {e.prod} rev-parse HEAD)" >> "$STUB_LOG"\n'
+    )
+    old = _git(e.prod, "rev-parse", "HEAD")
+    r = e.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = e.calls()
+    boot = _idx(calls, "launchctl bootout gui/")
+    assert f"head={old}" in calls[boot]
+    first_build = _idx(calls, "uv run python cli/vigil dev-image")
+    start = _idx(calls, "launchctl bootstrap gui/")
+    assert boot < first_build < start
+    assert calls[start].split()[3].endswith("Library/LaunchAgents/dev.vigil.vigild.plist")
+    assert not e.called("launchctl kickstart")
+
+
+def test_failed_rebuild_still_starts_vigild_and_names_repo(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    e.commit("Change the executor", {"images/claude-executor/Dockerfile": "FROM x\n"})
+    r = e.run(STUB_DEVIMAGE_RC="1")
+    assert r.returncode != 0
+    assert e.called("launchctl bootstrap gui/")
+    assert "owner/alpha" in r.stdout + r.stderr
+    assert (
+        "rebuild failed for owner/alpha; vigild holds its dispatch "
+        "(page: image not fresh after deploy)" in r.stdout
+    )
+
+
+def test_no_image_change_uses_kickstart_only(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    e.commit("Add a thing", {"a.txt": "a\n"})
+    r = e.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert e.called("launchctl kickstart -k gui/")
+    assert not e.called("launchctl bootout")
+    assert not e.called("launchctl bootstrap")

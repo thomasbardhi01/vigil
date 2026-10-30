@@ -336,7 +336,11 @@ def test_on_rebuild_validates_at_mains_tip_not_the_pages_stale_base(world: Any) 
     tip = ws.head_sha(REPO, "main")
     assert tip != stale
     me = types.SimpleNamespace(
-        session_images=None, dev_images=images, workspace=ws, background=False
+        session_images=None,
+        dev_images=images,
+        workspace=ws,
+        background=False,
+        release_stale_images=lambda: [],
     )
     JobRunner.on_rebuild(me, REPO, stale)  # type: ignore[arg-type]
     row = images.latest(REPO)

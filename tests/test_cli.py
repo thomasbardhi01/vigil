@@ -293,7 +293,11 @@ def test_cli_build_leaves_one_record_like_on_rebuild_and_names_the_data_dir(
     images.store.x("DELETE FROM dev_images")
     docker.builds.clear()  # the fake's image ids count builds; start the second from the same
     me = types.SimpleNamespace(
-        session_images=None, dev_images=images, workspace=ws, background=False
+        session_images=None,
+        dev_images=images,
+        workspace=ws,
+        background=False,
+        release_stale_images=lambda: [],
     )
     JobRunner.on_rebuild(me, "o/fixture", base)  # type: ignore[arg-type]
     (row,) = images.store.q("SELECT * FROM dev_images WHERE repo=?", ("o/fixture",))

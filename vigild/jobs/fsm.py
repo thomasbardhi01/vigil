@@ -346,7 +346,7 @@ FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon", S.MERGED: "prs_me
 # once the deps job it waits on merged (round 3) or once a backend breaker's
 # probe closed it (review B6), and record it merged once the owner merged
 # every PR of it by hand (review B7). Everything else is the owner's.
-VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged")
+VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged", "image_fresh")
 NEVER_FORCED = {(S.SPEC_PENDING, S.APPROVED)}
 
 
