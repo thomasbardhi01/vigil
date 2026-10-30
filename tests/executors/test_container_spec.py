@@ -379,3 +379,14 @@ def test_the_sdk_budget_reaches_the_container_env_only_when_set(
     env = worker_kwargs(cfg, spec, network="n")["environment"]
     assert "VIGIL_MAX_BUDGET_USD" not in env
     assert env["VIGIL_MAX_TURNS"] == "30"
+
+
+def test_a_local_presets_small_model_is_the_local_model_and_a_hosted_one_has_none(
+    cfg: Config, spec: SessionSpec
+) -> None:
+    """#197: the CLI's background model points at the local model, so it tries no hosted call."""
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    assert "VIGIL_SMALL_FAST_MODEL" not in env  # hosted: the entrypoint's own default
+    spec.preset, spec.model = "tower-qwen", "qwen3.6-35b-a3b"
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    assert env["VIGIL_SMALL_FAST_MODEL"] == "qwen3.6-35b-a3b"

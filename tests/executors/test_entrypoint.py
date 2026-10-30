@@ -545,3 +545,17 @@ def test_the_sdk_budget_comes_only_from_the_env_vigild_sets(
     assert "max_budget_usd" not in opts and opts["max_turns"] == 12
     monkeypatch.setenv("VIGIL_MAX_BUDGET_USD", "lots")  # not a number: ignored
     assert "max_budget_usd" not in ep.agent_options("worker", TOKEN, print)
+
+
+def test_the_cli_small_model_is_the_local_model_when_vigild_sets_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ep = _entrypoint()
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.delenv("VIGIL_SMALL_FAST_MODEL", raising=False)
+    env = ep.agent_options("worker", TOKEN, print)["env"]
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-haiku-5-5"
+    monkeypatch.setenv("VIGIL_SMALL_FAST_MODEL", "qwen3.6-35b-a3b")
+    env = ep.agent_options("worker", TOKEN, print)["env"]
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "qwen3.6-35b-a3b"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.6-35b-a3b"
