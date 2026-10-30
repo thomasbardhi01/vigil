@@ -4,6 +4,8 @@ auth and consent never leave rung 0, and deps never passes rung 1."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -353,3 +355,77 @@ def test_a_pinned_task_stays_at_rung_zero_and_never_promotes_its_shape(
     ladder.record(_audit(shape, 1), verify_level=1)  # one unpinned audit
     assert ladder.rung(shape) == 1  # promotion still needs its own window
     assert store.q("SELECT COUNT(*) n FROM audits")[0]["n"] == 1
+
+
+def _pinned_prefix_ok(entry: str, root: Path) -> bool:
+    """Check that a pinned-path entry's literal prefix names a real file or directory.
+
+    Uses ``os.listdir`` on the parent so we verify the name via directory
+    entries, never ``Path.exists``.  Matches are case-exact.
+    """
+    # Extract the literal prefix: everything before the first glob character.
+    prefix = entry.split("*")[0]
+    prefix = prefix.split("?")[0]
+    prefix = prefix.split("[")[0]
+
+    if prefix.endswith("/"):
+        # The entry names a directory.  Verify it by listing the parent.
+        dir_name = prefix.rstrip("/")
+        dir_path = root / dir_name
+        if not dir_path.is_dir():
+            return False
+        parent = dir_path.parent
+        return dir_path.name in os.listdir(parent)
+    else:
+        # The entry names a file.  Verify it by listing the parent.
+        file_path = root / prefix
+        parent = file_path.parent
+        try:
+            return file_path.name in os.listdir(parent)
+        except FileNotFoundError:
+            return False
+
+
+def test_current_vigil_pins_name_existing_paths(cfg: Config) -> None:
+    """Every pin from the vigil repo's policy resolves to an existing path."""
+    root = Path(__file__).resolve().parents[2]  # repo root
+    pinned = cfg.repo(VIGIL).ladder_pinned_paths
+    results = [_pinned_prefix_ok(entry, root) for entry in pinned]
+    assert len(pinned) > 0
+    assert all(results), f"Not all pins resolve: {dict(zip(pinned, results, strict=True))}"
+
+
+def test_typo_pin_is_refused(cfg: Config) -> None:
+    """A misspelled pin entry does not resolve on a tmp_path fixture tree."""
+    tmp_root = Path(cfg.vigild.data_dir)  # tmp_path-backed directory
+    # Build a tree: correct paths under "vigild", typo under "vigil".
+    for part in ("vigild/gateway", "vigil/review"):
+        (tmp_root / part).mkdir(parents=True, exist_ok=True)
+    (tmp_root / "vigild/gateway/service.py").touch()
+    (tmp_root / "vigil/review/ladder.py").touch()
+
+    # Correct spelling resolves; typos do not.
+    assert _pinned_prefix_ok("vigild/gateway/", tmp_root)
+    assert not _pinned_prefix_ok("vigil/gateway/", tmp_root)
+    assert not _pinned_prefix_ok("vigild/gatewey/", tmp_root)
+    assert _pinned_prefix_ok("vigil/review/ladder.py", tmp_root)
+    assert not _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
+
+
+def test_wrong_case_pin_is_refused(cfg: Config) -> None:
+    """A wrong-case pin entry does not resolve on a tmp_path fixture tree."""
+    tmp_root = Path(cfg.vigild.data_dir)
+    for part in ("vigild/gateway", "Vigild/review", "docs"):
+        (tmp_root / part).mkdir(parents=True, exist_ok=True)
+    (tmp_root / "vigild/gateway/service.py").touch()
+    (tmp_root / "Vigild/review/ladder.py").touch()
+    (tmp_root / "docs/owner-rulings.md").touch()
+
+    # Correct case resolves; wrong case does not.
+    assert _pinned_prefix_ok("vigild/gateway/", tmp_root)
+    assert not _pinned_prefix_ok("VIGILD/gateway/", tmp_root)
+    assert not _pinned_prefix_ok("Vigild/gateway/", tmp_root)
+    assert _pinned_prefix_ok("Vigild/review/ladder.py", tmp_root)
+    assert not _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
+    assert _pinned_prefix_ok("docs/owner-rulings.md", tmp_root)
+    assert not _pinned_prefix_ok("Docs/owner-rulings.md", tmp_root)
