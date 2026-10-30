@@ -308,6 +308,14 @@ COORD_CASES: list[CoordCase] = [
         False,
         "tests-docs",
         "docs",
+        text="Touch `docs/*.txt`.",
+    ),
+    _r(
+        "pinned",
+        "wildcard hint that can name the rulings file",
+        True,
+        "pinned",
+        "docs",
         text="Touch `docs/*.md`.",
     ),
     # tests-docs

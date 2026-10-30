@@ -29,6 +29,7 @@ from vigild.intake.paths import scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
 from vigild.jobs.model import Role
 from vigild.jobs.ownernote import spec_body as spec_text
+from vigild.jobs.rulings import is_coord_note
 from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
 from vigild.packets.prefill import Prefill
@@ -44,7 +45,7 @@ TITLES = {
     "contract": "3. Contract",
     "feature_index": "1a. Feature-map index (one line per row)",
     "prefill": "3b. Prefill (vigild's own computation, paths read at base_sha)",
-    "owner": "3a. Owner's amendment (from the owner, not fenced)",
+    "owner": "3a. Amendment (the owner's or the coord's, as its note says; not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
     "self_check": "6. Self-check",
@@ -310,13 +311,15 @@ def assemble_worker(
                 "and sent it back; fix each one, even if it is low severity."
             )
             if fix_round.get("note"):
+                who = "coord" if is_coord_note(str(fix_round["note"])) else "owner"
                 contract_part += (
-                    " Their note on this round is in the fenced `owner note` block: it says "
-                    "what they want fixed, within your task's scope."
+                    f" The {who}'s note on this round is in the fenced `{who} note` block: it "
+                    "says what to fix, within your task's scope."
                 )
             contract_part += "\n"
         if fix_round.get("note"):
-            untrusted["owner note"] = str(fix_round["note"])
+            note = str(fix_round["note"])
+            untrusted["coord note" if is_coord_note(note) else "owner note"] = note
     if fix_context and fix_context.get("failure_log"):
         untrusted["failure-log"] = fix_context["failure_log"]
     report = artifact_path(Path("."), contract["job_id"], "worker_report.json", contract["task_id"])
@@ -742,19 +745,21 @@ def _assemble_coord(
             "approved": "previously approved spec",
             "approved-pre-versioning": "approved spec (pre-versioning, the one on file)",
         }.get(baseline, "current draft (never approved)")
+        who = "coord" if any(is_coord_note(n) for n in owner_notes) else "owner"
         shown = "\n\n".join(
             (f"### Note {i} of {len(owner_notes)}\n\n" if len(owner_notes) > 1 else "")
             + _codeblock(n)
             for i, n in enumerate(owner_notes, start=1)
         )
         parts["owner"] = (
-            f"The owner sent this job back with {'notes' if len(owner_notes) > 1 else 'a note'}. "
+            f"The {who} sent this job back with "
+            f"{'notes' if len(owner_notes) > 1 else 'a note'}. "
             f"This is a change to the {what}, not a new request: **amend** that spec and do "
             "not redraft it from the request. Change only what the notes ask and keep every "
             "section, line and acceptance criterion they do not touch exactly as it is. "
             "Apply the notes in order; a later note wins. Then re-plan `plan.md` from the "
             "amended spec.\n\n"
-            f"## The owner's {'notes' if len(owner_notes) > 1 else 'note'}\n\n{shown}\n\n"
+            f"## The {who}'s {'notes' if len(owner_notes) > 1 else 'note'}\n\n{shown}\n\n"
             f"## The {what}\n\n{_codeblock(spec_text(previous))}\n"
         )
         output += (

@@ -227,7 +227,7 @@ def test_the_coord_gets_the_approved_spec_and_the_note_as_an_owner_section(world
     (packet,) = packets
     # an owner section, trusted: it survives the removal of every fenced block
     acted_on = strip_fenced(packet)
-    assert "# 3a. Owner's amendment" in acted_on
+    assert "# 3a. Amendment" in acted_on
     assert NOTE in acted_on and "<<<UNTRUSTED" not in packet.split("# 3a.")[1].split("# 4.")[0]
     # the previously approved spec, whole, in that section
     section = acted_on.split("# 3a.")[1].split("# 4.")[0]
@@ -580,3 +580,50 @@ def test_the_coord_prompt_says_scope_paths_have_no_trailing_slash() -> None:
 
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
     assert "no trailing slash" in text and "out_of_scope" in text
+
+
+# --- a coord token's note is the coord's, never the owner's (owner, 2026-10-29) -------------
+
+HEADING = "Autonomy (what coord may do between the owner's windows)"
+LABEL = f"coord's note (ruling: {HEADING})"
+
+
+def test_a_coord_replan_note_reaches_the_coord_packet_labelled_as_the_coords(
+    world: World,
+) -> None:
+    w = world
+    job, item = _held(w)
+    packets = _capture(w)
+    _arm(w)
+    r = w.client.post(
+        f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.coord),
+        json={"note": NOTE, "ruling": f"see {HEADING}"},
+    )  # fmt: skip
+    assert r.status_code == 200, r.text
+    (packet,) = packets
+    section = strip_fenced(packet).split("# 3a.")[1].split("# 4.")[0]
+    assert LABEL in section and NOTE in section
+    assert "The owner sent this job back" not in section and "The owner's note" not in section
+    assert "Owner's amendment" not in packet and "from the owner" not in packet.split("# 4.")[0]
+    assert _art(w, job, "owner_note.md").content.startswith(LABEL)
+
+
+def test_a_coord_replan_note_without_a_ruling_is_refused(world: World) -> None:
+    w = world
+    _, item = _held(w)
+    r = w.client.post(
+        f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.coord), json={"note": NOTE}
+    )
+    assert r.status_code == 422 and "ruling" in r.text
+    assert w.store.get_inbox_item(item["id"]).status == "open"
+
+
+def test_an_owner_replan_note_keeps_its_label(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    packets = _capture(w)
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    section = strip_fenced(packets[0]).split("# 3a.")[1].split("# 4.")[0]
+    assert "The owner sent this job back" in section and "coord's note" not in section
+    assert _art(w, job, "owner_note.md").content == NOTE
