@@ -334,7 +334,7 @@ def test_a_session_step_failure_after_a_recorded_dev_image_names_the_stage_and_t
 
     import vigild.server as server
 
-    images, _, ws, base, _ = _cli_world(world, monkeypatch)
+    images, *_ = _cli_world(world, monkeypatch)
     runner = server.build_runner(None, None)  # type: ignore[arg-type]
 
     def session(repo: str, sha: str, **kw: Any) -> str:
