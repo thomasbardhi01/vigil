@@ -1090,15 +1090,15 @@ class JobService:
             if task.job_id != job.id or task.state != "failed":
                 raise Conflict(f"{task_id} is {task.state}, not a failed task of {job.id}")
             try:
-                self.runner.owner_republish(job.id, task_id, item_id)
-            except RepublishRefused as e:
-                raise Conflict(str(e)) from e
-            try:
                 job = transition(
                     self.store, job.id, job.blocked_from, actor, channel=_channel(actor),
                     evidence={"inbox_item_id": item_id, "action": "republish"},
                 )  # fmt: skip
             except TransitionError as e:
+                raise Conflict(str(e)) from e
+            try:  # checks, then the `owner_republish` event: it rolls back with the move
+                self.runner.owner_republish(job.id, task_id, item_id)
+            except RepublishRefused as e:
                 raise Conflict(str(e)) from e
             self.store.resolve_inbox_item(item_id, actor.value)
             for other in self.store.list_inbox():

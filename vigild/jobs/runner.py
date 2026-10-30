@@ -316,8 +316,6 @@ class JobRunner:
         self.reaper = reaper
         self.jobs: Pager | None = None
         self._why: dict[str, dict[str, Any]] = {}  # task id -> why its last attempt failed
-        # task id -> (publish inputs, inbox item id): the owner's republish, until it runs
-        self._owner_pub: dict[str, tuple[dict[str, Any], int]] = {}
         self._why_lock = threading.Lock()
         self.deferred: list[str] = []  # approved builds reconcile found, not yet started
         self._running: set[str] = set()
@@ -3500,16 +3498,39 @@ class JobRunner:
             )
         return True
 
+    def _owner_event(self, task_id: str) -> tuple[int, dict[str, Any]] | None:
+        """The task's latest `owner_republish` event, if no `republish` event has consumed
+        it (the `republish` event records the id it consumed)."""
+        rows = self.store.q(
+            "SELECT id, data FROM events WHERE task_id=? AND type='owner_republish' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        if not rows:
+            return None
+        eid = int(rows[0]["id"])
+        for r in self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='republish' AND id>?", (task_id, eid)
+        ):
+            if json.loads(r["data"]).get("owner_event") == eid:
+                return None
+        return eid, json.loads(rows[0]["data"])
+
     def _republish_inputs(self, task_id: str) -> dict[str, Any] | None:
         """What a task's last publish refusal kept, if that refusal is its latest failure:
-        its result was imported, verified and accepted, so only the publish is retried."""
+        its result was imported, verified and accepted, so only the publish is retried.
+        The owner's republish (an unconsumed `owner_republish` event) comes first, its
+        inputs rebuilt from vigild's records."""
+        if self._owner_event(task_id) is not None:
+            try:
+                return self._owner_inputs(self.store.get_task(task_id).job_id, task_id)
+            except RepublishRefused:
+                log.warning("owner republish of %s no longer holds", task_id)
         rows = self.store.q(
             "SELECT type, data FROM events WHERE task_id=? "
             "AND type IN ('task_failed','publish_refused') ORDER BY id DESC LIMIT 2",
             (task_id,),
         )
-        if task_id in self._owner_pub:
-            return self._owner_pub[task_id][0]
         if len(rows) < 2 or rows[1]["type"] != "publish_refused":
             return None
         if json.loads(rows[0]["data"]).get("title") != f"{task_id}: publish refused":
@@ -3526,7 +3547,7 @@ class JobRunner:
         pub = self._republish_inputs(task_id)
         s = self._last_worker(task_id)
         assert pub is not None and s is not None  # dispatch checked, before it set `running`
-        owner = self._owner_pub.pop(task_id, None)  # the owner's, once: a retry uses the event
+        owner = self._owner_event(task_id)  # the owner's, consumed by this event
         try:
             ok = self._publish_task(job, s, task_id, pub)
         except Exception as e:  # vigild trouble: the task fails, nothing is left running
@@ -3541,17 +3562,18 @@ class JobRunner:
         result = self._task_pr(task_id) if ok else self._why.get(task_id, {}).get("error")
         data = {"task": task_id, "head": pub["head"], "result": result}
         if owner is not None:
-            data["inbox_item_id"] = owner[1]
+            data["inbox_item_id"] = owner[1].get("inbox_item_id")
+            data["owner_event"] = owner[0]
         self.store.add_event(
             "republish", data, Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return ok
 
-    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
-        """The owner's republish of a failed task's verified head: check vigild's own
-        record against the vault, build the publish inputs as the post-verify path does
-        and keep them for the dispatch that follows. Refuses (`RepublishRefused`) before
-        anything changes."""
+    def _owner_inputs(self, job_id: str, task_id: str) -> dict[str, Any]:
+        """The publish inputs of a failed task's verified head, from vigild's records:
+        the verifier's `after.sha` must be the vault's `refs/vigil/<task>`, and a publish
+        attempt on record after that `tests.json` shows the head was accepted (the record
+        is written before acceptance, scope and integrity checks)."""
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
         art = self.store.get_artifact(job_id, "tests.json", task_id)
@@ -3560,7 +3582,7 @@ class JobRunner:
         except json.JSONDecodeError:
             tests = None
         after = ((tests or {}).get("after") or {}).get("sha")
-        if not isinstance(after, str) or not after:
+        if art is None or tests is None or not isinstance(after, str) or not after:
             raise RepublishRefused(f"{task_id} has no verifier record with an after.sha")
         ref = self.workspace.task_ref(job.repo, task_id)
         if ref != after:
@@ -3568,6 +3590,19 @@ class JobRunner:
                 f"{task_id}: the verifier's head is {after}, the vault's refs/vigil/{task_id} "
                 f"is {ref or 'missing'}"
             )
+        attempted = False
+        for r in self.store.q(
+            "SELECT type, data FROM events WHERE task_id=? AND ts>=? "
+            "AND type IN ('publish_refused','task_failed')",
+            (task_id, art.created_at),  # timestamps are whole seconds: a tie counts as after
+        ):
+            d = json.loads(r["data"])
+            if r["type"] == "publish_refused" and d.get("head") == after:
+                attempted = True
+            if r["type"] == "task_failed" and d.get("title") == f"{task_id}: publish refused":
+                attempted = True
+        if not attempted:
+            raise RepublishRefused("the head was never accepted (no publish attempt on record)")
         raw = self.store.get_artifact(job_id, "worker_report.json", task_id)
         if raw is None or self._last_worker(task_id) is None:
             raise RepublishRefused(f"{task_id} has no worker report or session on record")
@@ -3576,13 +3611,23 @@ class JobRunner:
             base_sha = self.workspace.base_sha(task_id)
         except (ValidationError, WorkspaceError, OSError, KeyError, ValueError) as e:
             raise RepublishRefused(f"{task_id}: its record is unusable: {e}"[:300]) from e
-        overlap = [str(p) for p in tests.get("runner_files") or []]  # type: ignore[union-attr]
-        pub = self._pub_inputs(
+        overlap = [str(p) for p in tests.get("runner_files") or []]
+        return self._pub_inputs(
             job, t, report, tests, after, base_sha, str(t.contract["branch"]), overlap,
-            not tests.get("hidden_disabled"),  # type: ignore[union-attr]
+            not tests.get("hidden_disabled"),
             self._task_pr(task_id) if self._task_head(task_id) else None,
         )  # fmt: skip
-        self._owner_pub[task_id] = (pub, item_id)
+
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        """The owner's republish of a failed task's verified head: check vigild's records
+        and the vault (`_owner_inputs`), then record an `owner_republish` event the
+        dispatch that follows works from, restart or not. Refuses (`RepublishRefused`)
+        before anything is written."""
+        pub = self._owner_inputs(job_id, task_id)
+        self.store.add_event(
+            "owner_republish", {"task": task_id, "head": pub["head"], "inbox_item_id": item_id},
+            Provenance.HUMAN, job_id=job_id, task_id=task_id,
+        )  # fmt: skip
 
     # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 

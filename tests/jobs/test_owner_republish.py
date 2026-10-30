@@ -16,10 +16,12 @@ from tests.jobs.test_coord_loop import (
     _approve,
     _events,
     _failure_item,
+    _request,
     auth,
     world,  # noqa: F401
 )
 from tests.jobs.test_republish import _refuse_w1_once, _w1_calls
+from vigild.provenance import Provenance
 
 
 def _failed(w: World) -> tuple[str, str, dict[str, Any]]:
@@ -121,11 +123,131 @@ def test_a_record_without_an_after_sha_is_a_409(world: World) -> None:
 
 def test_a_page_that_is_not_a_failed_task_page_is_refused(world: World) -> None:
     w = world
-    _job, tid, item = _failed(w)
-    assert _post(w, item["id"], "vi-9999-w9").status_code == 409  # not on this page
-    spec = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
-    other = [q for q in spec["questions"] if q["body"].get("kind") != "worker_failed"]
-    for q in other:
-        assert _post(w, q["id"], tid).status_code == 409
+    job, tid, item = _failed(w)
+    assert _post(w, item["id"], "vi-9999-w9").status_code == 409  # not among the page's tasks
+    assert _post(w, item["id"], None).status_code == 409
+    other = [
+        w.store.create_inbox_item(
+            "questions", kind, job, f"{kind} page", body, Provenance.HUMAN, own_job=True
+        ).id
+        for kind, body in (
+            ("ask_coord", {"question": "?", "task_id": tid}),
+            ("budget", {"kind": "budget", "tasks": {}, "actions": ["abandon"]}),
+        )
+    ]
+    assert other, "the case list would be empty"
+    for qid in other:
+        assert _post(w, qid, tid).status_code == 409
     assert _post(w, 999999, tid).status_code == 404
-    assert not _events(w, "republish")
+    assert not _events(w, "republish") and not _events(w, "owner_republish")
+
+
+def test_a_task_of_another_job_is_refused(world: World) -> None:
+    w = world
+    _job, tid, item = _failed(w)
+    other = _request(w)  # a second job, still waiting for its spec's approval
+    w.store.x("UPDATE tasks SET job_id=? WHERE id=?", (other, tid))
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 409, r.text
+    assert not _events(w, "owner_republish")
+
+
+def test_a_task_that_is_not_failed_is_refused(world: World) -> None:
+    w = world
+    _job, tid, item = _failed(w)
+    w.store.x("UPDATE tasks SET state='pr_open' WHERE id=?", (tid,))
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 409, r.text
+    assert not _events(w, "owner_republish")
+
+
+def test_a_head_that_failed_acceptance_is_never_republished(world: World) -> None:
+    """tests.json is written before stage 3: a verifier record and a vault ref aren't
+    proof the head was accepted."""
+    from tests.jobs.test_coord_loop import _flaky
+
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    job = _approve(w)
+    tid = f"{job}-w1"
+    item = _failure_item(w, job)
+    assert "stage 3 acceptance failed" in json.dumps(item["body"]["tasks"])
+    repo = w.store.get_job(job).repo
+    assert _record(w, job, tid)["after"]["sha"] == w.runner.workspace.task_ref(repo, tid)
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 409, r.text
+    assert "never accepted" in r.text
+    assert not _events(w, "owner_republish")
+    assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]
+
+
+def test_a_refusal_before_the_current_record_is_not_evidence(world: World) -> None:
+    w = world
+    job, tid, item = _failed(w)
+    rec = _record(w, job, tid)
+    w.store.add_artifact(job, "tests.json", json.dumps(rec), Provenance.HUMAN, task_id=tid)
+    w.store.x(
+        "UPDATE artifacts SET created_at='2999-01-01T00:00:00' WHERE name='tests.json' "
+        "AND id=(SELECT MAX(id) FROM artifacts WHERE name='tests.json' AND task_id=?)",
+        (tid,),
+    )
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 409 and "never accepted" in r.text, r.text
+    assert not _events(w, "owner_republish")
+
+
+def test_a_task_that_predates_156_republishes_on_its_task_failed_event(world: World) -> None:
+    w = world
+    _job, tid, item = _failed(w)
+    w.store.x("DELETE FROM events WHERE type='publish_refused' AND task_id=?", (tid,))
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 200, r.text
+    assert w.store.get_task(tid).state in ("pr_open", "reviewed")
+
+
+def test_the_owner_event_survives_a_hold_and_republishes_with_no_session(world: World) -> None:
+    """Nothing is kept in memory: a held dispatch (or a restart) republishes later."""
+    w = world
+    job, tid, item = _failed(w)
+    real = w.runner.dispatch
+    w.runner.dispatch = lambda j: None  # type: ignore[method-assign]
+    assert _post(w, item["id"], tid).status_code == 200
+    (ev,) = _events(w, "owner_republish")
+    assert ev["head"] == _record(w, job, tid)["after"]["sha"] and ev["inbox_item_id"] == item["id"]
+    assert w.store.get_task(tid).state == "failed" and not _events(w, "republish")
+    assert not hasattr(w.runner, "_owner_pub")
+    w.runner.dispatch = real  # type: ignore[method-assign]
+    real(job)
+    assert w.store.get_task(tid).state in ("pr_open", "reviewed")
+    assert _w1_calls(w, job) == 1
+    (rep,) = _events(w, "republish")
+    assert rep["owner_event"] and rep["inbox_item_id"] == item["id"]
+
+
+def test_a_failed_transition_leaves_no_event(world: World, monkeypatch: Any) -> None:
+    from vigild.jobs import service
+    from vigild.jobs.fsm import TransitionError
+
+    w = world
+    _job, tid, item = _failed(w)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise TransitionError("no")
+
+    monkeypatch.setattr(service, "transition", boom)
+    assert _post(w, item["id"], tid).status_code == 409
+    assert not _events(w, "owner_republish")
+    assert w.runner._owner_event(tid) is None
+    assert w.store.get_inbox_item(item["id"]).status == "open"
+
+
+def test_a_consumed_republish_is_not_used_again(world: World) -> None:
+    w = world
+    job, tid, item = _failed(w)
+    assert _post(w, item["id"], tid).status_code == 200
+    assert w.runner._owner_event(tid) is None  # consumed by its `republish` event
+    w.store.update_task(tid, state="failed")
+    w.store.add_event(
+        "task_failed", {"title": f"{tid}: worker session failed"}, "human", job_id=job, task_id=tid
+    )
+    assert w.runner._republish_inputs(tid) is None  # an ordinary retry starts a session
