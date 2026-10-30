@@ -660,6 +660,22 @@ class Workspace:
             f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
 
+    def remote_tip(self, repo: str, branch: str, token: str | None) -> str | None:
+        """The tip of `branch` on the remote right now, or None if it has none."""
+        if is_bench_repo(repo):
+            raise WorkspaceError(f"{repo} is a bench repo: there is no remote")
+        if not BRANCH.match(branch) or ".." in branch:
+            raise WorkspaceError(f"branch {branch!r} must be vigil/*")
+        out = self._git(
+            self.vault(repo), "ls-remote", self.remote_url(repo), f"refs/heads/{branch}",
+            token=token,
+        )  # fmt: skip
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref == f"refs/heads/{branch}" and SHA.match(sha):
+                return sha
+        return None
+
     # --- what reaches the target repo (Tier 1: `.vigil/` stays in the vault) ---------------
 
     def _vigil_entries(self, repo: str, sha: str) -> list[str]:

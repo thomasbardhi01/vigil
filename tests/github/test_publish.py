@@ -234,3 +234,22 @@ def test_closing_a_pr_patches_its_state_with_a_one_repo_write_token() -> None:
         pass
     else:
         raise AssertionError("a PR of another repo was closed")
+
+
+def test_a_branch_that_moved_on_the_remote_is_refused_before_any_push_or_record(
+    setup: tuple[Workspace, str, str, Path],
+) -> None:
+    """#32: the remote tip is neither vigild's record nor behind the commit sent."""
+    ws, base, head, bare = setup
+    tree = git(bare, "rev-parse", f"{base}^{{tree}}")
+    outside = git(bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+                  "-p", base, "-m", "someone else's push")  # fmt: skip
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", outside)
+    pulls = FakePulls(bare)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, pulls)
+    assert type(raised.value).__name__ == "BranchMoved"
+    assert "moved on the remote" in str(raised.value)
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == outside  # not overwritten
+    assert ws.published_sha(REPO, BRANCH) is None  # no record written
+    assert pulls.prs == []
