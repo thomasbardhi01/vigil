@@ -282,6 +282,8 @@ class ReportPlan:
     reports: int
     problems: list[str]
     vitest_dirs: tuple[str, ...] = ()  # repo-relative dirs of the vitest projects it runs
+    # report name (`vitest-<n>.xml`) -> the repo-relative dir of the n-th vitest command
+    report_dirs: Mapping[str, str] = field(default_factory=dict)
 
 
 def _flags(n: int) -> str:
@@ -306,6 +308,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
     problems: list[str] = []
     out, pos, n, reporting = [], 0, 0, 0
     vitest_dirs: list[str] = []
+    report_dirs: dict[str, str] = {}
     cwd = ""
     for c in parse(test_cmd).commands:
         if c.program == "cd" and c.args:
@@ -317,7 +320,17 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if _runs_vitest(c):
             n += 1
             reporting += 1
-            vitest_dirs.append(cwd)
+            where = cwd
+            if c.program == "pnpm":
+                pargs = list(c.args)
+                i = 0  # only pnpm's own options: stop at `exec`, `run` or a script name
+                while i < len(pargs) and pargs[i].startswith("-"):
+                    if pargs[i] in ("-C", "--dir") and i + 1 < len(pargs):
+                        where = "/".join(x for x in (cwd, pargs[i + 1].strip("/")) if x)
+                        i += 1
+                    i += 1
+            vitest_dirs.append(where)
+            report_dirs[f"vitest-{n}.xml"] = where
             end = c.start + len(c.text.rstrip())
             out.append(test_cmd[pos:end] + _flags(n))
             pos = end
@@ -373,6 +386,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
             continue  # PYTEST_ADDOPTS reaches it through pnpm
         n += 1
         vitest_dirs.append(where)
+        report_dirs[f"vitest-{n}.xml"] = where
         body = " ".join([script, *(shlex.quote(a) for a in extra)]) + _flags(n)
         lead = c.text[: len(c.text) - len(c.text.lstrip())]
         dir_opt = f"-C {shlex.quote(where)} " if where and where != cwd else ""
@@ -387,7 +401,9 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         problems.append(
             "runs no test runner vigil can read (pytest, vitest, or a pnpm script that runs one)"
         )
-    return ReportPlan("".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)))
+    return ReportPlan(
+        "".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)), report_dirs
+    )
 
 
 def can_report(test_cmd: str, read: ReadFile | None = None) -> bool:
@@ -404,9 +420,15 @@ class Case:
     file: str
     status: str  # pass | failure | error | skipped | xfail
     assertion: bool = False  # a failure carrying the task's HMAC tag (hidden runs only)
+    # a vitest case's project dir (repo-relative; "" is the root), from the plan that built
+    # the command; UNKNOWN_PROJECT when its report has no dir; None for pytest and unmapped
+    project: str | None = None
 
 
-def parse_junit(data: bytes, tag: str = "") -> list[Case]:
+UNKNOWN_PROJECT = "<unknown>"
+
+
+def parse_junit(data: bytes, tag: str = "", project: str | None = None) -> list[Case]:
     if len(data) > MAX_REPORT or b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         return []
     try:
@@ -435,6 +457,7 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
                 tc.get("file") or classname,
                 status,
                 assertion,
+                project,
             )
         )
     return cases
@@ -443,6 +466,13 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
 def belongs(case: Case, files: Iterable[str]) -> bool:
     """Is a report's test case in one of these repo files? pytest names a
     module (`tests.test_a`); vitest a path relative to its project dir."""
+    if case.project is not None:
+        # vitest, with the dir its command ran in: the full repo path, exact, never a suffix
+        proj = case.project
+        if proj == UNKNOWN_PROJECT:
+            return case.file in files
+        full = case.file if not proj or case.file.startswith(proj + "/") else f"{proj}/{case.file}"
+        return full in files
     parts = case.file.split(".")
     # pytest: a module, or module.Class(.Nested): try each prefix as a .py path
     guesses = {case.file} | {"/".join(parts[:k]) + ".py" for k in range(1, len(parts) + 1)}
@@ -666,16 +696,24 @@ class Verifier:
             "runner_files": overlap,
             "runner_file_changed": bool(set(overlap) & changed_paths),
         }
-        command = with_reports(test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        # one plan, from the base's blobs: the command that runs and the report -> dir map
+        # that reads its reports (never re-planned from the worker's head)
+        plan = plan_reports(test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        command, dirs = plan.command, plan.report_dirs
         pin = (base_sha, pinned)
-        base = self._run(repo, image, f"{task_id}-base", base_sha, test_cmd, command, [pin])
+        base = self._run(
+            repo, image, f"{task_id}-base", base_sha, test_cmd, command, [pin], report_dirs=dirs
+        )
         record["base"] = base
         base2: dict[str, Any] | None = None
         if base["_report"]:
             # A second base run finds ids that change per run (phase 1 run, finding
             # #1). It costs one more run the length of the base's, and only when the
             # base reported.
-            base2 = self._run(repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin])
+            base2 = self._run(
+                repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin],
+                report_dirs=dirs,
+            )  # fmt: skip
             if base2["_report"] and base2["_cases"]:
                 record["base_repeat"] = {
                     k: base2[k] for k in ("sha", "exit", "outcome", "tests") if k in base2
@@ -686,12 +724,14 @@ class Verifier:
         if must_fail_first:
             before = self._run(
                 repo, image, f"{task_id}-before", base_sha, test_cmd, command,
-                [(head, tests), pin],
+                [(head, tests), pin], report_dirs=dirs,
             )  # fmt: skip
             before["applied"] = tests
             self._collection_failure(before, tests, test_cmd)
             record["before"] = before
-        after = self._run(repo, image, f"{task_id}-after", head, test_cmd, command, [pin])
+        after = self._run(
+            repo, image, f"{task_id}-after", head, test_cmd, command, [pin], report_dirs=dirs
+        )
         if not after["_report"] and after["outcome"] == "pass":
             # owner direction, round 3: "tests ran" can't be confirmed without a report
             after["outcome"] = "unknown"
@@ -766,7 +806,9 @@ class Verifier:
         plan = plan_reports(cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
         if plan.problems:
             return {**entry, "outcome": "unknown", "selected": 0, "note": "; ".join(plan.problems)}
-        run = self._run(repo, image, name, head, cmd, plan.command, [pin])
+        run = self._run(
+            repo, image, name, head, cmd, plan.command, [pin], report_dirs=plan.report_dirs
+        )
         return self._ac_entry(cmd, acs, run)
 
     @staticmethod
@@ -826,9 +868,8 @@ class Verifier:
         runs it only as a subprocess. Only the base run gets the tag in its
         environment: the base's own code runs there, never a worker's."""
         assert self.host_key is not None
-        command = with_reports(
-            hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path)
-        )
+        plan = plan_reports(hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        command = plan.command
         mine: list[str] = []
         if head is not None:
             mine = sorted(
@@ -848,6 +889,7 @@ class Verifier:
                 keep_output=True, tag=tag,
                 put=[helper_file(hidden.prefix.rstrip("/"), hidden.vitest)],
                 env={TAG_ENV: tag if tagged else "untagged"}, subject=subject,
+                report_dirs=plan.report_dirs,
             )  # fmt: skip
         finally:
             shutil.rmtree(subject.parent, ignore_errors=True)
@@ -1247,6 +1289,7 @@ class Verifier:
         tag: str = "",
         env: Mapping[str, str] | None = None,
         subject: Path | None = None,
+        report_dirs: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         halted = _HALTED.get()
         if halted is not None and halted():
@@ -1264,7 +1307,16 @@ class Verifier:
             )
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)
-        cases = [c for data in r.reports.values() for c in parse_junit(data, tag)]
+        dirs = report_dirs or {}
+        cases = [
+            c
+            for name_, data in r.reports.items()
+            for c in parse_junit(
+                data,
+                tag,
+                dirs.get(name_, UNKNOWN_PROJECT) if name_.startswith("vitest-") else None,
+            )
+        ]
         got = judge(test_cmd, r.exit, r.timed_out, r.output)
         out: dict[str, Any] = {
             "sha": sha,
