@@ -1454,14 +1454,27 @@ class JobService:
             ):
                 raise Conflict(f"inbox item {item_id} doesn't offer reset")
             if actor is Actor.COORD:
-                # the owner's ruling lets coord reset `repo_failures` only (a traced
-                # run of failures); a money, depth or backend breaker is the owner's.
-                # The kind is the breaker row's, not the page's.
+                # the owner's rulings let coord reset `repo_failures` (a traced run of
+                # failures) and `wip` (capacity: only while the repo's stack is below
+                # `wip_per_repo`, owner 2026-10-30); a money, depth or backend breaker
+                # is the owner's. The kind and scope are the breaker row's, not the page's.
                 rows = self.store.q(
-                    "SELECT kind FROM breakers WHERE id=?", (item.body.get("breaker"),)
+                    "SELECT kind, scope FROM breakers WHERE id=?", (item.body.get("breaker"),)
                 )
-                if not rows or rows[0]["kind"] != "repo_failures":
-                    raise Forbidden("the coord token resets a repo_failures breaker only")
+                kind = rows[0]["kind"] if rows else None
+                if kind not in ("repo_failures", "wip"):
+                    raise Forbidden("the coord token resets a repo_failures or wip breaker only")
+                if kind == "wip":
+                    from vigild.scheduler import wip
+
+                    repo = str(rows[0]["scope"]).removeprefix("repo:")
+                    held = len(wip.stack(self.store, repo))
+                    limit = self.cfg.budgets.wip_per_repo
+                    if held >= limit:
+                        raise Forbidden(
+                            f"the coord token resets a wip breaker only when the stack has "
+                            f"room: {held} of {limit}"
+                        )
             self.store.add_event(
                 "reset", {"inbox_item_id": item_id, "breaker": item.body.get("breaker")},
                 Provenance.HUMAN, job_id=item.job_id,

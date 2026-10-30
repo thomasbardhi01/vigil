@@ -455,6 +455,29 @@ def test_the_coord_token_may_reset_a_repo_failures_breaker(
     assert store.get_inbox_item(item).resolved_by == "coord"
 
 
+def test_the_coord_token_may_reset_a_wip_breaker_when_the_stack_has_room(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    """Owner, 2026-10-30: a capacity breaker, reset by coord once the repo's stack is
+    below `wip_per_repo` (the fixture repo's stack is empty)."""
+    item = _breaker_page(store, "wip")
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.coord))
+    assert r.status_code == 200, r.text
+    assert store.get_inbox_item(item).resolved_by == "coord"
+
+
+def test_the_coord_token_may_not_reset_a_wip_breaker_while_the_stack_is_full(
+    client: TestClient, tokens: Tokens, store: Store, services: Services
+) -> None:
+    services.cfg.budgets.wip_per_repo = 0  # the stack (empty) is at the limit
+    item = _breaker_page(store, "wip")
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.coord))
+    assert r.status_code == 403 and "stack has room" in r.text, r.text
+    assert store.get_inbox_item(item).status == "open"
+    r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.admin))
+    assert r.status_code == 200, r.text  # the owner's reset is unchanged
+
+
 # --- the ruling must name a heading of docs/owner-rulings.md (owner, 2026-10-29) ----------
 
 
