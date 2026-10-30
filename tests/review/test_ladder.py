@@ -360,30 +360,39 @@ def test_a_pinned_task_stays_at_rung_zero_and_never_promotes_its_shape(
 def _pinned_prefix_ok(entry: str, root: Path) -> bool:
     """Check that a pinned-path entry's literal prefix names a real file or directory.
 
-    Uses ``os.listdir`` on the parent so we verify the name via directory
-    entries, never ``Path.exists``.  Matches are case-exact.
+    Uses ``os.listdir`` on each parent so we verify every component of the
+    path with case-exact matching, never ``Path.exists``.  Returns False for
+    an empty prefix (e.g. a bare glob).
     """
     # Extract the literal prefix: everything before the first glob character.
     prefix = entry.split("*")[0]
     prefix = prefix.split("?")[0]
     prefix = prefix.split("[")[0]
 
-    if prefix.endswith("/"):
-        # The entry names a directory.  Verify it by listing the parent.
-        dir_name = prefix.rstrip("/")
-        dir_path = root / dir_name
-        if not dir_path.is_dir():
-            return False
-        parent = dir_path.parent
-        return dir_path.name in os.listdir(parent)
-    else:
-        # The entry names a file.  Verify it by listing the parent.
-        file_path = root / prefix
-        parent = file_path.parent
+    if not prefix:
+        # A glob-only entry names nothing.
+        return False
+
+    is_dir_entry = prefix.endswith("/")
+    if is_dir_entry:
+        prefix = prefix.rstrip("/")
+
+    # Walk each component of the prefix, checking case-exactly at every step.
+    parts = prefix.split("/")
+    current = root
+    for part in parts:
         try:
-            return file_path.name in os.listdir(parent)
+            entries = os.listdir(current)
         except FileNotFoundError:
             return False
+        if part not in entries:
+            return False
+        current = current / part
+
+    # The entry must be a directory when it ended in '/'.
+    if is_dir_entry:
+        return current.is_dir()
+    return True
 
 
 def test_current_vigil_pins_name_existing_paths(cfg: Config) -> None:
@@ -415,17 +424,20 @@ def test_typo_pin_is_refused(cfg: Config) -> None:
 def test_wrong_case_pin_is_refused(cfg: Config) -> None:
     """A wrong-case pin entry does not resolve on a tmp_path fixture tree."""
     tmp_root = Path(cfg.vigild.data_dir)
-    for part in ("vigild/gateway", "Vigild/review", "docs"):
+    # Build a single tree with correct case only; wrong-case variants are
+    # tested as pins, not as separate directories.
+    for part in ("vigild/gateway", "vigild/review", "docs"):
         (tmp_root / part).mkdir(parents=True, exist_ok=True)
     (tmp_root / "vigild/gateway/service.py").touch()
-    (tmp_root / "Vigild/review/ladder.py").touch()
+    (tmp_root / "vigild/review/ladder.py").touch()
     (tmp_root / "docs/owner-rulings.md").touch()
 
     # Correct case resolves; wrong case does not.
     assert _pinned_prefix_ok("vigild/gateway/", tmp_root)
     assert not _pinned_prefix_ok("VIGILD/gateway/", tmp_root)
     assert not _pinned_prefix_ok("Vigild/gateway/", tmp_root)
-    assert _pinned_prefix_ok("Vigild/review/ladder.py", tmp_root)
-    assert not _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
+    assert _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
+    assert not _pinned_prefix_ok("Vigild/review/ladder.py", tmp_root)
+    assert not _pinned_prefix_ok("vigild/Budget.py", tmp_root)
     assert _pinned_prefix_ok("docs/owner-rulings.md", tmp_root)
     assert not _pinned_prefix_ok("Docs/owner-rulings.md", tmp_root)
