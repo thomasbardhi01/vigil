@@ -404,40 +404,28 @@ def test_current_vigil_pins_name_existing_paths(cfg: Config) -> None:
     assert all(results), f"Not all pins resolve: {dict(zip(pinned, results, strict=True))}"
 
 
-def test_typo_pin_is_refused(cfg: Config) -> None:
+def _fixture_tree(root: Path) -> None:
+    (root / "vigild/gateway").mkdir(parents=True)
+    (root / "vigild/gateway/service.py").touch()
+    (root / "vigild/budget.py").touch()
+
+
+def test_typo_pin_is_refused(tmp_path: Path) -> None:
     """A misspelled pin entry does not resolve on a tmp_path fixture tree."""
-    tmp_root = Path(cfg.vigild.data_dir)  # tmp_path-backed directory
-    # Build a tree: correct paths under "vigild", typo under "vigil".
-    for part in ("vigild/gateway", "vigil/review"):
-        (tmp_root / part).mkdir(parents=True, exist_ok=True)
-    (tmp_root / "vigild/gateway/service.py").touch()
-    (tmp_root / "vigil/review/ladder.py").touch()
-
-    # Correct spelling resolves; typos do not.
-    assert _pinned_prefix_ok("vigild/gateway/", tmp_root)
-    assert not _pinned_prefix_ok("vigil/gateway/", tmp_root)
-    assert not _pinned_prefix_ok("vigild/gatewey/", tmp_root)
-    assert _pinned_prefix_ok("vigil/review/ladder.py", tmp_root)
-    assert not _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
+    _fixture_tree(tmp_path)
+    assert _pinned_prefix_ok("vigild/budget.py", tmp_path)
+    assert _pinned_prefix_ok("vigild/gateway/**", tmp_path)
+    assert not _pinned_prefix_ok("vigild/budjet.py", tmp_path)
+    assert not _pinned_prefix_ok("vigild/gatway/**", tmp_path)
+    assert not _pinned_prefix_ok("**", tmp_path)
 
 
-def test_wrong_case_pin_is_refused(cfg: Config) -> None:
-    """A wrong-case pin entry does not resolve on a tmp_path fixture tree."""
-    tmp_root = Path(cfg.vigild.data_dir)
-    # Build a single tree with correct case only; wrong-case variants are
-    # tested as pins, not as separate directories.
-    for part in ("vigild/gateway", "vigild/review", "docs"):
-        (tmp_root / part).mkdir(parents=True, exist_ok=True)
-    (tmp_root / "vigild/gateway/service.py").touch()
-    (tmp_root / "vigild/review/ladder.py").touch()
-    (tmp_root / "docs/owner-rulings.md").touch()
-
-    # Correct case resolves; wrong case does not.
-    assert _pinned_prefix_ok("vigild/gateway/", tmp_root)
-    assert not _pinned_prefix_ok("VIGILD/gateway/", tmp_root)
-    assert not _pinned_prefix_ok("Vigild/gateway/", tmp_root)
-    assert _pinned_prefix_ok("vigild/review/ladder.py", tmp_root)
-    assert not _pinned_prefix_ok("Vigild/review/ladder.py", tmp_root)
-    assert not _pinned_prefix_ok("vigild/Budget.py", tmp_root)
-    assert _pinned_prefix_ok("docs/owner-rulings.md", tmp_root)
-    assert not _pinned_prefix_ok("Docs/owner-rulings.md", tmp_root)
+def test_wrong_case_pin_is_refused(tmp_path: Path) -> None:
+    """A pin differing only in case does not resolve, even on a
+    case-insensitive file system."""
+    _fixture_tree(tmp_path)
+    assert _pinned_prefix_ok("vigild/budget.py", tmp_path)
+    assert _pinned_prefix_ok("vigild/gateway/**", tmp_path)
+    assert not _pinned_prefix_ok("vigild/Budget.py", tmp_path)
+    assert not _pinned_prefix_ok("Vigild/gateway/**", tmp_path)
+    assert not _pinned_prefix_ok("vigild/Gateway/**", tmp_path)
