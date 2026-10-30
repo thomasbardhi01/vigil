@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Protocol
 import httpx2
 
 from vigild.intake.paths import in_scope
+from vigild.redact import redact
 
 if TYPE_CHECKING:
     from vigild.workspace import Workspace
@@ -72,8 +73,16 @@ class RestPulls:
         )
         if r.status_code != 201:
             is_json = r.headers.get("content-type", "").startswith("application/json")
-            msg = r.json().get("message", "") if is_json else r.text[:200]
-            raise PublishError(f"{r.status_code}: {msg}")
+            doc = r.json() if is_json else {}
+            doc = doc if isinstance(doc, dict) else {}
+            msg = doc.get("message", "") if is_json else r.text[:200]
+            why = "; ".join(  # GitHub's own reason, e.g. "title is too long"
+                str(e.get("message") or e.get("code") or "") if isinstance(e, dict) else str(e)
+                for e in (doc.get("errors") or [])[:5]
+            )
+            if why:
+                msg = f"{msg} ({why})"
+            raise PublishError(redact(f"{r.status_code}: {msg}")[:600])
         url: str = r.json()["html_url"]
         return url
 
