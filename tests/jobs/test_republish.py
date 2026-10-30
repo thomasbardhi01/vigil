@@ -63,6 +63,24 @@ def test_a_retry_after_a_publish_refusal_republishes_the_head_with_no_session(
     assert f"vigil/{job}-w1" in [p["head"] for p in w.publisher.prs]
 
 
+def test_a_republish_on_the_dregs_of_the_cap_still_republishes(world: World) -> None:
+    """A republish starts no session, so #121's floor for one call doesn't stop it."""
+    from tests.jobs.test_out_of_cap import _drain
+
+    w = world
+    _refuse_w1_once(w)
+    job = _approve(w)
+    tid = f"{job}-w1"
+    item = _failure_item(w, job)
+    _drain(w, tid, 0.06)  # under the floor for one call
+    assert w.runner.out_of_cap(tid)
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_task(tid).state in ("pr_open", "reviewed")
+    assert _w1_calls(w, job) == 1  # no worker session started
+    assert [e for e in _events(w, "republish") if e["task_id"] == tid]
+
+
 def test_a_second_refusal_fails_the_task_with_the_new_error(world: World) -> None:
     w = world
     real = w.publisher.publish
