@@ -133,3 +133,5 @@ repos:
       - vigild/metering/**
       - configs/budgets.yaml
       - vigild/review/ladder.py
+      # the owner's rulings index (owner, 2026-10-29): a docs-tier PR can't create a ruling
+      - docs/owner-rulings.md

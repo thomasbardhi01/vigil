@@ -355,3 +355,38 @@ def test_an_in_review_job_is_refused_with_no_side_effect(world: World) -> None:
     assert (len(w.store.events(job_id=job)), w.store.get_task(task).contract) == before
     assert w.store.get_job(job).state is JobState.IN_REVIEW
     assert w.store.get_inbox_item(item["id"]).status == "open"
+
+
+def test_a_coord_fix_note_is_labelled_as_the_coords(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    heading = "Autonomy (what coord may do between the owner's windows)"
+    task = f"{job}-w1"
+    bare = w.client.post(
+        f"/api/inbox/{item['id']}/fix", headers=auth(w.tokens.coord),
+        json={"task_id": task, "findings": [0], "note": NOTE},
+    )  # fmt: skip
+    assert bare.status_code == 422 and "ruling" in bare.text  # a note needs a ruling
+    r = w.client.post(
+        f"/api/inbox/{item['id']}/fix", headers=auth(w.tokens.coord),
+        json={"task_id": task, "findings": [0], "note": NOTE, "ruling": f"under {heading}"},
+    )  # fmt: skip
+    assert r.status_code == 200, r.text
+    fix = _workers(w, "w1")[1]
+    assert f"coord's note (ruling: {heading})" in fix.packet and NOTE in fix.packet
+    assert "<<<UNTRUSTED coord-note" in fix.packet and "owner-note" not in fix.packet
+    assert "Their note" not in fix.packet
+    *_, ev = [
+        e for e in w.store.events(job_id=job) if e.type == "state" and e.data["to"] == "building"
+    ]
+    assert (ev.data["actor"], ev.data["channel"]) == ("coord", "mcp")
+
+
+def test_a_coord_fix_without_a_note_needs_no_ruling(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    r = w.client.post(
+        f"/api/inbox/{item['id']}/fix", headers=auth(w.tokens.coord),
+        json={"task_id": f"{job}-w1", "findings": [1]},
+    )  # fmt: skip
+    assert r.status_code == 200, r.text

@@ -19,18 +19,21 @@ from vigild.api.auth import (
     COOKIE,
     UI_SESSION_TTL,
     Scope,
+    actor_of,
     create_ui_session,
     end_ui_session,
     identify,
     require,
 )
 from vigild.db import Store
+from vigild.jobs import rulings
 from vigild.jobs.batch import MAX_JOBS, batch_view
 from vigild.jobs.fsm import KILL_CHANNELS, Actor
 from vigild.jobs.service import (
     BadNote,
     Conflict,
     DuplicateIssue,
+    Forbidden,
     JobRequest,
     KillFailed,
     NoteTooLarge,
@@ -55,6 +58,46 @@ ADMIN = Depends(require(Scope.ADMIN))
 def _svc(request: Request) -> Services:
     services: Services = request.app.state.services
     return services
+
+
+def _heading(request: Request, ruling: Any) -> str:
+    """The `docs/owner-rulings.md` heading a coord ruling names; 422 (listing them) if none."""
+    if not isinstance(ruling, str) or not ruling.strip():
+        raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
+    try:
+        source = _svc(request).rulings_source
+        return rulings.match(ruling, source() if source is not None else None)
+    except rulings.RulingError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+def _coord_note(request: Request, body: dict[str, Any], note: Any) -> Any:
+    """A note made with the coord token is labelled as the coord's, with the heading its
+    `ruling` names, whatever the body says; the owner's note is untouched."""
+    if actor_of(request)[0] != "coord" or not isinstance(note, str) or not note.strip():
+        return note
+    return rulings.label_note(note, _heading(request, body.get("ruling")))
+
+
+def _approver(
+    request: Request, body: dict[str, Any] | None
+) -> tuple[Actor, str | None, str | None]:
+    """Who approves, from the token (`actor_of`), never the body, and the ruling the coord
+    token must cite. A missing ruling is a 422: the token may approve, the request is
+    incomplete."""
+    if actor_of(request)[0] != "coord":
+        return Actor.OWNER, None, None
+    edits = (body or {}).get("edits")
+    if edits not in (None, ""):
+        # `edits` reach the worker's packet as the owner's notes, to be followed: not the coord's
+        raise HTTPException(403, "the coord token can't approve with `edits`; the owner does")
+    ruling = (body or {}).get("ruling")
+    return Actor.COORD, ruling, _heading(request, ruling)
+
+
+def _who(request: Request) -> Actor:
+    """The actor of a state change, from the token (never a body)."""
+    return Actor.COORD if actor_of(request)[0] == "coord" else Actor.OWNER
 
 
 def _plain(obj: Any) -> Any:
@@ -198,8 +241,10 @@ def kill_job(
     channel = (body or {}).get("channel", request.state.channel)
     if not isinstance(channel, str) or channel not in KILL_CHANNELS:
         raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
+    actor = _who(request)
+    channel = "mcp" if actor is Actor.COORD else channel
     try:
-        return _plain(_svc(request).jobs.kill(job_id, Actor.OWNER, channel))  # type: ignore[no-any-return]
+        return _plain(_svc(request).jobs.kill(job_id, actor, channel))  # type: ignore[no-any-return]
     except NotFound as e:
         raise HTTPException(404, "no such job") from e
     except Conflict as e:
@@ -244,12 +289,16 @@ def get_batch(request: Request, batch_id: str) -> dict[str, Any]:
 
 
 @router.post("/api/batch/{batch_id}/approve-all", dependencies=[ADMIN])
-def approve_batch(request: Request, batch_id: str) -> dict[str, Any]:
+def approve_batch(
+    request: Request, batch_id: str, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
     """Approve every open spec of the batch (owner only). Each is an ordinary per-job
     approval with its own events (channel `inbox`, evidence naming the batch). A job whose
-    spec is not ready is listed under `skipped` and left as it is."""
+    spec is not ready is listed under `skipped` and left as it is. With the coord token the
+    body must carry a `ruling`, and a spec on `ladder_pinned_paths` is skipped."""
+    actor, ruling, heading = _approver(request, body)
     try:
-        return _svc(request).jobs.approve_batch(batch_id)
+        return _svc(request).jobs.approve_batch(batch_id, actor, ruling, heading)
     except NotFound as e:
         raise HTTPException(404, "no such batch") from e
 
@@ -265,7 +314,10 @@ def kill_batch(
     if not isinstance(channel, str) or channel not in KILL_CHANNELS:
         raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
     try:
-        out = _svc(request).jobs.kill_batch(batch_id, Actor.OWNER, channel)
+        actor = _who(request)
+        out = _svc(request).jobs.kill_batch(
+            batch_id, actor, "mcp" if actor is Actor.COORD else channel
+        )
     except NotFound as e:
         raise HTTPException(404, "no such batch") from e
     return _plain(out)  # type: ignore[no-any-return]
@@ -287,10 +339,19 @@ def approve(
     request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
     edits = (body or {}).get("edits")
+    actor, ruling, heading = _approver(request, body)
     try:
-        job = _svc(request).jobs.approve(item_id, edits if isinstance(edits, str) else None)
+        job = _svc(request).jobs.approve(
+            item_id,
+            edits if isinstance(edits, str) else None,
+            actor=actor,
+            ruling=ruling,
+            ruling_heading=heading,
+        )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
+    except Forbidden as e:
+        raise HTTPException(403, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     return {"job_id": job.id, "state": job.state.value}
@@ -300,7 +361,7 @@ def approve(
 def resume(request: Request, item_id: int) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = jobs.resume(item_id)
+        job = jobs.resume(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -312,7 +373,7 @@ def resume(request: Request, item_id: int) -> dict[str, Any]:
 def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = {"retry": jobs.retry}[action](item_id)
+        job = {"retry": jobs.retry}[action](item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -337,9 +398,10 @@ def replan(
     note = (body or {}).get("note")
     if note is not None and not isinstance(note, str):
         raise HTTPException(422, "note must be text")
+    note = _coord_note(request, body or {}, note)
     jobs = _svc(request).jobs
     try:
-        job = jobs.replan(item_id, note)
+        job = jobs.replan(item_id, note, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except NoteTooLarge as e:
@@ -365,7 +427,13 @@ def fix(
     body = body or {}
     jobs = _svc(request).jobs
     try:
-        job = jobs.fix(item_id, body.get("task_id"), body.get("findings"), body.get("note"))
+        job = jobs.fix(
+            item_id,
+            body.get("task_id"),
+            body.get("findings"),
+            _coord_note(request, body, body.get("note")),
+            _who(request),
+        )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except NoteTooLarge as e:
@@ -388,7 +456,7 @@ def abandon(
     the jobs it holds (2a round 3)."""
     job_id = (payload or {}).get("job_id")
     try:
-        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None)
+        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -400,7 +468,7 @@ def abandon(
 def rebuild(request: Request, item_id: int) -> dict[str, Any]:
     """Build and validate a repo's failed dev image again."""
     try:
-        _svc(request).jobs.rebuild(item_id)
+        _svc(request).jobs.rebuild(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -412,9 +480,11 @@ def rebuild(request: Request, item_id: int) -> dict[str, Any]:
 def reset(request: Request, item_id: int) -> dict[str, Any]:
     """Reset a tripped circuit breaker; the jobs it paused resume."""
     try:
-        out = _svc(request).jobs.reset(item_id)
+        out = _svc(request).jobs.reset(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
+    except Forbidden as e:
+        raise HTTPException(403, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     # `queued`: the job's last run is still finishing; it picks up after (B4)
@@ -424,7 +494,7 @@ def reset(request: Request, item_id: int) -> dict[str, Any]:
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:
-        _svc(request).jobs.dismiss(item_id)
+        _svc(request).jobs.dismiss(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:

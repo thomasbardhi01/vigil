@@ -235,17 +235,24 @@ def doctor(
 
 
 def _api_client() -> httpx2.Client:
-    """A client for vigild's REST API with the admin token: `VIGIL_API_TOKEN` from the
-    environment, else from the env file vigild itself reads (`vigild.config`). The URL is
-    `VIGIL_API_URL`, else the configured loopback listener."""
+    """A client for vigild's REST API with the owner's token: `VIGIL_API_TOKEN` from the
+    environment, else from the env file vigild itself reads (`vigild.config`). With
+    `VIGIL_API_ROLE=coord` it uses `VIGIL_COORD_TOKEN` the same way, and never falls back to
+    the owner's token (#146). The URL is `VIGIL_API_URL`, else the configured loopback
+    listener."""
     import httpx2
 
     from vigild import config
 
     cfg = config.load()
-    token = config.env_override("VIGIL_API_TOKEN") or config.load_secrets().get("VIGIL_API_TOKEN")
+    role = config.env_override("VIGIL_API_ROLE") or "owner"
+    if role not in ("owner", "coord"):
+        typer.echo("VIGIL_API_ROLE must be owner or coord")
+        raise typer.Exit(1)
+    var = "VIGIL_COORD_TOKEN" if role == "coord" else "VIGIL_API_TOKEN"
+    token = config.env_override(var) or config.load_secrets().get(var)
     if not token:
-        typer.echo("no VIGIL_API_TOKEN (set it, or put it in the env file)")
+        typer.echo(f"no {var} (set it, or put it in the env file)")
         raise typer.Exit(1)
     base = config.env_override("VIGIL_API_URL") or (
         f"http://{cfg.vigild.api.host}:{cfg.vigild.api.port}"

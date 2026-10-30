@@ -6,6 +6,7 @@ import json
 import plistlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import pytest
@@ -315,3 +316,30 @@ def test_doctor_prints_each_remote_hosts_rule_lines() -> None:
     lines = _sandbox_host_lines(cfg, object(), fake)
     assert seen and len(lines) == 6
     assert render(lines).splitlines()[2].startswith("fail  sandbox host box-a: rule 3")
+
+
+def _token_lines(secrets: Secrets, cfg: Config) -> dict[str, Any]:
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    checks = run_checks(cfg, secrets, http=http, docker=None, repos=None, include_claude_mods=False)
+    return {c.name: c for c in checks if c.name.startswith("VIGIL_COORD_TOKEN")}
+
+
+def test_doctor_checks_that_both_api_tokens_exist_and_differ(cfg: Config) -> None:
+    owner, coord = "owner-fake-value-000", "coord-fake-value-111"
+    got = _token_lines(Secrets({"VIGIL_API_TOKEN": owner, "VIGIL_COORD_TOKEN": coord}), cfg)
+    assert [(c.ok, c.note) for c in got.values()] == [(True, "")]
+    text = render(list(got.values()))
+    assert text == "pass  VIGIL_COORD_TOKEN"
+    assert owner not in text and coord not in text
+
+
+def test_doctor_fails_when_the_coord_token_is_missing_or_the_owner_one(cfg: Config) -> None:
+    (c,) = _token_lines(Secrets({"VIGIL_API_TOKEN": "owner-fake-value-000"}), cfg).values()
+    assert (c.ok, c.note) == (False, "missing")
+    # the coord token must not be the owner token, or vigild reads it as the owner
+    same = Secrets(
+        {"VIGIL_API_TOKEN": "same-fake-value-000", "VIGIL_COORD_TOKEN": "same-fake-value-000"}
+    )
+    (c,) = _token_lines(same, cfg).values()
+    assert (c.ok, c.note) == (False, "same as VIGIL_API_TOKEN")
+    assert "same-fake-value-000" not in render([c])
