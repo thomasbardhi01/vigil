@@ -10,6 +10,7 @@ Every piece of work runs inside a job, and every job waits in
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -737,13 +738,24 @@ class JobService:
         contract: list[dict[str, Any]] | None = None
         if plan is not None and before is not None:
             contract = contract_diff(before.content, plan.content)
+        prev = self.store.get_artifact(job_id, "spec_previous.md")
+        # a full-context diff, so every change sits under its `##` heading
+        full = diff.content
+        if prev is not None:
+            full = "".join(
+                difflib.unified_diff(
+                    prev.content.splitlines(keepends=True),
+                    spec.content.splitlines(keepends=True),
+                    n=10**6,
+                )
+            )
         return {
             "amendment": {
                 "changelog": log.content,
                 "diff": diff.content,
                 "note_bytes": len(note.content.encode()),
                 "contract_diff": contract,
-                "unlisted": unlisted_changes(log.content, contract or [], diff.content),
+                "unlisted": unlisted_changes(log.content, contract or [], full),
             }
         }
 

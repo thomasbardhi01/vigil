@@ -144,7 +144,7 @@ def _names(changelog: str, word: str) -> bool:
 def unlisted_changes(changelog: str, contract: list[dict[str, Any]], spec_diff: str) -> list[str]:
     """The changes the changelog doesn't list. A contract change is listed when the
     changelog has its field name as a whole token; a spec change when it names the `##`
-    section the diff changes (a change before any heading seen in the diff is "spec")."""
+    section the diff changes (the diff needs full context: each change under its heading)."""
     out = [
         f"{c['task_id'] or 'plan'} {c['field']}: changed, not in the changelog"
         for c in contract
@@ -153,7 +153,10 @@ def unlisted_changes(changelog: str, contract: list[dict[str, Any]], spec_diff: 
     section = ""
     changed: list[str] = []
     for line in spec_diff.splitlines():
-        if line.startswith(("---", "+++", "@@")):
+        if line.startswith("@@"):
+            section = ""  # a hunk without a heading in view is not under the last one
+            continue
+        if line.startswith(("---", "+++")):
             continue
         text = line[1:]
         if text.startswith("## "):

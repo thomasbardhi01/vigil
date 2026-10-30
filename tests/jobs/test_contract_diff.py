@@ -120,3 +120,9 @@ def test_unlisted_names_a_spec_section_the_changelog_omits() -> None:
     assert got == "spec Goal: changed, not in the changelog"
     assert unlisted_changes("- Goal reworded", [], DIFF) == []
     assert unlisted_changes("", [], "") == []
+
+
+def test_unlisted_hunk_without_heading_is_not_charged_to_an_earlier_section() -> None:
+    diff = "--- a\n+++ b\n@@ -1,3 +1,3 @@\n ## Goal\n-a\n+b\n@@ -20,3 +20,3 @@\n x\n-y\n+z\n"
+    got = unlisted_changes("- Goal reworded", [], diff)
+    assert got == ["spec (no section): changed, not in the changelog"]
