@@ -212,6 +212,10 @@ WOULD_BE = [
     ("PUT", "/api/review/ladder/{shape}"),
     ("POST", "/api/jobs/{job_id}/merge"),
     ("POST", "/api/merge"),
+    ("POST", "/api/merge-pr"),
+    ("POST", "/api/automerge"),
+    ("PUT", "/api/budget-override"),
+    ("PATCH", "/api/caps_edit"),
 ]
 
 
@@ -270,3 +274,128 @@ def test_no_coord_token_set_means_nothing_matches(services: Services, tokens: To
     services.tokens = Tokens(admin=tokens.admin, read=None, heartbeat=None)
     with TestClient(create_app(services)) as c:
         assert c.get("/api/health", headers=auth(tokens.coord)).status_code == 401
+
+
+def test_an_innocent_word_is_not_refused(stub_app: FastAPI, tokens: Tokens) -> None:
+    stub_app.add_api_route(
+        "/api/escape", lambda: {"done": True}, methods=["POST"],
+        dependencies=[Depends(require(Scope.ADMIN))],
+    )  # fmt: skip
+    with TestClient(stub_app) as c:
+        assert c.post("/api/escape", headers=auth(tokens.coord), json={}).status_code == 200
+
+
+# --- the actor on every state change (fix round 1) ---------------------------------------
+
+
+def _page(store: Store, jid: str) -> int:
+    from vigild.jobs.fsm import Actor, transition
+
+    store._force_state(jid, JobState.BUILDING)
+    transition(store, jid, JobState.BLOCKED, Actor.VIGILD, evidence={"reason": "budget"})
+    return store.create_inbox_item(
+        "questions", "worker_failed", jid, "failed",
+        {"resumable": True, "actions": ["retry", "abandon", "resume"]},
+    ).id  # fmt: skip
+
+
+def _to(store: Store, jid: str, state: str) -> Any:
+    (ev,) = [e for e in store.events(job_id=jid) if e.type == "state" and e.data["to"] == state]
+    return ev
+
+
+@pytest.mark.parametrize("who", ["admin", "coord"])
+def test_abandon_records_the_actor_from_the_token(
+    client: TestClient, tokens: Tokens, store: Store, who: str
+) -> None:
+    jid = client.post("/api/jobs", json=_job(), headers=auth(tokens.admin)).json()["id"]
+    item = _page(store, jid)
+    r = client.post(f"/api/inbox/{item}/abandon", headers=auth(getattr(tokens, who)), json={})
+    assert r.status_code == 200, r.text
+    actor, channel = ("coord", "mcp") if who == "coord" else ("owner", "inbox")
+    ev = _to(store, jid, "abandoned")
+    assert (ev.data["actor"], ev.data["channel"]) == (actor, channel)
+    assert store.get_inbox_item(item).resolved_by == actor
+
+
+@pytest.mark.parametrize("who", ["admin", "coord"])
+def test_resume_records_the_actor_from_the_token(
+    client: TestClient, tokens: Tokens, store: Store, who: str
+) -> None:
+    jid = client.post("/api/jobs", json=_job(), headers=auth(tokens.admin)).json()["id"]
+    item = _page(store, jid)
+    r = client.post(f"/api/inbox/{item}/resume", headers=auth(getattr(tokens, who)), json={})
+    assert r.status_code == 200, r.text
+    actor, channel = ("coord", "mcp") if who == "coord" else ("owner", "inbox")
+    ev = _to(store, jid, "building")
+    assert (ev.data["actor"], ev.data["channel"]) == (actor, channel)
+    assert store.get_inbox_item(item).resolved_by == actor
+
+
+@pytest.mark.parametrize("who", ["admin", "coord"])
+def test_kill_records_the_actor_from_the_token(
+    client: TestClient, tokens: Tokens, store: Store, who: str
+) -> None:
+    jid = client.post("/api/jobs", json=_job(), headers=auth(tokens.admin)).json()["id"]
+    # the body can ask for the cli channel; the coord token's is always mcp
+    r = client.post(
+        f"/api/jobs/{jid}/kill", headers=auth(getattr(tokens, who)), json={"channel": "cli"}
+    )
+    assert r.status_code == 200, r.text
+    actor, channel = ("coord", "mcp") if who == "coord" else ("owner", "cli")
+    (done,) = [e for e in store.events(job_id=jid) if e.type == "job_killed"]
+    for ev in (_to(store, jid, "abandoned"), done):
+        assert (ev.data["actor"], ev.data["channel"]) == (actor, channel)
+
+
+# --- `edits` (fix round 1) -------------------------------------------------------------
+
+
+def test_refused_with_edits(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner,
+    pending: tuple[str, int],
+) -> None:  # fmt: skip
+    jid, item = pending
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord),
+        json={"ruling": RULING, "edits": "also touch vigild/budget.py"},
+    )  # fmt: skip
+    assert r.status_code == 403 and "edits" in r.text
+    assert store.get_job(jid).state is JobState.SPEC_PENDING and runner.approved == []
+    ids = client.post(
+        "/api/batch", json={"name": "b", "jobs": [_job(5)]}, headers=auth(tokens.admin)
+    ).json()
+    r = client.post(
+        f"/api/batch/{ids['batch_id']}/approve-all", headers=auth(tokens.coord),
+        json={"ruling": RULING, "edits": "x"},
+    )  # fmt: skip
+    assert r.status_code == 403
+
+
+def test_an_owner_approval_with_edits_still_works(
+    client: TestClient, tokens: Tokens, store: Store, pending: tuple[str, int]
+) -> None:
+    jid, item = pending
+    r = client.post(f"/api/inbox/{item}/approve", headers=auth(tokens.admin), json={"edits": "e"})
+    assert r.status_code == 200, r.text
+    (ap,) = store.q("SELECT * FROM approvals WHERE job_id=?", (jid,))
+    assert ap["edits"] == "e" and ap["actor"] == "owner"
+
+
+# --- token collisions at start (fix round 1) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "other", ["VIGIL_API_TOKEN", "VIGIL_METRICS_TOKEN", "VIGIL_HEARTBEAT_TOKEN"]
+)
+def test_start_refuses_a_coord_token_equal_to_another(tmp_path: Any, other: str) -> None:
+    from vigild.config import ConfigError
+    from vigild.server import build
+
+    env = tmp_path / "env"
+    env.write_text(f"{other}=shared-fake-value-000\nVIGIL_COORD_TOKEN=shared-fake-value-000\n")
+    env.chmod(0o600)
+    with pytest.raises(ConfigError) as e:
+        build(env_file=env, data_dir=tmp_path / "d")
+    assert other in str(e.value) and "VIGIL_COORD_TOKEN" in str(e.value)
+    assert "shared-fake-value-000" not in str(e.value)

@@ -91,6 +91,11 @@ class Conflict(ValueError):
     pass
 
 
+def _channel(actor: Actor) -> str:
+    """Where a state change came from: the inbox for the owner, `mcp` for the coord token."""
+    return "mcp" if actor is Actor.COORD else "inbox"
+
+
 class Forbidden(Exception):
     """The caller's token may not do this (the coord token on a pinned spec)."""
 
@@ -1005,7 +1010,7 @@ class JobService:
             raise Conflict(f"inbox item {item_id} is not an open question or page")
         return item
 
-    def resume(self, item_id: int) -> Job:
+    def resume(self, item_id: int, actor: Actor = Actor.OWNER) -> Job:
         """The owner resumes the job a page is about: a held job returns to the
         state it left, and the runner picks up its remaining work."""
         with self.store.tx():
@@ -1017,7 +1022,7 @@ class JobService:
                 assert job.blocked_from is not None
                 try:
                     job = transition(
-                        self.store, job.id, job.blocked_from, Actor.OWNER, channel="inbox",
+                        self.store, job.id, job.blocked_from, actor, channel=_channel(actor),
                         evidence={"inbox_item_id": item_id, "action": "resume"},
                     )  # fmt: skip
                 except TransitionError as e:
@@ -1027,11 +1032,11 @@ class JobService:
             self.store.add_event(
                 "resume", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            self.store.resolve_inbox_item(item_id, actor.value)
             # round 3, F7: one resume per hold; the job's other resumable pages close
             for other in self.store.list_inbox():
                 if other.job_id == job.id and other.body.get("resumable") and other.id != item_id:
-                    self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+                    self.store.resolve_inbox_item(other.id, actor.value)
         self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
 
@@ -1041,11 +1046,11 @@ class JobService:
             raise Conflict(f"inbox item {item_id} doesn't offer {action}")
         return item
 
-    def retry(self, item_id: int) -> Job:
+    def retry(self, item_id: int, actor: Actor = Actor.OWNER) -> Job:
         """Run the failed and remaining tasks again, each with what's left of
         its own cap (review round 2, N5)."""
         self._offered(item_id, "retry")
-        return self.resume(item_id)
+        return self.resume(item_id, actor)
 
     @staticmethod
     def _check_note(note: object) -> None:
@@ -1059,7 +1064,14 @@ class JobService:
         if size > NOTE_MAX_BYTES:
             raise NoteTooLarge(f"the note is over {NOTE_MAX_BYTES} bytes")
 
-    def fix(self, item_id: int, task_id: object, findings: object, note: object = None) -> Job:
+    def fix(
+        self,
+        item_id: int,
+        task_id: object,
+        findings: object,
+        note: object = None,
+        actor: Actor = Actor.OWNER,
+    ) -> Job:
         """ "Fix with findings" (owner, 2026-10-27): a reviewed PR goes back to its worker
         with findings the owner chose from its review and audit, and a note. It is the
         2a fix round: the same branch and PR, then the verifier, a re-review and a
@@ -1146,7 +1158,7 @@ class JobService:
                 }
             try:
                 job = transition(
-                    self.store, job.id, JobState.BUILDING, Actor.OWNER, channel="inbox",
+                    self.store, job.id, JobState.BUILDING, actor, channel=_channel(actor),
                     evidence={"inbox_item_id": item_id, "action": "fix",
                               "findings": {task_id: len(chosen)}},
                 )  # fmt: skip
@@ -1154,7 +1166,7 @@ class JobService:
                 raise Conflict(str(e)) from e
             self.store.add_event("fix_with_findings", data, Provenance.HUMAN, job_id=job.id,
                                  task_id=task_id)  # fmt: skip
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            self.store.resolve_inbox_item(item_id, actor.value)
         self.last_notice[job.id] = notice
         self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
@@ -1166,7 +1178,7 @@ class JobService:
         )
         return str(json.loads(rows[0]["data"])["head"]) if rows else None
 
-    def replan(self, item_id: int, note: str | None = None) -> Job:
+    def replan(self, item_id: int, note: str | None = None, actor: Actor = Actor.OWNER) -> Job:
         """Send a job back to the coord. A held job (a failed build) goes back with
         the failures in the packet; a job waiting on its spec item goes back only
         with a note (the spec item's "replan with note": never an approval, the job
@@ -1182,7 +1194,7 @@ class JobService:
             if peek.job_id is not None and self.runner.busy(peek.job_id):
                 raise Conflict(f"{peek.job_id} is being worked on; try again in a moment")
             if peek.queue == "specs":
-                job = self._replan_spec(peek, note)
+                job = self._replan_spec(peek, note, actor)
             else:
                 item = self._offered(item_id, "replan")
                 assert item.job_id is not None
@@ -1190,18 +1202,18 @@ class JobService:
                 if job.state is not JobState.SPEC_PENDING:  # a stranded draft already is
                     try:
                         job = transition(
-                            self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
-                            channel="inbox",
+                            self.store, item.job_id, JobState.SPEC_PENDING, actor,
+                            channel=_channel(actor),
                             evidence={"inbox_item_id": item_id, "action": "replan"},
                         )  # fmt: skip
                     except TransitionError as e:
                         raise Conflict(str(e)) from e
                 self._record_replan(job.id, item_id, note, item.body.get("tasks") or {})
-                self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+                self.store.resolve_inbox_item(item_id, actor.value)
         self.last_run[job.id] = self.runner.on_resume(job.id, replan=True)
         return job
 
-    def _replan_spec(self, item: InboxItem, note: str | None) -> Job:
+    def _replan_spec(self, item: InboxItem, note: str | None, actor: Actor = Actor.OWNER) -> Job:
         """The spec item's "replan with note": the job is already `spec_pending`, where
         the coord drafts, so no state changes; it is not the owner's approval."""
         if item.status != "open" or item.kind != "spec" or item.job_id is None:
@@ -1212,7 +1224,7 @@ class JobService:
         if job.state is not JobState.SPEC_PENDING:
             raise Conflict(f"{job.id} is {job.state.value}, not spec_pending")
         self._record_replan(job.id, item.id, note, {})
-        self.store.resolve_inbox_item(item.id, Actor.OWNER.value)
+        self.store.resolve_inbox_item(item.id, actor.value)
         return job
 
     def _record_replan(
@@ -1248,7 +1260,7 @@ class JobService:
         first = (note or "").strip().splitlines()
         decisions.add(self.store, job_id, "vigild", "replan", first[0] if first else "no note")
 
-    def abandon(self, item_id: int, job_id: str | None = None) -> Job:
+    def abandon(self, item_id: int, job_id: str | None = None, actor: Actor = Actor.OWNER) -> Job:
         """Give the job up: nothing more runs; open PRs stay for you to close.
         A breaker's page (one page however many jobs it holds) abandons the
         held job its caller names (2a round 3): any job a breaker holds can
@@ -1272,21 +1284,22 @@ class JobService:
                 raise Conflict(f"inbox item {item_id} names no job")
             try:
                 job = transition(
-                    self.store, target, JobState.ABANDONED, Actor.OWNER,
-                    channel="inbox", evidence={"inbox_item_id": item_id, "action": "abandon"},
+                    self.store, target, JobState.ABANDONED, actor,
+                    channel=_channel(actor),
+                    evidence={"inbox_item_id": item_id, "action": "abandon"},
                 )  # fmt: skip
             except TransitionError as e:
                 raise Conflict(str(e)) from e
             self.store.add_event(
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
-            self._close_out(job.id, breakers)
+            self._close_out(job.id, breakers, actor.value)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
 
-    def _close_out(self, job_id: str, breakers: Any) -> None:
+    def _close_out(self, job_id: str, breakers: Any, by: str = "owner") -> None:
         """What giving a job up leaves behind, closed: its tasks that have no open PR are
         abandoned, its own pages are resolved, and no breaker holds it."""
         for t in self.store.list_tasks(job_id):
@@ -1297,11 +1310,11 @@ class JobService:
             # and for the other jobs it holds (2a round 6)
             own = other.job_id == job_id and other.body.get("kind") != "breaker"
             if own and other.queue in ("questions", "specs"):
-                self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+                self.store.resolve_inbox_item(other.id, by)
         # a breaker that then holds nothing resolves its page but stays
         # open: only its own condition reopens dispatch (owner, 2026-10-23);
         # one that still holds a job keeps its page for it (2a round 7)
-        breakers.unhold(job_id, by=Actor.OWNER.value)
+        breakers.unhold(job_id, by=by)
 
     def kill(
         self, job_id: str, actor: Actor, channel: str, *, wait: float = 30.0
@@ -1362,7 +1375,7 @@ class JobService:
                 if now in TERMINAL:  # a second kill got there first
                     return already(now)
                 raise Conflict(str(e)) from e
-        effects = self._kill_effects(job_id, wait)
+        effects = self._kill_effects(job_id, wait, actor.value)
         self.store.add_event(
             "job_killed",
             {"actor": actor.value, "channel": channel, "from": was, **effects},
@@ -1375,7 +1388,7 @@ class JobService:
             **out, "state": JobState.ABANDONED.value, "killed": True, "message": message, **effects,
         }  # fmt: skip
 
-    def _kill_effects(self, job_id: str, wait: float) -> dict[str, Any]:
+    def _kill_effects(self, job_id: str, wait: float, by: str = "owner") -> dict[str, Any]:
         """The runner's stop, revoke, drain and settle, then the close-out. A step that
         raises is logged (redacted) and surfaces as `KillFailed` naming it; the job stays
         `abandoned` without a `job_killed` event, so the next kill runs both again."""
@@ -1392,7 +1405,7 @@ class JobService:
 
         try:
             with self.store.tx():
-                self._close_out(job_id, Breakers(self.store, self.cfg))
+                self._close_out(job_id, Breakers(self.store, self.cfg), by)
         except Exception as e:
             raise self._kill_failed(job_id, "close-out (tasks, pages, breaker holds)", e) from e
         return effects
@@ -1403,7 +1416,7 @@ class JobService:
         log.error("kill %s failed at %s: %s", job_id, step, what)
         return KillFailed(step, what[:500])
 
-    def reset(self, item_id: int) -> dict[str, list[str]]:
+    def reset(self, item_id: int, actor: Actor = Actor.OWNER) -> dict[str, list[str]]:
         """Reset a tripped circuit breaker (plan 2a, item 4): it closes, and
         the jobs it paused resume: `resumed`, or `queued` behind their own
         run that is still finishing (review B4)."""
@@ -1417,14 +1430,14 @@ class JobService:
                 "reset", {"inbox_item_id": item_id, "breaker": item.body.get("breaker")},
                 Provenance.HUMAN, job_id=item.job_id,
             )  # fmt: skip
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            self.store.resolve_inbox_item(item_id, actor.value)
         reset = getattr(self.runner, "on_breaker_reset", None)
         if reset is None:
             return {"resumed": [], "queued": []}
         out = reset(int(item.body["breaker"]), item_id)
         return out if isinstance(out, dict) else {"resumed": list(out), "queued": []}
 
-    def rebuild(self, item_id: int) -> None:
+    def rebuild(self, item_id: int, actor: Actor = Actor.OWNER) -> None:
         """Build and validate a repo's failed dev image again (round 2)."""
         with self.store.tx():
             item = self._question(item_id)
@@ -1435,10 +1448,10 @@ class JobService:
             self.store.add_event("rebuild", {"inbox_item_id": item_id, **{
                 k: item.body.get(k) for k in ("repo", "key", "base_sha")
             }}, Provenance.HUMAN)  # fmt: skip
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            self.store.resolve_inbox_item(item_id, actor.value)
         self.runner.on_rebuild(str(item.body["repo"]), str(item.body["base_sha"]))
 
-    def dismiss(self, item_id: int) -> None:
+    def dismiss(self, item_id: int, actor: Actor = Actor.OWNER) -> None:
         """Resolve a page with nothing to act on. A breaker's page that still
         holds jobs can't be dismissed: they would wait with no page (2a
         round 9); reset the breaker or abandon them."""
@@ -1453,4 +1466,4 @@ class JobService:
             self.store.add_event(
                 "dismiss", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=item.job_id
             )
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            self.store.resolve_inbox_item(item_id, actor.value)

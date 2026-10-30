@@ -20,7 +20,7 @@ import uvicorn
 from vigild import config
 from vigild.api.app import create_app
 from vigild.budget import Budget
-from vigild.config import Config, Secrets
+from vigild.config import Config, ConfigError, Secrets
 from vigild.db import Store
 from vigild.devimage import DevImages
 from vigild.gateway.app import create_gateway_app
@@ -105,6 +105,18 @@ class Vigild:
     services: Services
 
 
+def refuse_coord_collision(tokens: Tokens) -> None:
+    """The coord token must differ from every other token: `identify` would read a shared
+    value as the owner's (first match wins). Names only, never values (#146)."""
+    for name, other in (
+        ("VIGIL_API_TOKEN", tokens.admin),
+        ("VIGIL_METRICS_TOKEN", tokens.read),
+        ("VIGIL_HEARTBEAT_TOKEN", tokens.heartbeat),
+    ):
+        if tokens.coord and tokens.coord == other:
+            raise ConfigError(f"VIGIL_COORD_TOKEN is the same as {name}; they must differ")
+
+
 def build(
     *,
     config_dir: Path = config.CONFIG_DIR,
@@ -137,6 +149,7 @@ def build(
         heartbeat=secrets.get("VIGIL_HEARTBEAT_TOKEN"),
         coord=secrets.get("VIGIL_COORD_TOKEN"),
     )
+    refuse_coord_collision(tokens)
     jobs = JobService(cfg, store, runner or NullRunner())
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs, degraded=off)
     for f in sorted(off):

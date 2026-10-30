@@ -65,10 +65,19 @@ def _approver(request: Request, body: dict[str, Any] | None) -> tuple[Actor, str
     incomplete."""
     if actor_of(request)[0] != "coord":
         return Actor.OWNER, None
+    edits = (body or {}).get("edits")
+    if edits not in (None, ""):
+        # `edits` reach the worker's packet as the owner's notes, to be followed: not the coord's
+        raise HTTPException(403, "the coord token can't approve with `edits`; the owner does")
     ruling = (body or {}).get("ruling")
     if not isinstance(ruling, str) or not ruling.strip():
         raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
     return Actor.COORD, ruling
+
+
+def _who(request: Request) -> Actor:
+    """The actor of a state change, from the token (never a body)."""
+    return Actor.COORD if actor_of(request)[0] == "coord" else Actor.OWNER
 
 
 def _plain(obj: Any) -> Any:
@@ -212,8 +221,10 @@ def kill_job(
     channel = (body or {}).get("channel", request.state.channel)
     if not isinstance(channel, str) or channel not in KILL_CHANNELS:
         raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
+    actor = _who(request)
+    channel = "mcp" if actor is Actor.COORD else channel
     try:
-        return _plain(_svc(request).jobs.kill(job_id, Actor.OWNER, channel))  # type: ignore[no-any-return]
+        return _plain(_svc(request).jobs.kill(job_id, actor, channel))  # type: ignore[no-any-return]
     except NotFound as e:
         raise HTTPException(404, "no such job") from e
     except Conflict as e:
@@ -283,7 +294,10 @@ def kill_batch(
     if not isinstance(channel, str) or channel not in KILL_CHANNELS:
         raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
     try:
-        out = _svc(request).jobs.kill_batch(batch_id, Actor.OWNER, channel)
+        actor = _who(request)
+        out = _svc(request).jobs.kill_batch(
+            batch_id, actor, "mcp" if actor is Actor.COORD else channel
+        )
     except NotFound as e:
         raise HTTPException(404, "no such batch") from e
     return _plain(out)  # type: ignore[no-any-return]
@@ -323,7 +337,7 @@ def approve(
 def resume(request: Request, item_id: int) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = jobs.resume(item_id)
+        job = jobs.resume(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -335,7 +349,7 @@ def resume(request: Request, item_id: int) -> dict[str, Any]:
 def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = {"retry": jobs.retry}[action](item_id)
+        job = {"retry": jobs.retry}[action](item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -362,7 +376,7 @@ def replan(
         raise HTTPException(422, "note must be text")
     jobs = _svc(request).jobs
     try:
-        job = jobs.replan(item_id, note)
+        job = jobs.replan(item_id, note, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except NoteTooLarge as e:
@@ -388,7 +402,9 @@ def fix(
     body = body or {}
     jobs = _svc(request).jobs
     try:
-        job = jobs.fix(item_id, body.get("task_id"), body.get("findings"), body.get("note"))
+        job = jobs.fix(
+            item_id, body.get("task_id"), body.get("findings"), body.get("note"), _who(request)
+        )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except NoteTooLarge as e:
@@ -411,7 +427,7 @@ def abandon(
     the jobs it holds (2a round 3)."""
     job_id = (payload or {}).get("job_id")
     try:
-        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None)
+        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -423,7 +439,7 @@ def abandon(
 def rebuild(request: Request, item_id: int) -> dict[str, Any]:
     """Build and validate a repo's failed dev image again."""
     try:
-        _svc(request).jobs.rebuild(item_id)
+        _svc(request).jobs.rebuild(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -435,7 +451,7 @@ def rebuild(request: Request, item_id: int) -> dict[str, Any]:
 def reset(request: Request, item_id: int) -> dict[str, Any]:
     """Reset a tripped circuit breaker; the jobs it paused resume."""
     try:
-        out = _svc(request).jobs.reset(item_id)
+        out = _svc(request).jobs.reset(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -447,7 +463,7 @@ def reset(request: Request, item_id: int) -> dict[str, Any]:
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:
-        _svc(request).jobs.dismiss(item_id)
+        _svc(request).jobs.dismiss(item_id, _who(request))
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
