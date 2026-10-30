@@ -1810,7 +1810,9 @@ class JobRunner:
             session_dir=self._session_dir(coord.id),
             max_turns=40,
             max_minutes=COORD_MINUTES,
-            max_budget_usd=self.cfg.budgets.coord_session_usd,
+            max_budget_usd=self.sdk_budget(
+                coord.backend_preset or "", self.cfg.budgets.coord_session_usd
+            ),
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
@@ -2165,7 +2167,7 @@ class JobRunner:
                 repo=job.repo, preset=preset, model=self.cfg.preset(preset).model or "",
                 clone=clone, session_dir=self._session_dir(s.id), max_turns=40,
                 max_minutes=COORD_MINUTES,
-                max_budget_usd=amount,
+                max_budget_usd=self.sdk_budget(preset, amount),
                 mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
@@ -2617,6 +2619,13 @@ class JobRunner:
         )
         raw_len = int(row["n"] or 0) * CHARS_PER_TOKEN
         return worst_case_usd(prices, model, raw_len, MIN_OUTPUT_TOKENS)
+
+    def sdk_budget(self, preset: str, usd: float) -> float | None:
+        """The Agent SDK's `max_budget_usd` for a session on `preset`. A local
+        backend gets none: the CLI prices a model it doesn't know with a
+        fallback and would stop a session whose real spend is $0. Locality is
+        `configs/backends.yaml`'s answer alone; the gateway caps every call."""
+        return None if self.cfg.preset(preset).locality == "local" else usd
 
     def out_of_cap(self, task_id: str) -> str | None:
         """Why a worker session can't start for this task: what is left of its cap can't
@@ -3123,7 +3132,7 @@ class JobRunner:
             session_dir=self._session_dir(s.id),
             max_turns=max_turns,
             max_minutes=WORKER_MINUTES,
-            max_budget_usd=amount,  # what's left of the task's cap (N5)
+            max_budget_usd=self.sdk_budget(preset, amount),  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
@@ -4731,7 +4740,7 @@ class JobRunner:
             max_minutes=REVIEW_MINUTES,
             # the cap is checked call by call at the gateway, and a review may
             # go past it (owner, 2026-10-23): only the day stops the CLI
-            max_budget_usd=self.cfg.budgets.daily_usd,
+            max_budget_usd=self.sdk_budget(preset, self.cfg.budgets.daily_usd),
             mounts=self.workspace.overlays(clone),
             packet=packet,
             image=session_image,
@@ -5027,8 +5036,8 @@ class JobRunner:
                 session_id=s.id, role=Role.COORD, job_id=job.id, task_id=None, repo=job.repo,
                 preset=preset, model=self.cfg.preset(preset).model or "", clone=clone,
                 session_dir=self._session_dir(s.id), max_turns=40, max_minutes=COORD_MINUTES,
-                max_budget_usd=amount, mounts=self.workspace.overlays(clone),
-                packet=packet.text, image=session_image,
+                max_budget_usd=self.sdk_budget(preset, amount),
+                mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
             out = self._run_session(
