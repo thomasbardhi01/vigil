@@ -48,8 +48,24 @@ def make_app(runs: Any, status: int = 200) -> tuple[GitHubApp, list[httpx2.Reque
     return app, seen
 
 
-def run(name: str, status: str, conclusion: str | None, id_: int = 1) -> dict[str, Any]:
-    return {"id": id_, "name": name, "status": status, "conclusion": conclusion}
+def run(
+    name: str, status: str, conclusion: str | None, id_: int = 1, app: str = "github-actions"
+) -> dict[str, Any]:
+    return {
+        "id": id_, "name": name, "status": status, "conclusion": conclusion,
+        "app": {"slug": app},
+    }  # fmt: skip
+
+
+def test_only_github_actions_runs_count() -> None:
+    """#191 review: any app with checks:write could post a run named test; only GitHub
+    Actions' own run decides, so a third-party success can't make a real failure a flake."""
+    real_fail = run("test", "completed", "failure", 1)
+    forged = run("test", "completed", "success", 2, app="some-other-app")
+    app, _ = make_app([real_fail, forged])
+    assert app.ci_test_result(REPO, SHA) == "failure"
+    app, _ = make_app([forged])
+    assert app.ci_test_result(REPO, SHA) == "pending"
 
 
 @pytest.mark.parametrize(

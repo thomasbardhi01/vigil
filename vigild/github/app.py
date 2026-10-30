@@ -83,6 +83,9 @@ def _norm(repo: str) -> str:
     return repo.strip().lower()
 
 
+ACTIONS_APP = "github-actions"  # the only app whose CI check runs are trusted (#191)
+
+
 class GitHubApp:
     def __init__(
         self,
@@ -265,7 +268,13 @@ class GitHubApp:
                 )
             if r.status_code != 200:
                 return "unknown"  # 403/404: the App lacks checks:read here, or no such commit
-            runs = [c for c in r.json().get("check_runs", []) if c.get("name") == job]
+            # only GitHub Actions' own run counts: any app with checks:write could post a
+            # run named `job`, and a forged success must never turn a failure into a flake
+            runs = [
+                c
+                for c in r.json().get("check_runs", [])
+                if c.get("name") == job and (c.get("app") or {}).get("slug") == ACTIONS_APP
+            ]
         except GitHubError, TokenPolicyError, httpx2.HTTPError, ValueError, AttributeError:
             return "unknown"
         if not runs:
