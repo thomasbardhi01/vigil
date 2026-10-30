@@ -24,10 +24,10 @@ def _one_task_plan(job: str) -> str:
 
 def _run(w: World, issue: int | None, *, one_task: bool = False) -> list[dict[str, Any]]:
     if one_task:
-        spec = SPEC.split("- AC2")[0] + "\n## Files in scope\n" + SPEC.split("## Files in scope\n")[1]
-        spec = spec.replace("- `docs/runbook.md`\n", "").replace(
-            "- `tests/test_runbook.py`\n", ""
+        spec = (
+            SPEC.split("- AC2")[0] + "\n## Files in scope\n" + SPEC.split("## Files in scope\n")[1]
         )
+        spec = spec.replace("- `docs/runbook.md`\n", "").replace("- `tests/test_runbook.py`\n", "")
         w.standin.coord_drafts = [lambda j: (spec, _one_task_plan(j))]
     req: dict[str, Any] = {
         "repo": REPO, "title": "Document the rate limit", "request": "Undocumented.",
@@ -38,9 +38,7 @@ def _run(w: World, issue: int | None, *, one_task: bool = False) -> list[dict[st
     r = w.client.post("/api/jobs", headers=auth(w.tokens.admin), json=req)
     assert r.status_code == 202, r.text
     item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
-    r = w.client.post(
-        f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={}
-    )
+    r = w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
     assert r.status_code == 200, r.text
     return w.publisher.prs
 
