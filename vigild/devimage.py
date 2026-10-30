@@ -136,6 +136,15 @@ def image_prefix(data_path: Path, kind: str) -> str:
     return f"vigil-{kind}-{hashlib.sha256(str(resolved).encode()).hexdigest()[:8]}"
 
 
+def instance_id(data_path: Path) -> str:
+    """This vigild's identity: sha256 of its resolved data dir, 12 hex digits. Production
+    gets one too. Every container and network vigild creates carries it (`dev.vigil.
+    instance`), so a kill or a purge finds only this vigild's own, never another vigild's
+    with the same per-database job id (#162)."""
+    resolved = data_path.expanduser().resolve()
+    return hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+
+
 class DevImages:
     def __init__(
         self,

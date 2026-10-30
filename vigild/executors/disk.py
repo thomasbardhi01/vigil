@@ -78,10 +78,14 @@ def _stopped(c: Any) -> bool:
     return status == "created" and str(state.get("StartedAt") or "").startswith("0001-01-01")
 
 
-def _prunable(c: Any, may_prune: Callable[[str], bool]) -> bool:
+def _prunable(c: Any, may_prune: Callable[[str], bool], instance: str | None = None) -> bool:
     """A verifier or deps container is never pruned (it may sit between runs);
-    a session's only when `may_prune` says its job is final or unknown."""
+    a session's only when `may_prune` says its job is final or unknown. With `instance`
+    (this vigild's `dev.vigil.instance`) only its own containers: another vigild's
+    sessions are unknown to these records, which would read as prunable (#162)."""
     labels = _labels(c) or dict(getattr(c, "labels", None) or {})
+    if instance is not None and labels.get("dev.vigil.instance") != instance:
+        return False
     if labels.get("dev.vigil.role") in PROTECTED_ROLES:
         return False
     return may_prune(str(labels.get(CONTAINER_LABEL, "")))
@@ -118,13 +122,15 @@ def _in_use(client: Any) -> set[str]:
     return {str(c.attrs.get("Image")) for c in client.containers.list(all=True)}
 
 
-def reclaimable_bytes(client: Any, may_prune: Callable[[str], bool] | None = None) -> int:
+def reclaimable_bytes(
+    client: Any, may_prune: Callable[[str], bool] | None = None, instance: str | None = None
+) -> int:
     """What a prune could free: vigil's stopped containers, and its images no
     container uses once those are gone."""
     stopped = [
         c
         for c in _containers(client)
-        if _stopped(c) and _prunable(c, may_prune or (lambda sid: False))
+        if _stopped(c) and _prunable(c, may_prune or (lambda sid: False), instance)
     ]
     gone = {c.id for c in stopped}
     held = {str(c.attrs.get("Image")) for c in client.containers.list(all=True) if c.id not in gone}
@@ -138,7 +144,7 @@ class DiskBudgetExceeded(HostRefused):
 
 
 def enforce_budget(
-    client: Any, budget_bytes: int, *, may_prune: Callable[[str], bool]
+    client: Any, budget_bytes: int, *, may_prune: Callable[[str], bool], instance: str | None = None
 ) -> list[str]:
     """Remove vigil-labelled **stopped** containers, then vigil-labelled images
     no container uses, least recently used first, until usage is within the
@@ -150,7 +156,7 @@ def enforce_budget(
     if used <= budget_bytes:
         return removed
     for c in sorted(
-        (c for c in _containers(client) if _stopped(c) and _prunable(c, may_prune)),
+        (c for c in _containers(client) if _stopped(c) and _prunable(c, may_prune, instance)),
         key=_last_used,
     ):
         if used <= budget_bytes:

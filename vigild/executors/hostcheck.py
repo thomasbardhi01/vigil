@@ -451,6 +451,7 @@ class DockerProber:
         from vigild.executors.runtime import (
             LABEL,
             _hardening,
+            instance_labels,
             proxy_kwargs,
             require_image,
             tar_files,
@@ -467,7 +468,10 @@ class DockerProber:
             model="", clone=cfg.vigild.data_path, session_dir=cfg.vigild.data_path / sid,
             max_turns=0, max_minutes=1, max_budget_usd=0.0,
         )  # fmt: skip
-        net = c.networks.create(f"vigil-{sid}", driver="bridge", internal=True, labels={LABEL: sid})
+        net = c.networks.create(
+            f"vigil-{sid}", driver="bridge", internal=True,
+            labels={LABEL: sid, **instance_labels(cfg)},
+        )  # fmt: skip
         proxy = box = None
         try:
             pk = proxy_kwargs(cfg, spec, host)
@@ -501,7 +505,7 @@ class DockerProber:
                     "PROBE_SLICE": host.cgroup_slice,
                 },
                 cgroupns="host",  # to read the slice's limits; the mount is read-only
-                labels={LABEL: sid, "dev.vigil.role": "probe"},
+                labels={LABEL: sid, "dev.vigil.role": "probe", **instance_labels(cfg)},
                 **_hardening(cfg, host),
             )
             box.start()
