@@ -323,11 +323,12 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
             where = cwd
             if c.program == "pnpm":
                 pargs = list(c.args)
-                for flag in ("-C", "--dir"):
-                    if flag in pargs and pargs.index(flag) + 1 < len(pargs):
-                        where = "/".join(
-                            x for x in (cwd, pargs[pargs.index(flag) + 1].strip("/")) if x
-                        )
+                i = 0  # only pnpm's own options: stop at `exec`, `run` or a script name
+                while i < len(pargs) and pargs[i].startswith("-"):
+                    if pargs[i] in ("-C", "--dir") and i + 1 < len(pargs):
+                        where = "/".join(x for x in (cwd, pargs[i + 1].strip("/")) if x)
+                        i += 1
+                    i += 1
             vitest_dirs.append(where)
             report_dirs[f"vitest-{n}.xml"] = where
             end = c.start + len(c.text.rstrip())

@@ -1543,3 +1543,17 @@ def test_ac7_realistic_cases_are_matched_as_before() -> None:
     py = Case("tests.gateway.test_own_call_key::test_k", "tests.gateway.test_own_call_key", "pass")
     assert belongs(py, ["tests/gateway/test_own_call_key.py"])
     assert not belongs(py, ["tests/gateway/test_other.py"])
+
+
+@pytest.mark.parametrize(
+    ("cmd", "dirs"),
+    [
+        ("pnpm -C server exec vitest run --dir test", ("server",)),
+        ("pnpm exec vitest run --dir src", ("",)),
+        ("cd web && pnpm --dir server exec vitest run -C x", ("web/server",)),
+    ],
+)
+def test_vitest_own_dir_option_is_not_pnpms(cmd: str, dirs: tuple[str, ...]) -> None:
+    from vigild.verifier import plan_reports
+
+    assert plan_reports(cmd, None).vitest_dirs == dirs
