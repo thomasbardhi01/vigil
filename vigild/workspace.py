@@ -663,11 +663,15 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
 
-    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+    def push(self, repo: str, head: str, branch: str, token: str | None, lease: str | None) -> None:
+        """Push `head` to `branch` only if the remote tip is still `lease` (the SHA
+        publish checked; None means the branch must not exist yet). The caller has
+        already refused a non-fast-forward: a lease alone would let git make one."""
         if is_bench_repo(repo):
             raise WorkspaceError(f"{repo} is a bench repo: nothing is pushed")
         self._git(
-            self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
+            self.vault(repo), "push", "--quiet", "--no-verify",
+            f"--force-with-lease=refs/heads/{branch}:{lease or ''}", self.remote_url(repo),
             f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
 
