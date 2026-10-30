@@ -1029,7 +1029,7 @@ def test_a_hosted_sessions_hosted_call_is_unchanged(
 def test_a_request_cannot_override_the_sessions_locality(
     client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
 ) -> None:
-    sid, tok = _local_session(cfg, store, budget, gw)
+    _, tok = _local_session(cfg, store, budget, gw)
     r = client.post(
         "/v1/messages",
         json=_msg(locality="hosted", metadata={"locality": "hosted", "user_id": "x"}),
