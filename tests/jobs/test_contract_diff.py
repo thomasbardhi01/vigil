@@ -96,15 +96,22 @@ def test_contract_diff_the_verify_list_is_one_entry() -> None:
 
 
 def test_contract_diff_interface() -> None:
-    assert list(inspect.signature(contract_diff).parameters) == ["previous_plan", "amended_plan"]
-    (e,) = contract_diff(_plan(), _with(goal="g2"))
-    assert set(e) == {"task_id", "field", "previous", "amended"}
+    sig = inspect.signature(contract_diff, eval_str=True)
+    assert str(sig) == "(previous_plan: str, amended_plan: str) -> list[dict]"
+    got = contract_diff(_plan(), _with(goal="g2", test_cmd="x", out_of_scope=[]))
+    assert len(got) == 3
+    for e in got:
+        assert isinstance(e, dict) and set(e) == {"task_id", "field", "previous", "amended"}
+    for f, v in (("why", "z"), ("value", 5), ("risk", 3), ("size", "L")):
+        assert contract_diff(_plan(), _with(**{f: v})) == []
 
 
 def test_unlisted_interface() -> None:
-    sig = inspect.signature(unlisted_changes)
-    assert list(sig.parameters) == ["changelog", "contract", "spec_diff"]
+    sig = inspect.signature(unlisted_changes, eval_str=True)
+    assert str(sig) == "(changelog: str, contract: list[dict], spec_diff: str) -> list[str]"
     assert unlisted_changes("", [], "") == []
+    got = unlisted_changes("", contract_diff(_plan(), _with(goal="g2")), "")
+    assert isinstance(got, list) and got and all(isinstance(s, str) for s in got)
 
 
 def test_unlisted_a_field_is_listed_by_its_name_as_a_whole_token() -> None:

@@ -654,5 +654,9 @@ def test_replan_without_a_note_has_no_plan_previous(world: World) -> None:
 
 def test_coord_prompt_keeps_plan_fields_byte_identical() -> None:
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
-    assert "byte-identical" in text and "spec_changelog.md" in text
-    assert len(text.splitlines()) <= 40
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("4."))
+    end = next(i for i, ln in enumerate(lines) if ln.startswith("5."))
+    rule = "\n".join(lines[start:end])
+    assert "byte-identical" in rule and "spec_changelog.md" in rule
+    assert len(lines) <= 40

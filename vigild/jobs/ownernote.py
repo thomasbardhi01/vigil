@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import difflib
 import re
-from typing import Any
 
 from vigild.jobs.artifacts import MD_PROV, parse_plan
 
@@ -117,7 +116,7 @@ HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 SPEC_HEADING = re.compile(r"^##[ \t]+(.*?)[ \t]*$")
 
 
-def contract_diff(previous_plan: str, amended_plan: str) -> list[dict[str, Any]]:
+def contract_diff(previous_plan: str, amended_plan: str) -> list[dict]:  # type: ignore[type-arg]
     """Each worker-contract field that differs between two plan.md texts, as entries
     {task_id, field, previous, amended}. Tasks are matched by task_id only; a task in one
     plan only is one entry with field "task"; the plan-level `verify` list is one entry
@@ -125,7 +124,7 @@ def contract_diff(previous_plan: str, amended_plan: str) -> list[dict[str, Any]]
     old, new = parse_plan(previous_plan), parse_plan(amended_plan)
     before = {w.task_id: w for w in old.workers}
     after = {w.task_id: w for w in new.workers}
-    out: list[dict[str, Any]] = []
+    out: list[dict] = []  # type: ignore[type-arg]
     for tid, w in after.items():
         if tid not in before:
             out.append({"task_id": tid, "field": "task", "previous": None, "amended": tid})
@@ -168,7 +167,7 @@ def _changed_sections(diff_text: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def unlisted_changes(changelog: str, contract: list[dict[str, Any]], spec_diff: str) -> list[str]:
+def unlisted_changes(changelog: str, contract: list[dict], spec_diff: str) -> list[str]:  # type: ignore[type-arg]
     """The changes the coord's changelog doesn't name: a contract field whose name is
     not a whole token of it, a task added or removed whose id it doesn't name, and each
     spec section changed whose heading it doesn't name. `spec_diff` should be a
