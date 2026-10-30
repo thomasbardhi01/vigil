@@ -227,7 +227,7 @@ def _cli_world(world: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
     return images, suites, ws, base, data
 
 
-ROW_FIELDS = ("repo", "image", "ok", "output", "key", "stage", "base_sha")
+ROW_FIELDS = ("repo", "image", "image_id", "ok", "output", "key", "stage", "base_sha")
 
 
 def test_cli_build_leaves_one_record_like_on_rebuild_and_names_the_data_dir(
@@ -238,6 +238,7 @@ def test_cli_build_leaves_one_record_like_on_rebuild_and_names_the_data_dir(
     from vigild.jobs.runner import JobRunner
 
     images, _, ws, base, data = _cli_world(world, monkeypatch)
+    docker = world[1]
     out = CliRunner().invoke(app, ["dev-image", "--repo", "o/fixture"])
     assert out.exit_code == 0, out.output
     assert str(data) in out.output
@@ -245,6 +246,7 @@ def test_cli_build_leaves_one_record_like_on_rebuild_and_names_the_data_dir(
     assert len(rows) == 1
     cli_row = {k: rows[0][k] for k in ROW_FIELDS}
     images.store.x("DELETE FROM dev_images")
+    docker.builds.clear()  # the fake's image ids count builds; start the second from the same
     me = types.SimpleNamespace(
         session_images=None, dev_images=images, workspace=ws, background=False
     )
@@ -323,3 +325,27 @@ def test_cli_with_session_images_and_rebuild_builds_the_dev_image_once(
     assert out.exit_code == 0, out.output
     assert calls == ["session", "dev"]
     assert len(images.store.q("SELECT * FROM dev_images WHERE repo=?", ("o/fixture",))) == 1
+
+
+def test_a_session_step_failure_after_a_recorded_dev_image_names_the_stage_and_tag(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import types
+
+    import vigild.server as server
+
+    images, _, ws, base, _ = _cli_world(world, monkeypatch)
+    runner = server.build_runner(None, None)  # type: ignore[arg-type]
+
+    def session(repo: str, sha: str, **kw: Any) -> str:
+        images.ensure_fresh(repo, sha, **kw)  # the dev image is recorded
+        images.stage = "session-build"
+        raise RuntimeError("session build died")
+
+    runner.session_images = types.SimpleNamespace(ensure_fresh=session)
+    out = CliRunner().invoke(app, ["dev-image", "--repo", "o/fixture"])
+    (row,) = images.store.q("SELECT * FROM dev_images WHERE repo=?", ("o/fixture",))
+    assert out.exit_code == 1
+    assert "session-build" in out.output and "session build died" in out.output
+    assert row["image"] in out.output
+    assert "no record was written" not in out.output

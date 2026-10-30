@@ -417,10 +417,14 @@ def dev_image(
     except Exception as e:
         # cut short: no record, so vigild would still say "not built"
         stage = getattr(images, "stage", "") or "start"
-        typer.echo(
-            f"fail  {repo}  stopped at {stage}: {type(e).__name__}: {str(e)[:300]}; "
-            f"no record was written to {data}"
+        recorded = (
+            images.newest_validated(repo, ("validate",)) if stage.startswith("session") else None
         )
+        if recorded is not None:
+            note = f"the dev image {recorded['image']} has its record in {data}"
+        else:
+            note = f"no record was written to {data}"
+        typer.echo(f"fail  {repo}  stopped at {stage}: {type(e).__name__}: {str(e)[:300]}; {note}")
         raise typer.Exit(1) from e
     finally:
         runner.close()  # the docker client, or its pool's __del__ writes to a closed stderr
