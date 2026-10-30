@@ -3523,7 +3523,7 @@ class JobRunner:
         inputs rebuilt from vigild's records."""
         if self._owner_event(task_id) is not None:
             try:
-                return self._owner_inputs(self.store.get_task(task_id).job_id, task_id)
+                return self._owner_inputs(str(self.store.get_task(task_id).job_id), task_id)
             except RepublishRefused:
                 log.warning("owner republish of %s no longer holds", task_id)
         rows = self.store.q(
