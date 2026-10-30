@@ -291,3 +291,47 @@ async def test_a_batch_over_stdio_is_submitted_seen_and_approved(
         assert tokens.admin not in json.dumps(ap.model_dump(mode="json"))
     routes = {e.data["route"] for e in store.events() if e.type == "mcp_call"}
     assert {"/api/batch", "/api/batch/{batch_id}", "/api/batch/{batch_id}/approve-all"} <= routes
+
+
+# --- which token the server uses (#146) -----------------------------------------------
+
+
+def test_serve_uses_the_api_token_unless_the_role_is_coord() -> None:
+    from vigil.mcp_server import token_from_env
+
+    env = {"VIGIL_API_TOKEN": "owner-fake-000", "VIGIL_COORD_TOKEN": "coord-fake-111"}
+    assert token_from_env(env) == "owner-fake-000"  # the default, so nothing breaks
+    assert token_from_env({**env, "VIGIL_API_ROLE": "owner"}) == "owner-fake-000"
+    assert token_from_env({**env, "VIGIL_API_ROLE": "coord"}) == "coord-fake-111"
+
+
+def test_serve_names_the_variable_it_lacks_without_printing_a_value() -> None:
+    from vigil.mcp_server import token_from_env
+
+    with pytest.raises(SystemExit, match="VIGIL_COORD_TOKEN is not set"):
+        token_from_env({"VIGIL_API_TOKEN": "owner-fake-000", "VIGIL_API_ROLE": "coord"})
+    with pytest.raises(SystemExit, match="VIGIL_API_TOKEN is not set"):
+        token_from_env({"VIGIL_COORD_TOKEN": "coord-fake-111"})
+    with pytest.raises(SystemExit, match="VIGIL_API_ROLE"):
+        token_from_env({"VIGIL_API_TOKEN": "owner-fake-000", "VIGIL_API_ROLE": "root"})
+
+
+@pytest.mark.parametrize(
+    ("args", "body"),
+    [
+        ({"item_id": 4, "action": "approve", "ruling": "R"}, {"ruling": "R"}),
+        ({"item_id": 4, "action": "approve", "edits": "e", "ruling": "R"},
+         {"edits": "e", "ruling": "R"}),
+    ],
+)  # fmt: skip
+async def test_inbox_act_approve_carries_the_ruling(args: dict[str, Any], body: Any) -> None:
+    seen = Seen()
+    assert not (await _call(seen, "inbox_act", args)).is_error
+    assert json.loads(seen.requests[0].content) == body
+
+
+async def test_approve_all_carries_the_ruling() -> None:
+    seen = Seen()
+    r = await _call(seen, "approve_all", {"batch_id": "b-0001", "ruling": "R"})
+    assert not r.is_error
+    assert json.loads(seen.requests[0].content) == {"ruling": "R"}

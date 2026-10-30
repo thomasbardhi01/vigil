@@ -135,6 +135,7 @@ def build(
         admin=secrets.get("VIGIL_API_TOKEN"),
         read=secrets.get("VIGIL_METRICS_TOKEN"),
         heartbeat=secrets.get("VIGIL_HEARTBEAT_TOKEN"),
+        coord=secrets.get("VIGIL_COORD_TOKEN"),
     )
     jobs = JobService(cfg, store, runner or NullRunner())
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs, degraded=off)

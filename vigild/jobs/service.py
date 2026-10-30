@@ -29,7 +29,7 @@ from vigild.devimage import missing_tools
 from vigild.gateway.firstcall import refusals as first_call_refusals
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import public_view
-from vigild.intake.paths import matches_any
+from vigild.intake.paths import globs_overlap, in_scope, matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task
 from vigild.jobs import decisions
@@ -89,6 +89,10 @@ class NotFound(KeyError):
 
 class Conflict(ValueError):
     pass
+
+
+class Forbidden(Exception):
+    """The caller's token may not do this (the coord token on a pinned spec)."""
 
 
 class KillFailed(RuntimeError):
@@ -491,7 +495,9 @@ class JobService:
             self.runner.on_job_created(job_id, True)
         return batch_id, ids
 
-    def approve_batch(self, batch_id: str) -> dict[str, Any]:
+    def approve_batch(
+        self, batch_id: str, actor: Actor = Actor.OWNER, ruling: str | None = None
+    ) -> dict[str, Any]:
         """Approve all of a batch's open specs (owner, 2026-10-28). Each is the ordinary
         approval of that job's spec item (its own transaction, `approval` and state events,
         channel `inbox`), with the batch named in the evidence. A job whose spec is not open
@@ -515,8 +521,8 @@ class JobService:
                 skipped.append({"job_id": job_id, "state": state, "reason": "no open spec"})
                 continue
             try:
-                job = self.approve(item_id, batch_id=batch_id)
-            except Conflict as e:
+                job = self.approve(item_id, batch_id=batch_id, actor=actor, ruling=ruling)
+            except (Conflict, Forbidden) as e:
                 state = self.store.get_job(job_id).state.value
                 skipped.append({"job_id": job_id, "state": state, "reason": str(e)})
                 continue
@@ -902,9 +908,43 @@ class JobService:
         )
         return item
 
+    def pinned_scope(self, job_id: str) -> str | None:
+        """`path ~ glob` for the first file of the job's plan that meets its repo's
+        `ladder_pinned_paths` (strict `in_scope`; a wildcard counts if it can name a pinned
+        file), else None. A plan whose scope can't be read is reported as `unreadable plan`:
+        the coord token fails closed."""
+        plan = self.store.get_artifact(job_id, "plan.md")
+        blocks = re.findall(r"```json\s*\n(.*?)```", plan.content if plan else "", flags=re.S)
+        block = next((b for b in blocks if '"workers"' in b), None)
+        try:
+            workers = json.loads(block or "")["workers"]
+            files = [str(f) for w in workers for f in w["files_in_scope"]]
+        except ValueError, KeyError, TypeError:
+            return "unreadable plan"
+        pol = self.cfg.repos.repos.get(self.store.get_job(job_id).repo)
+        for f in files:
+            for g in pol.ladder_pinned_paths if pol else []:
+                if in_scope(f, [g]) or globs_overlap(f, g):
+                    return f"{f} ~ {g}"
+        return None
+
     def approve(
-        self, item_id: int, edits: str | None = None, *, batch_id: str | None = None
+        self,
+        item_id: int,
+        edits: str | None = None,
+        *,
+        batch_id: str | None = None,
+        actor: Actor = Actor.OWNER,
+        ruling: str | None = None,
     ) -> Job:
+        """The owner's approval from the inbox. With `actor=COORD` (the coord token, #146)
+        it is recorded as coord over `mcp`, must cite a `ruling`, and is refused (`Forbidden`)
+        for a spec whose scope hits the repo's `ladder_pinned_paths`."""
+        coord = actor is Actor.COORD
+        channel = "mcp" if coord else "inbox"
+        cited = str(redact(ruling.strip())) if coord and ruling and ruling.strip() else None
+        if coord and cited is None:
+            raise BadNote("the coord token must cite a ruling")
         # One transaction: state, approval row, artifact, event and the inbox
         # item commit together or not at all; the build starts after the commit.
         with self.store.tx():
@@ -914,33 +954,45 @@ class JobService:
                 raise NotFound(item_id) from e
             if item.queue != "specs" or item.status != "open" or item.job_id is None:
                 raise Conflict(f"inbox item {item_id} is not an open spec to approve")
+            if coord and (hit := self.pinned_scope(item.job_id)):
+                raise Forbidden(
+                    f"the coord token can't approve a spec on ladder_pinned_paths ({hit}); "
+                    "the owner approves it"
+                )
+            extra: dict[str, Any] = {"ruling": cited} if cited else {}
             try:
                 job = transition(
                     self.store,
                     item.job_id,
                     JobState.APPROVED,
-                    Actor.OWNER,
-                    channel="inbox",
+                    actor,
+                    channel=channel,
                     evidence={"inbox_item_id": item_id}
-                    | ({"batch_id": batch_id} if batch_id else {}),
+                    | ({"batch_id": batch_id} if batch_id else {})
+                    | extra,
                 )
             except TransitionError as e:
                 raise Conflict(str(e)) from e
-            self.store.add_approval(job.id, item_id, Actor.OWNER.value, "inbox", edits)
+            self.store.add_approval(job.id, item_id, actor.value, channel, edits)
             self.store.add_artifact(
                 job.id,
                 "approval.json",
-                json.dumps({"inbox_item_id": item_id, "actor": "owner", "edits": edits}),
+                json.dumps(
+                    {"inbox_item_id": item_id, "actor": actor.value, "edits": edits} | extra
+                ),
                 Provenance.HUMAN,
             )
             self.store.add_event(
                 "approval",
                 {"inbox_item_id": item_id, "edits": edits}
-                | ({"batch_id": batch_id} if batch_id else {}),
+                | ({"batch_id": batch_id} if batch_id else {})
+                | extra,
                 Provenance.HUMAN,
                 job_id=job.id,
             )
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+            if cited:
+                decisions.add(self.store, job.id, "vigild", "coord_approval", cited)
+            self.store.resolve_inbox_item(item_id, actor.value)
         self.runner.on_approved(job.id)
         return job
 

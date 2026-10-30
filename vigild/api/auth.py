@@ -3,6 +3,12 @@
 admin can do everything; read can GET; heartbeat can only post heartbeats
 (phase 3). A scope whose token is unset matches nothing.
 
+coord (issue #146) is the coord's own token: what admin can do, except that vigild
+derives the actor from the token (`actor_of`, never from a body), an approval must cite a
+ruling, and a route that edits a budget or cap, moves a rung or merges is refused outright
+(`COORD_REFUSED`), as is approving a spec that touches `ladder_pinned_paths` (the approve
+routes check it). The web UI's login takes the admin or read token only.
+
 The web UI never stores a token (P7: no). `POST /api/login` takes the admin
 or read token once and sets `vigil_session`: a random id (stored hashed),
 HttpOnly, SameSite=Strict, Path=/, 12 hours, Secure when the UI is served over
@@ -28,18 +34,24 @@ COOKIE = "vigil_session"
 UI_SESSION_TTL = timedelta(hours=12)
 UI_HEADER = "x-vigil-ui"
 SAFE = {"GET", "HEAD", "OPTIONS"}
+# A write whose route has one of these path words is the owner's alone. No route edits a
+# cap or a rung or merges today (policy is configs/*.yaml by PR; merging is on GitHub); a
+# route added later at such a place is refused for the coord token before its handler runs.
+COORD_REFUSED = frozenset({"budget", "budgets", "cap", "caps", "rung", "rungs", "ladder", "merge"})
 
 
 class Scope(StrEnum):
     ADMIN = "admin"
     READ = "read"
     HEARTBEAT = "heartbeat"
+    COORD = "coord"
 
 
 GRANTS: dict[Scope, set[Scope]] = {
     Scope.ADMIN: {Scope.ADMIN, Scope.READ, Scope.HEARTBEAT},
     Scope.READ: {Scope.READ},
     Scope.HEARTBEAT: {Scope.HEARTBEAT},
+    Scope.COORD: {Scope.ADMIN, Scope.READ, Scope.HEARTBEAT, Scope.COORD},
 }
 
 
@@ -54,6 +66,7 @@ def identify(tokens: Tokens, header: str | None) -> Scope | None:
         (Scope.ADMIN, tokens.admin),
         (Scope.READ, tokens.read),
         (Scope.HEARTBEAT, tokens.heartbeat),
+        (Scope.COORD, tokens.coord),
     ):
         if token and hmac.compare_digest(presented, token.encode()) and found is None:
             found = scope
@@ -106,7 +119,21 @@ def require(needed: Scope) -> Callable[[Request], Scope]:
             raise HTTPException(401, "missing or invalid bearer token")
         if needed not in GRANTS[scope]:
             raise HTTPException(403, f"the {scope.value} token can't do this")
+        if scope is Scope.COORD and request.method not in SAFE:
+            route = request.scope.get("route")
+            path = str(getattr(route, "path", None) or request.url.path)
+            if COORD_REFUSED & set(path.lower().strip("/").split("/")):
+                raise HTTPException(403, "the coord token can't do this; it is the owner's")
+        request.state.scope = scope
         request.state.authed = True  # the channel middleware logs only authenticated calls
         return scope
 
     return dep
+
+
+def actor_of(request: Request) -> tuple[str, str]:
+    """(actor, channel) for a state change, from the token that authenticated the call. The
+    coord token is `coord` over `mcp`; every other is the owner, from the inbox."""
+    if getattr(request.state, "scope", None) is Scope.COORD:
+        return "coord", "mcp"
+    return "owner", "inbox"

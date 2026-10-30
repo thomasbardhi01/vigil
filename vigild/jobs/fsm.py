@@ -49,9 +49,11 @@ Guard = Callable[[Ctx], list[str]]
 
 def _approval(c: Ctx) -> list[str]:
     errs: list[str] = []
-    if c.actor is not Actor.OWNER:
+    # the coord token (#146) approves over mcp, citing a ruling; everyone else is the owner
+    coord = c.actor is Actor.COORD and c.channel == "mcp" and bool(c.evidence.get("ruling"))
+    if c.actor is not Actor.OWNER and not coord:
         errs.append("only the owner approves a spec")
-    if c.channel != "inbox":
+    if c.channel != "inbox" and not coord:
         errs.append("approval happens only from the inbox")
     for name in ("spec.md", "plan.md"):
         if c.store.get_artifact(c.job.id, name) is None:

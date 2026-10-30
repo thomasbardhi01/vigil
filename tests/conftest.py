@@ -65,7 +65,10 @@ class RecordingRunner:
 @pytest.fixture
 def tokens() -> Tokens:
     return Tokens(
-        admin=secrets.token_hex(16), read=secrets.token_hex(16), heartbeat=secrets.token_hex(16)
+        admin=secrets.token_hex(16),
+        read=secrets.token_hex(16),
+        heartbeat=secrets.token_hex(16),
+        coord=secrets.token_hex(16),
     )
 
 

@@ -13,12 +13,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class Tokens:
-    """Decision `api-auth`'s three bearer scopes. None means the scope is off; nothing
-    matches it."""
+    """Decision `api-auth`'s bearer scopes, plus the coord's own token (#146). None means
+    the scope is off; nothing matches it."""
 
     admin: str | None
     read: str | None
     heartbeat: str | None
+    coord: str | None = None
 
 
 @dataclass

@@ -19,6 +19,7 @@ from vigild.api.auth import (
     COOKIE,
     UI_SESSION_TTL,
     Scope,
+    actor_of,
     create_ui_session,
     end_ui_session,
     identify,
@@ -31,6 +32,7 @@ from vigild.jobs.service import (
     BadNote,
     Conflict,
     DuplicateIssue,
+    Forbidden,
     JobRequest,
     KillFailed,
     NoteTooLarge,
@@ -55,6 +57,18 @@ ADMIN = Depends(require(Scope.ADMIN))
 def _svc(request: Request) -> Services:
     services: Services = request.app.state.services
     return services
+
+
+def _approver(request: Request, body: dict[str, Any] | None) -> tuple[Actor, str | None]:
+    """Who approves, from the token (`actor_of`), never the body, and the ruling the coord
+    token must cite. A missing ruling is a 422: the token may approve, the request is
+    incomplete."""
+    if actor_of(request)[0] != "coord":
+        return Actor.OWNER, None
+    ruling = (body or {}).get("ruling")
+    if not isinstance(ruling, str) or not ruling.strip():
+        raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
+    return Actor.COORD, ruling
 
 
 def _plain(obj: Any) -> Any:
@@ -244,12 +258,16 @@ def get_batch(request: Request, batch_id: str) -> dict[str, Any]:
 
 
 @router.post("/api/batch/{batch_id}/approve-all", dependencies=[ADMIN])
-def approve_batch(request: Request, batch_id: str) -> dict[str, Any]:
+def approve_batch(
+    request: Request, batch_id: str, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
     """Approve every open spec of the batch (owner only). Each is an ordinary per-job
     approval with its own events (channel `inbox`, evidence naming the batch). A job whose
-    spec is not ready is listed under `skipped` and left as it is."""
+    spec is not ready is listed under `skipped` and left as it is. With the coord token the
+    body must carry a `ruling`, and a spec on `ladder_pinned_paths` is skipped."""
+    actor, ruling = _approver(request, body)
     try:
-        return _svc(request).jobs.approve_batch(batch_id)
+        return _svc(request).jobs.approve_batch(batch_id, actor, ruling)
     except NotFound as e:
         raise HTTPException(404, "no such batch") from e
 
@@ -287,10 +305,15 @@ def approve(
     request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
     edits = (body or {}).get("edits")
+    actor, ruling = _approver(request, body)
     try:
-        job = _svc(request).jobs.approve(item_id, edits if isinstance(edits, str) else None)
+        job = _svc(request).jobs.approve(
+            item_id, edits if isinstance(edits, str) else None, actor=actor, ruling=ruling
+        )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
+    except Forbidden as e:
+        raise HTTPException(403, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     return {"job_id": job.id, "state": job.state.value}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -114,13 +115,17 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         note: str | None = None,
         edits: str | None = None,
         job_id: str | None = None,
+        ruling: str | None = None,
     ) -> dict[str, Any]:
-        """Act on an inbox item: approve (optional `edits`), replan (`note` required), retry,
+        """Act on an inbox item: approve (optional `edits`; `ruling` is required with the
+        coord token, naming the owner ruling that allows it), replan (`note` required), retry,
         abandon (optional `job_id` on a breaker's page) or reset."""
         path = f"/api/inbox/{item_path(item_id)}/{action}"
         body: dict[str, Any] | None = None
-        if action == "approve" and edits is not None:
-            body = {"edits": edits}
+        if action == "approve" and (edits is not None or ruling is not None):
+            body = ({"edits": edits} if edits is not None else {}) | (
+                {"ruling": ruling} if ruling is not None else {}
+            )
         elif action == "replan":
             if not note:
                 raise ToolError("replan needs a note")
@@ -147,18 +152,32 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         return clean(call("GET", f"/api/batch/{batch_path(batch_id)}"))  # type: ignore[no-any-return]
 
     @mcp.tool()
-    def approve_all(batch_id: str) -> dict[str, Any]:
-        """Approve every open spec of a batch (POST /api/batch/{id}/approve-all)."""
-        return clean(call("POST", f"/api/batch/{batch_path(batch_id)}/approve-all"))  # type: ignore[no-any-return]
+    def approve_all(batch_id: str, ruling: str | None = None) -> dict[str, Any]:
+        """Approve every open spec of a batch (POST /api/batch/{id}/approve-all). The coord
+        token must cite a `ruling`; it skips specs on ladder_pinned_paths."""
+        body = {"ruling": ruling} if ruling is not None else None
+        return clean(call("POST", f"/api/batch/{batch_path(batch_id)}/approve-all", body))  # type: ignore[no-any-return]
 
     return mcp
 
 
-def serve() -> None:
-    """Run on stdio. Environment only: `VIGIL_API_TOKEN`, `VIGIL_API_URL`."""
-    token = os.environ.get("VIGIL_API_TOKEN")
+def token_from_env(environ: Mapping[str, str]) -> str:
+    """The bearer token: `VIGIL_API_TOKEN`, or `VIGIL_COORD_TOKEN` when
+    `VIGIL_API_ROLE=coord` (#146); never a fallback from one to the other."""
+    role = environ.get("VIGIL_API_ROLE") or "owner"
+    if role not in ("owner", "coord"):
+        raise SystemExit("vigil mcp: VIGIL_API_ROLE must be owner or coord")
+    var = "VIGIL_COORD_TOKEN" if role == "coord" else "VIGIL_API_TOKEN"
+    token = environ.get(var)
     if not token:
-        raise SystemExit("vigil mcp: VIGIL_API_TOKEN is not set in this process's environment")
+        raise SystemExit(f"vigil mcp: {var} is not set in this process's environment")
+    return token
+
+
+def serve() -> None:
+    """Run on stdio. Environment only: `VIGIL_API_TOKEN` (or `VIGIL_COORD_TOKEN` with
+    `VIGIL_API_ROLE=coord`), `VIGIL_API_URL`."""
+    token = token_from_env(os.environ)
     client = httpx2.Client(
         base_url=os.environ.get("VIGIL_API_URL") or DEFAULT_URL,
         headers={"Authorization": f"Bearer {token}"},

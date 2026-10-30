@@ -201,3 +201,48 @@ def test_batch_status_refuses_an_id_that_is_not_a_batch_id_before_any_call(
         out = CliRunner().invoke(app, ["batch", "status", bad])
         assert out.exit_code == 1, bad
     assert seen == []
+
+
+def _client_token(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], file: dict[str, str]
+) -> str | None:
+    """The bearer token `_api_client` would send, with `env` as the environment and `file`
+    as the env file's contents (fake values)."""
+    import vigil.main as cli
+
+    from vigild import config
+
+    for name in ("VIGIL_API_TOKEN", "VIGIL_COORD_TOKEN", "VIGIL_API_ROLE"):
+        monkeypatch.delenv(name, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(config, "load_secrets", lambda: config.Secrets(file))
+    auth_header = cli._api_client().headers["Authorization"]
+    return str(auth_header).removeprefix("Bearer ")
+
+
+def test_api_client_uses_the_api_token_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    both = {"VIGIL_API_TOKEN": "owner-fake-000", "VIGIL_COORD_TOKEN": "coord-fake-111"}
+    assert _client_token(monkeypatch, {}, both) == "owner-fake-000"
+    assert _client_token(monkeypatch, {"VIGIL_API_ROLE": "owner"}, both) == "owner-fake-000"
+
+
+def test_api_client_uses_the_coord_token_for_the_coord_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    both = {"VIGIL_API_TOKEN": "owner-fake-000", "VIGIL_COORD_TOKEN": "coord-fake-111"}
+    assert _client_token(monkeypatch, {"VIGIL_API_ROLE": "coord"}, both) == "coord-fake-111"
+    # from the environment first, as VIGIL_API_TOKEN is
+    env = {"VIGIL_API_ROLE": "coord", "VIGIL_COORD_TOKEN": "coord-env-222"}
+    assert _client_token(monkeypatch, env, both) == "coord-env-222"
+
+
+def test_api_client_with_the_coord_role_never_falls_back_to_the_owner_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer
+
+    with pytest.raises(typer.Exit):
+        _client_token(
+            monkeypatch, {"VIGIL_API_ROLE": "coord"}, {"VIGIL_API_TOKEN": "owner-fake-000"}
+        )
