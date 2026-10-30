@@ -317,6 +317,17 @@ def test_published_diff_keeps_lookalikes(ws: Workspace, tmp_path: Path) -> None:
     ]
 
 
+def test_a_directory_named_dot_vigil_space_b_is_reviewed(ws: Workspace, tmp_path: Path) -> None:
+    """Coord review of #208: `.vigil b/x.py` is not `.vigil`, so publish keeps it and the
+    reviewer must see it; its header `diff --git a/.vigil b/x.py b/...` must not read as
+    the `.vigil` file's. A top-level file named `.vigil` is still dropped."""
+    base, head = _result(ws, tmp_path, {".vigil b/x.py": "evil", ".vigil": "f", "ok.md": "o"})
+    diff = ws.published_diff(PD_REPO, base, head)
+    assert ".vigil b/x.py" in diff and "evil" in diff
+    assert "ok.md" in diff
+    assert "diff --git a/.vigil b/.vigil" not in diff
+
+
 def test_published_diff_of_only_vigil_changes_is_empty(ws: Workspace, tmp_path: Path) -> None:
     base, head = _result(ws, tmp_path, {".vigil/a": "1", ".VIGIL/b": "2"})
     assert ws.published_diff(PD_REPO, base, head) == ""

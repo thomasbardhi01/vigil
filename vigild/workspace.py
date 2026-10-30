@@ -41,7 +41,12 @@ RO_DIRS = (".github", ".claude", ".opencode", ".git/hooks")
 RO_FILES = (".git/config",)
 VIGIL_DIR = ".vigil"
 # a diff block of the top-level `.vigil` entry (a directory or a file), any case
-VIGIL_BLOCK = re.compile(r'diff --git "?a/\.vigil(?:/| b/|")', re.I)
+# A `diff --git` header for the top-level `.vigil` only: the directory (`a/.vigil/...`) or a
+# file named exactly `.vigil` (the whole header line), unquoted or git-quoted. Never a path
+# that merely starts with ".vigil " (a directory `.vigil b/` is published and reviewed).
+VIGIL_BLOCK = re.compile(
+    r'diff --git (?:"?a/\.vigil/|a/\.vigil b/\.vigil\n|"a/\.vigil" "b/\.vigil"\n)', re.I
+)
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
 MAX_BUNDLE = 512 << 20
