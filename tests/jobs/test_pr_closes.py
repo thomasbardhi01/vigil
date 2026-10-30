@@ -60,6 +60,18 @@ def test_a_job_with_no_issue_names_none(world: World) -> None:
     assert all("Closes" not in p["body"] and "Refs" not in p["body"] for p in prs)
 
 
+def test_superseded_and_abandoned_tasks_dont_count(world: World) -> None:
+    """A replanned job keeps its dropped workers; one live task still closes the issue."""
+    from vigild.jobs.runner import live_task_count
+
+    class T:
+        def __init__(self, state: str) -> None:
+            self.state = state
+
+    assert live_task_count([T("superseded"), T("abandoned"), T("verified")]) == 1
+    assert live_task_count([T("superseded"), T("waiting"), T("running")]) == 2
+
+
 def test_a_two_task_job_refs_its_issue_on_each_pr(world: World) -> None:
     prs = _run(world, 38)
     assert len(prs) == 2
