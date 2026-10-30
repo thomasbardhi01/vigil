@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import auth, git
+from tests.conftest import auth, git, main_rulings
 from tests.harness import LocalTestRunner, finish_session
 from tests.test_devimage import FakeDocker, FakeSuites
 from vigild.api.app import create_app
@@ -460,7 +460,7 @@ def world(
     build_first(images, runner.session_images)
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
-    services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)
+    services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs, rulings_source=main_rulings)
     with TestClient(create_app(services)) as c:
         yield World(
             c,

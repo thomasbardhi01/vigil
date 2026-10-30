@@ -53,8 +53,8 @@ phase 1 are ADRs in `docs/decisions/`; the owner's rulings are indexed in
   (`vigild/config.py`). A session never opens, prints or copies anything
   under `~/.config/vigil/`, or any `.env*` file other than `.env.example`.
   The guard plugin does **not** protect that path by name.
-- The repo's deny rules block the Write tool on `.env.example`; change it
-  with `cp` from a temp file.
+- Sessions can't read or write `.env.example` (deny rules, so `cp` from a
+  temp file fails too). The owner edits it; name the line you need in the PR.
 - No secret in a test fixture, log, commit, or container. A session gets
   only a per-session gateway token, on its stdin.
 - Credentials are checked only by `vigil doctor`: names and pass/fail.

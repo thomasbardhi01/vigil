@@ -19,6 +19,13 @@ from vigild.db import Store
 from vigild.jobs.service import JobService
 from vigild.services import Services, Tokens
 
+RULINGS_ON_MAIN = Path(__file__).resolve().parents[1] / "docs" / "owner-rulings.md"
+
+
+def main_rulings() -> str | None:
+    """Tests have no mirror: the committed rulings file stands in for main's."""
+    return RULINGS_ON_MAIN.read_text()
+
 
 @pytest.fixture
 def cfg(tmp_path: Path) -> Config:
@@ -79,7 +86,10 @@ def runner() -> RecordingRunner:
 
 @pytest.fixture
 def services(cfg: Config, store: Store, tokens: Tokens, runner: RecordingRunner) -> Services:
-    return Services(cfg=cfg, store=store, tokens=tokens, jobs=JobService(cfg, store, runner))
+    return Services(
+        cfg=cfg, store=store, tokens=tokens, jobs=JobService(cfg, store, runner),
+        rulings_source=main_rulings,
+    )  # fmt: skip
 
 
 @pytest.fixture

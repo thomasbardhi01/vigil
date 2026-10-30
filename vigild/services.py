@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -30,3 +31,6 @@ class Services:
     jobs: JobService
     # Features switched off because a credential is missing, e.g. "github-app".
     degraded: set[str] = field(default_factory=set)
+    # docs/owner-rulings.md as it is on main (vigild's mirror, `rulings.from_mirror`); None,
+    # or a source that returns None, refuses every coord ruling (#146, owner 2026-10-30)
+    rulings_source: Callable[[], str | None] | None = None

@@ -60,12 +60,13 @@ def _svc(request: Request) -> Services:
     return services
 
 
-def _heading(ruling: Any) -> str:
+def _heading(request: Request, ruling: Any) -> str:
     """The `docs/owner-rulings.md` heading a coord ruling names; 422 (listing them) if none."""
     if not isinstance(ruling, str) or not ruling.strip():
         raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
     try:
-        return rulings.match(ruling)
+        source = _svc(request).rulings_source
+        return rulings.match(ruling, source() if source is not None else None)
     except rulings.RulingError as e:
         raise HTTPException(422, str(e)) from e
 
@@ -75,7 +76,7 @@ def _coord_note(request: Request, body: dict[str, Any], note: Any) -> Any:
     `ruling` names, whatever the body says; the owner's note is untouched."""
     if actor_of(request)[0] != "coord" or not isinstance(note, str) or not note.strip():
         return note
-    return rulings.label_note(note, _heading(body.get("ruling")))
+    return rulings.label_note(note, _heading(request, body.get("ruling")))
 
 
 def _approver(
@@ -91,7 +92,7 @@ def _approver(
         # `edits` reach the worker's packet as the owner's notes, to be followed: not the coord's
         raise HTTPException(403, "the coord token can't approve with `edits`; the owner does")
     ruling = (body or {}).get("ruling")
-    return Actor.COORD, ruling, _heading(ruling)
+    return Actor.COORD, ruling, _heading(request, ruling)
 
 
 def _who(request: Request) -> Actor:

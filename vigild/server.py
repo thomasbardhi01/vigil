@@ -26,6 +26,7 @@ from vigild.devimage import DevImages
 from vigild.gateway.app import create_gateway_app
 from vigild.gateway.private import private_config
 from vigild.gateway.service import Gateway
+from vigild.jobs import rulings
 from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService, Runner
 from vigild.services import Services, Tokens
@@ -307,6 +308,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     v.services.jobs.files = files
     # the same mirror tells the gate which scope entries are directories
     v.services.jobs.dirs = lambda repo, base: lambda path: ws.mirror_is_dir(repo, base, path)
+    # the coord token's rulings: docs/owner-rulings.md on main, from the mirror (#146)
+    v.services.rulings_source = rulings.from_mirror(ws)
     return runner
 
 

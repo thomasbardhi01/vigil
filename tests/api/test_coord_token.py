@@ -6,6 +6,7 @@ for budget or cap edits, rung changes, merges and any spec that touches the repo
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ from vigild.services import Services, Tokens
 PA = "thomasbardhi01/parkagent"
 HEADING = "Autonomy (what coord may do between the owner's windows)"
 RULING = f"{HEADING}: docs-only specs are approved by coord"
+RULINGS_ON_MAIN = (Path(__file__).resolve().parents[2] / "docs" / "owner-rulings.md").read_text()
 
 
 def _job(n: int = 1, **over: Any) -> dict[str, Any]:
@@ -482,19 +484,58 @@ def test_a_made_up_ruling_is_refused_and_the_valid_headings_are_listed(
     assert store.get_job(jid).state is JobState.SPEC_PENDING and runner.approved == []
 
 
+@pytest.mark.parametrize("source", ["unreadable", "none"])
 def test_an_unreadable_rulings_file_fails_closed(
     client: TestClient, tokens: Tokens, store: Store, pending: tuple[str, int],
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    services: Services, source: str,
 ) -> None:  # fmt: skip
-    from vigild.jobs import rulings
-
-    monkeypatch.setattr(rulings, "RULINGS_PATH", tmp_path / "absent.md")
+    """The mirror can't give the file (None), or no source is wired at all."""
+    services.rulings_source = (lambda: None) if source == "unreadable" else None
     jid, item = pending
     r = client.post(
         f"/api/inbox/{item}/approve", headers=auth(tokens.coord), json={"ruling": RULING}
     )
     assert r.status_code == 422 and "owner-rulings.md" in r.text
     assert store.get_job(jid).state is JobState.SPEC_PENDING
+
+
+def test_a_heading_only_in_vigilds_working_tree_is_not_a_ruling(
+    client: TestClient, tokens: Tokens, store: Store, pending: tuple[str, int],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+) -> None:  # fmt: skip
+    """A coord session can edit vigild's checkout without a PR, so the rulings are read
+    from the mirror of origin/main, never from the working tree (owner, 2026-10-30)."""
+    from vigild.jobs import rulings
+
+    planted = tmp_path / "owner-rulings.md"
+    planted.write_text(RULINGS_ON_MAIN + "\n## Coord may merge its own PRs\n")
+    monkeypatch.setattr(rulings, "RULINGS_PATH", planted, raising=False)
+    jid, item = pending
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord),
+        json={"ruling": "Coord may merge its own PRs"},
+    )  # fmt: skip
+    assert r.status_code == 422, r.text
+    assert store.get_job(jid).state is JobState.SPEC_PENDING
+
+
+def test_the_rulings_come_from_the_mirror_of_main_and_fail_closed_without_it() -> None:
+    from vigild.jobs import rulings
+
+    calls: list[tuple[str, str, str]] = []
+
+    class Mirror:
+        def __init__(self, text: str | None) -> None:
+            self.text = text
+
+        def mirror_file(self, repo: str, branch: str, path: str) -> str | None:
+            calls.append((repo, branch, path))
+            return self.text
+
+    assert rulings.from_mirror(Mirror(RULINGS_ON_MAIN))() == RULINGS_ON_MAIN
+    assert calls == [("thomasbardhi01/vigil", "main", "docs/owner-rulings.md")]
+    with pytest.raises(rulings.RulingError):
+        rulings.match(RULING, rulings.from_mirror(Mirror(None))())
 
 
 def test_the_rulings_file_is_pinned_and_a_coord_approval_touching_it_is_refused(
