@@ -83,6 +83,9 @@ class NullRunner:
     def prepare_fix(self, job_id: str, task_id: str) -> int:
         raise RuntimeError("no runner attached")
 
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        raise RuntimeError("no runner attached")
+
     def replay_review(
         self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
     ) -> dict[str, Any]:
