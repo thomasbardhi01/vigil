@@ -650,28 +650,34 @@ def require_local_files(host: SandboxHost, mounts: list[dict[str, Any]]) -> None
 
 @dataclass(frozen=True)
 class Unowned:
-    """A vigil-labelled container that no vigild claims: no instance label and an
-    id vigild never recorded (a pre-label leftover, #166). Kill and reap leave it."""
+    """A vigil-labelled container or network that no vigild claims: no instance label
+    and an id vigild never recorded (a pre-label leftover, #166). Kill and reap leave it."""
 
-    name: str
+    kind: str  # "container" or "network"
     id: str
+    name: str
     job: str  # its `dev.vigil.job` label, "" if none
 
 
 def is_unowned(labels: Mapping[str, str], cid: str, recorded: set[str]) -> bool:
-    """The one test for an unowned object: no instance label, id not recorded."""
-    return INSTANCE_LABEL not in labels and cid not in recorded
+    """The one test for an unowned object: a session label, no instance label, id not
+    recorded."""
+    return LABEL in labels and INSTANCE_LABEL not in labels and cid not in recorded
 
 
 def find_unowned(client: Any, recorded: set[str]) -> list[Unowned]:
-    """Every vigil-labelled container (any state) that `is_unowned`, by name. The one
-    selector for the startup page, `vigil doctor` and a kill's `unowned` list."""
-    out = [
-        Unowned(str(c.name), str(c.id), (c.labels or {}).get(JOB_LABEL, ""))
-        for c in client.containers.list(all=True, filters={"label": LABEL})
-        if is_unowned(c.labels or {}, str(c.id), recorded)
-    ]
-    return sorted(out, key=lambda u: u.name)
+    """Every vigil-labelled container (any state) and network that `is_unowned`. The
+    one selector for the startup page and `vigil doctor`."""
+    out: list[Unowned] = []
+    for c in client.containers.list(all=True, filters={"label": LABEL}):
+        labels = c.labels or {}
+        if is_unowned(labels, str(c.id), recorded):
+            out.append(Unowned("container", str(c.id), str(c.name), labels.get(JOB_LABEL, "")))
+    for net in client.networks.list(filters={"label": LABEL}):
+        labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
+        if is_unowned(labels, str(net.id), recorded):
+            out.append(Unowned("network", str(net.id), str(net.name), labels.get(JOB_LABEL, "")))
+    return sorted(out, key=lambda u: (u.name, u.kind))
 
 
 def _record(on_event: EventSink, kind: str, thing: Any) -> None:

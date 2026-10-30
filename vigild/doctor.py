@@ -118,15 +118,16 @@ def backup_freshness_check(
     return _safe(name, lambda: freshness(dest, now=now or datetime.now(UTC)))
 
 
-def unowned_containers_check(runtime: Any) -> Check:
-    """`unowned containers (N)`: vigil-labelled containers no vigild claims (#166).
+def unowned_containers_check(docker: Any, recorded: set[str]) -> Check:
+    """`unowned containers (N)`: vigil-labelled objects no vigild claims (#166).
     Fails naming them; kill and the startup reap never remove them."""
+    from vigild.executors.runtime import find_unowned
+
     try:
-        found = runtime.unowned()
-    except Exception as e:
+        found = find_unowned(docker, recorded)
+    except Exception as e:  # report the kind of failure, never a value
         return Check("unowned containers", False, type(e).__name__)
-    names = ", ".join(u.name for u in found)
-    return Check(f"unowned containers ({len(found)})", not found, names)
+    return Check(f"unowned containers ({len(found)})", not found, " ".join(u.name for u in found))
 
 
 def stale_image_checks(dev: Any, sessions: Any, repo: str, tip: str) -> list[Check]:
@@ -459,14 +460,9 @@ def run_checks(
             )
         out += _sandbox_host_lines(cfg, docker, host_checks)
         from vigild.db import Store
-        from vigild.executors.runtime import DockerRuntime
 
         store = Store.open(cfg.vigild.data_path / "vigil.db")
-        out.append(
-            unowned_containers_check(
-                DockerRuntime(cfg, docker, recorded=store.recorded_container_ids)
-            )
-        )
+        out.append(unowned_containers_check(docker, set(store.recorded_container_ids(""))))
         for repo in cfg.repos.repos:
 
             def last_build(r: str = repo) -> tuple[bool, str]:

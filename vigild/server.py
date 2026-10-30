@@ -230,29 +230,34 @@ def build_executors(cfg: Config, client: Any, store: Any) -> tuple[Any, Any, Any
     return hosts, HostExecutor(hosts), HostTestRunner(hosts)
 
 
-def reap_and_page(runtime: Any, store: Store, pager: Any) -> int:
+UNOWNED_TITLE = "unowned vigil containers left by the startup reap"
+
+
+def reap_and_page(local: Any, store: Any) -> int:
     """The startup reap, then one open `unowned_containers` page for what it leaves:
-    names and `dev.vigil.job` labels of vigil-labelled containers no vigild claims
-    (#166). Nothing more is removed; a page already open is not repeated."""
-    n = int(runtime.reap())
-    found = runtime.unowned()
+    kind, name and `dev.vigil.job` label of vigil-labelled objects no vigild claims
+    (#166). Nothing more is removed; a page already open is not repeated; a Docker
+    error while listing is logged and startup carries on."""
+    n = int(local.reap())
+    try:
+        found = local.unowned()
+    except Exception as e:
+        log.error("reap: could not list unowned containers: %s", type(e).__name__)
+        return n
     log.info("reap: removed %d containers, %d unowned left", n, len(found))
-    if found and not any(
-        i.kind == "page" and i.title == UNOWNED_TITLE for i in store.list_inbox("open")
-    ):
-        pager.page(
+    if found and not any(i.kind == "unowned_containers" for i in store.list_inbox("open")):
+        store.create_inbox_item(
+            "questions",
+            "unowned_containers",
             None,
             UNOWNED_TITLE,
             {
                 "kind": "unowned_containers",
-                "containers": [{"name": u.name, "job": u.job} for u in found],
+                "containers": [{"kind": u.kind, "name": u.name, "job": u.job} for u in found],
+                "actions": ["dismiss"],
             },
-            own_job=False,
         )
     return n
-
-
-UNOWNED_TITLE = "unowned vigil containers left by the startup reap"
 
 
 def build_runner(v: Vigild, app: Any) -> JobRunner:
@@ -301,7 +306,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         v.telemetry,
         images,
         Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
-        reaper=lambda: reap_and_page(local, v.store, v.services.jobs),
+        reaper=lambda: reap_and_page(local, v.store),
         session_images=sessions,
         breakers=v.gateway.breakers,
         deps=DepsExecutor(

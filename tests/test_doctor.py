@@ -345,31 +345,55 @@ def test_doctor_fails_when_the_coord_token_is_missing_or_the_owner_one(cfg: Conf
     assert "same-fake-value-000" not in render([c])
 
 
-def test_unowned_containers_check_passes_when_none() -> None:
-    class RT:
-        def unowned(self) -> list[Any]:
-            return []
+class _Obj:
+    def __init__(self, name: str, labels: dict[str, str]) -> None:
+        self.name, self.id, self.labels = name, f"id-{name}", labels
+        self.attrs = {"Labels": labels}
 
-    c = doctor.unowned_containers_check(RT())
+
+class _Docker:
+    def __init__(self, boxes: list[_Obj], nets: list[_Obj] | None = None) -> None:
+        self.boxes, self.nets = boxes, nets or []
+        self.containers = self
+        self.networks = self
+
+    def list(self, **kw: Any) -> list[_Obj]:
+        return self.nets if kw.get("all") is None else self.boxes
+
+
+def test_unowned_containers_check_passes_when_none() -> None:
+    from vigild.executors.runtime import INSTANCE_LABEL, LABEL
+
+    d = _Docker([_Obj("owned", {LABEL: "s", INSTANCE_LABEL: "me"}), _Obj("rec", {LABEL: "s"})])
+    c = doctor.unowned_containers_check(d, {"id-rec"})
     assert (c.name, c.ok, c.note) == ("unowned containers (0)", True, "")
+    assert render([c]).splitlines()[0].startswith("pass  unowned containers (0)")
 
 
 def test_unowned_containers_check_fails_naming_them() -> None:
-    from vigild.executors.runtime import Unowned
+    from vigild.executors.runtime import INSTANCE_LABEL, LABEL
 
-    class RT:
-        def unowned(self) -> list[Any]:
-            return [Unowned("vigil-s1", "id1", "vi-1"), Unowned("vigil-s2", "id2", "")]
-
-    c = doctor.unowned_containers_check(RT())
+    d = _Docker(
+        [
+            _Obj("stale-1", {LABEL: "s"}),
+            _Obj("owned", {LABEL: "s", INSTANCE_LABEL: "me"}),
+            _Obj("rec", {LABEL: "s"}),
+        ],
+        [_Obj("stale-net", {LABEL: "s"})],
+    )
+    c = doctor.unowned_containers_check(d, {"id-rec"})
     assert c.name == "unowned containers (2)" and c.ok is False
-    assert c.note == "vigil-s1, vigil-s2"
+    assert c.note == "stale-1 stale-net"
+    assert render([c]).splitlines()[0].startswith("fail  unowned containers (2)")
 
 
 def test_unowned_containers_check_reports_a_daemon_error_by_kind() -> None:
-    class RT:
-        def unowned(self) -> list[Any]:
+    class Boom:
+        def __init__(self) -> None:
+            self.containers = self
+
+        def list(self, **kw: Any) -> list[Any]:
             raise OSError("socket /secret/path")
 
-    c = doctor.unowned_containers_check(RT())
+    c = doctor.unowned_containers_check(Boom(), set())
     assert c.ok is False and c.note == "OSError"
