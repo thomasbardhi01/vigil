@@ -240,6 +240,8 @@ class DevImages:
         runner: TestRunner,
         *,
         on_failure: OnFailure | None = None,
+        on_flake: OnFailure | None = None,
+        ci_result: Callable[[str, str], str] | None = None,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.cfg = cfg
@@ -248,6 +250,10 @@ class DevImages:
         self.sources = sources
         self.runner = runner
         self.on_failure = on_failure
+        # #191: a suite that fails here while CI's `test` job is green for the same
+        # commit is a flake: recorded, offered a rebuild, and nobody is paged
+        self.on_flake = on_flake
+        self.ci_result = ci_result
         self.clock = clock
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
@@ -400,9 +406,21 @@ class DevImages:
             shutil.rmtree(src.parent, ignore_errors=True)
         passed = all(s["outcome"] == "pass" for s in suites.values())
         result: dict[str, Any] = {"suites": suites, "excluded": dict(pol.dev_excluded)}
+        if not passed and source == "mirror" and self._ci_green(repo, base_sha):
+            result["verdict"] = f"suite flaked, CI green on {base_sha}"
         return self._record(repo, key, tag, image_id, passed, "validate", result, base_sha)
 
     # --- helpers --------------------------------------------------------------------
+
+    def _ci_green(self, repo: str, sha: str) -> bool:
+        """Only a CI `test` job that succeeded on this very commit; pending, failed,
+        unreadable (no `checks: read`) or an error is not green."""
+        if self.ci_result is None:
+            return False
+        try:
+            return self.ci_result(repo, sha) == "success"
+        except Exception:
+            return False
 
     def _lock(self, repo: str) -> threading.Lock:
         with self._locks_lock:
@@ -430,16 +448,19 @@ class DevImages:
         return v
 
     def _page(self, v: Validation) -> None:
-        if self.on_failure is None:
-            return
         body = json.loads(v.output)
         failed = [n for n, s in (body.get("suites") or {}).items() if s.get("outcome") != "pass"]
         suffix = f" ({', '.join(failed)})" if failed else ""
-        self.on_failure(
+        flaked = bool(body.get("verdict")) and self.on_flake is not None
+        notify = self.on_flake if flaked else self.on_failure
+        if notify is None:
+            return
+        notify(
             v.repo,
-            f"{v.repo}: dev image {v.stage} failed{suffix}",
+            f"{v.repo}: dev image {v.stage} failed{suffix}"
+            + ("; CI is green on this commit, so a flake" if flaked else ""),
             {
-                "kind": "dev_image",
+                "kind": "dev_image_flake" if flaked else "dev_image",
                 "repo": v.repo,
                 "key": v.key,
                 "image": v.image,

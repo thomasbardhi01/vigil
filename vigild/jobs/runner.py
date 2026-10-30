@@ -799,6 +799,21 @@ class JobRunner:
                 return
         self._page(None, title, body)
 
+    def dev_image_flaked(self, repo: str, title: str, body: dict[str, Any]) -> None:
+        """A validation failure whose commit is green in CI (#191): one open item per
+        image key offering Rebuild, and no `page` event, so nobody is paged."""
+        for item in self.store.list_inbox():
+            if item.body.get("kind") in ("dev_image", "dev_image_flake") and (
+                item.body.get("key") == body.get("key")
+            ):
+                return
+        item = self.store.create_inbox_item(
+            "questions", "dev_image_flake", None, title, {**body, "resumable": False}
+        )
+        self.store.add_event(
+            "dev_image_flake", {"item": item.id, "title": title, **body}, Provenance.HUMAN
+        )
+
     def on_rebuild(self, repo: str, base_sha: str) -> None:
         """The owner asked for a failed dev image to be built again. The page's
         `base_sha` is where it failed, possibly behind a fix that has since merged, so
