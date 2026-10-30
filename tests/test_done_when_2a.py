@@ -35,11 +35,13 @@ from typing import Any
 import httpx2
 import pytest
 import uvicorn
+import yaml
 from fastapi.testclient import TestClient
 
 from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import BarePublisher
 from vigild.api.app import create_app
+from vigild import config as vigild_config
 from vigild.config import CoordRule, RepoPolicy
 from vigild.db import utcnow
 from vigild.devimage import DevImages, DockerImages, SessionImages
@@ -53,14 +55,25 @@ from vigild.services import Tokens
 from vigild.verifier import Verifier
 from vigild.workspace import Workspace
 
-pytestmark = [pytest.mark.docker, pytest.mark.live]
-
 REPO = "o/donewhen"
 EXCLUDE_NEWER = "2026-10-08T23:59:59Z"
 PYPROJECT = (
     '[project]\nname = "donewhen"\nversion = "0.1.0"\nrequires-python = ">=3.14"\n'
     'dependencies = ["pytest==9.1.1"]\n'
 )
+
+
+def budget_caps() -> tuple[float, float, int]:
+    """(per_task_usd, daily_usd, wip_per_repo) from configs/budgets.yaml."""
+    b = vigild_config.load().budgets
+    return (b.per_task_usd, b.daily_usd, b.wip_per_repo)
+
+
+def test_budget_caps_match_budgets_yaml() -> None:
+    raw = yaml.safe_load((Path(__file__).parent.parent / "configs" / "budgets.yaml").read_text())
+    assert budget_caps() == (
+        float(raw["per_task_usd"]), float(raw["daily_usd"]), int(raw["wip_per_repo"])
+    )  # fmt: skip
 
 
 def log(*a: Any) -> None:
@@ -138,7 +151,8 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     cfg.routing.coord = [CoordRule(name="default", when="always", preset="claude-haiku")]
     # the production caps and WIP limit (configs/budgets.yaml), as they are
     assert (cfg.budgets.per_task_usd, cfg.budgets.daily_usd, cfg.budgets.wip_per_repo) == (
-        2.0, 5.0, 4)  # fmt: skip
+        budget_caps()
+    )
     cfg.vigild.scheduler.checkpoint_seconds = 3
     cfg.repos.repos[REPO] = RepoPolicy(
         decider=["haiku", "jev"],
@@ -279,6 +293,8 @@ def pages(lv: Live) -> list[str]:
     return [f"{q['title']}: {json.dumps(q['body'])[:700]}" for q in inbox(lv)["questions"]]
 
 
+@pytest.mark.docker
+@pytest.mark.live
 def test_phase_2a_done_when(live: Live) -> None:
     lv = live
     store = lv.v.store
