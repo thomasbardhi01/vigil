@@ -41,13 +41,98 @@ from typing import Any, Protocol
 from vigild.config import CONFIG_DIR, Config
 from vigild.db import Store, iso, utcnow
 from vigild.shellwords import programs
-from vigild.verifier import RunResult, TestRunner, outcome
+from vigild.verifier import RunResult, TestRunner, outcome, parse_junit
 
 ROOT = CONFIG_DIR.parent
 BUILD_SECONDS = 60 * 60
 SUITE_SECONDS = 30 * 60
 SUITE_OUTPUT = 256 << 10
 TAIL = 3000
+MAX_FAILED = 50
+HEAD_CHARS = 300
+_B64_LINE = re.compile(r"^[A-Za-z0-9+/=]{200,}$")
+_SUMMARY = re.compile(r"^\W*(\d+ (failed|passed|error)|=+ .*(failed|passed|error)).*", re.I)
+_FAIL_LINE = re.compile(r"^(FAILED|ERROR) (\S+)")
+_BLOCK_HEAD = re.compile(r"^_{3,} .+ _{3,}$")
+
+
+def _strip_trailer(text: str) -> str:
+    """Drop the report trailer (the marker lines and the base64 under them)."""
+    return "\n".join(
+        ln
+        for ln in text.split("\n")
+        if not ln.startswith("VIGIL-REPORT") and not _B64_LINE.match(ln)
+    )
+
+
+def smart_tail(text: str, cap: int = TAIL) -> str:
+    """The stored tail of a suite's output, cut from the middle: a short head, the
+    summary line, every FAILED/ERROR line, the first `E` line under each failure block,
+    and the end; no base64 trailer."""
+    lines = _strip_trailer(text).split("\n")
+    plain = "\n".join(lines)
+    if len(plain) <= cap:
+        return plain
+    keep: list[str] = []
+    in_block, got_e = False, False
+    summary = ""
+    for ln in lines:
+        if _BLOCK_HEAD.match(ln):
+            in_block, got_e = True, False
+        elif in_block and not got_e and ln.startswith("E "):
+            got_e = True
+            keep.append(ln[:200])
+        elif _FAIL_LINE.match(ln):
+            keep.append(ln[:200])
+        if _SUMMARY.match(ln) and ("failed" in ln or "passed" in ln or "error" in ln):
+            summary = ln[:200]
+    marker = "\n[... middle of the output cut ...]\n"
+    head = plain[:HEAD_CHARS]
+    end_n = 500
+    budget = cap - len(head) - end_n - 2 * len(marker) - len(summary) - 2
+    mid_lines: list[str] = []
+    used = 0
+    for ln in keep:
+        if used + len(ln) + 1 > budget:
+            break
+        mid_lines.append(ln)
+        used += len(ln) + 1
+    end = plain[-end_n:]
+    if summary and summary not in end:
+        mid_lines.append(summary)
+    out = head + marker + "\n".join(mid_lines) + marker + end
+    return out[:cap] if len(out) > cap else out
+
+
+def failed_tests(r: RunResult) -> list[str]:
+    """Failing test ids, at most MAX_FAILED: from the JUnit reports when the result
+    carries any, else from the FAILED/ERROR lines of the output."""
+    ids: list[str] = []
+    for name in sorted(r.reports):
+        ids += [c.id for c in parse_junit(r.reports[name]) if c.status in ("failure", "error")]
+    if not ids:
+        for ln in _strip_trailer(r.output).split("\n"):
+            m = _FAIL_LINE.match(ln)
+            if m:
+                ids.append(m.group(2))
+    return list(dict.fromkeys(ids))[:MAX_FAILED]
+
+
+def dev_image_note(row: Any) -> str:
+    """Doctor's note for a failed dev-image record; names up to 3 failed tests. An old
+    record (no `failed_tests`) or a body that isn't JSON gets the plain line."""
+    base = f"{row['image']} failed its {row['stage'] or 'check'}"
+    try:
+        body = json.loads(row["output"] or "{}")
+        suites = body.get("suites", {}) if isinstance(body, dict) else {}
+        for name, s in suites.items():
+            ids = s.get("failed_tests") or []
+            if s.get("outcome") != "pass" and ids:
+                more = f" +{len(ids) - 3} more" if len(ids) > 3 else ""
+                return f"{base}  ({name} failed: {', '.join(ids[:3])}{more})"
+    except ValueError, AttributeError, TypeError:
+        pass
+    return base
 
 
 class StaleDevImage(RuntimeError):
@@ -308,7 +393,8 @@ class DevImages:
                 suites[name] = {
                     "exit": r.exit,
                     "outcome": outcome(r.exit, r.timed_out),
-                    "tail": r.output[-TAIL:],
+                    "tail": smart_tail(r.output),
+                    "failed_tests": failed_tests(r),
                 }
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)
