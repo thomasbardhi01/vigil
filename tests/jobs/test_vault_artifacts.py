@@ -466,3 +466,88 @@ def test_a_pr_that_cannot_be_cleaned_pages_with_retry_and_abandon(world: World) 
     r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert w.store.get_job(job).state is S.READY
+
+
+# --- a branch someone else pushed to (#32) ---------------------------------------------------
+
+
+def _outside_push(w: World, branch: str) -> str:
+    """A commit on the remote branch that neither vigild's record nor the vault has."""
+    base = git(w.bare, "rev-parse", "main")
+    tree = git(w.bare, "rev-parse", f"{base}^{{tree}}")
+    sha = git(w.bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+              "-p", base, "-m", "owner's own push")  # fmt: skip
+    git(w.bare, "update-ref", f"refs/heads/{branch}", sha)
+    return sha
+
+
+def test_a_branch_moved_before_the_first_publish_pages_with_replan_and_abandon(
+    world: World,
+) -> None:
+    w = world
+    real = w.publisher.publish
+    outside: dict[str, str] = {}
+
+    def moved(**kw: Any) -> str:
+        if str(kw["branch"]).endswith("-w1") and not outside:
+            outside[kw["branch"]] = _outside_push(w, kw["branch"])
+        return real(**kw)
+
+    w.publisher.publish = moved  # type: ignore[method-assign]
+    job = _approve(w)
+    item = _failure_item(w, job, kind="branch_moved")
+    assert item["body"]["actions"] == ["replan", "abandon"] and not item["body"]["resumable"]
+    (branch, sha) = next(iter(outside.items()))
+    assert branch in json.dumps(item["body"])
+    assert git(w.bare, "rev-parse", f"refs/heads/{branch}") == sha  # never overwritten
+    assert w.store.get_task(f"{job}-w1").state == "failed"
+
+
+def test_a_branch_moved_before_the_ready_gate_resend_pages_without_retry(world: World) -> None:
+    w = world
+    job = _held_in_review(w)
+    ws = w.runner.workspace
+    outside = {}
+    for t in w.store.list_tasks(job):  # the record is behind: the branch must be sent again
+        ev = _latest(w, t.id)
+        ws.record_published(REPO, ev["branch"], ev["base_sha"])
+        outside[ev["branch"]] = _outside_push(w, ev["branch"])
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.BLOCKED
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in qs if q["job_id"] == job and q["body"].get("kind") == "vigil_in_pr"]
+    assert item["body"]["actions"] == ["replan", "abandon"] and not item["body"]["resumable"]
+    assert "branch moved on the remote" in json.dumps(item["body"])
+    for branch, sha in outside.items():
+        assert git(w.bare, "rev-parse", f"refs/heads/{branch}") == sha
+
+
+def test_lost_record_after_the_first_push_resends_the_same_sha_and_goes_on(world: World) -> None:
+    w = world
+    real = w.publisher.publish
+    sent: dict[str, str] = {}
+    lost = [1]
+
+    def lose_record(**kw: Any) -> str:
+        url = real(**kw)
+        if str(kw["branch"]).endswith("-w1") and lost[0]:
+            lost[0] -= 1
+            sent["sha"] = git(w.bare, "rev-parse", f"refs/heads/{kw['branch']}")
+            git(w.runner.workspace.vault(REPO), "update-ref", "-d",
+                w.runner.workspace._pub_ref(kw["branch"]))  # fmt: skip
+            raise PublishError("500: the push landed but the answer was lost")
+        return url
+
+    w.publisher.publish = lose_record  # type: ignore[method-assign]
+    job = _approve(w)
+    tid = f"{job}-w1"
+    branch = f"vigil/{tid}"
+    assert w.store.get_task(tid).state == "failed"
+    assert w.runner.workspace.published_sha(REPO, branch) is None
+    item = _failure_item(w, job)
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert git(w.bare, "rev-parse", f"refs/heads/{branch}") == sent["sha"]  # the same sha
+    assert w.runner.workspace.published_sha(REPO, branch) == sent["sha"]
+    assert w.store.get_task(tid).state in ("pr_open", "reviewed")
+    assert w.store.get_job(job).state is S.READY

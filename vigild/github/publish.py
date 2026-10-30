@@ -42,6 +42,12 @@ class LegacyBranch(PublishError):
     `.vigil/` and vigild has no record of sending it. Only the owner can fix it."""
 
 
+class BranchMoved(PublishError):
+    """The remote tip of the branch is neither the commit vigild last sent nor an
+    ancestor of the one it means to send: someone pushed to it. A retry would loop
+    or overwrite their commit, so only a replan or an abandon is offered."""
+
+
 class Pulls(Protocol):
     def create_pull(
         self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
@@ -188,7 +194,34 @@ def publish(
         if outside:
             raise PublishError(f"files in the commit sent are outside the scope: {outside}")
         if push:
-            ws.push(repo, send, branch, token)
+            tip = ws.remote_tip(repo, branch, token)
+            if (
+                tip is not None
+                and tip != send
+                and tip != ws.published_sha(repo, branch)
+                and not ws.is_ancestor(repo, tip, send)
+            ):
+                raise BranchMoved(
+                    f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
+                    "last sent, and nothing is overwritten"
+                )
+            if tip is not None and tip != send and not ws.is_ancestor(repo, tip, send):
+                raise PublishError(
+                    f"{branch} would not fast-forward from the remote tip {tip[:12]}: "
+                    "nothing is forced and nothing is pushed"
+                )
+            try:
+                ws.push(repo, send, branch, token, tip)
+            except WorkspaceError as e:
+                # only a stale lease means the branch moved; a hook, ruleset or auth
+                # refusal keeps its own cause (#198 review)
+                if "stale info" in str(e):
+                    seen = tip[:12] if tip else "no branch"
+                    raise BranchMoved(
+                        f"{branch} moved on the remote after vigild read it ({seen}): "
+                        "nothing is overwritten"
+                    ) from e
+                raise
         ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
