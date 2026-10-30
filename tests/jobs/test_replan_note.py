@@ -258,6 +258,7 @@ def test_the_amended_spec_changelog_and_diff_are_stored_and_the_item_shows_them(
     body = _spec_item(w)["body"]
     assert body["amendment"] == {
         "changelog": CHANGELOG, "diff": diff, "note_bytes": len(NOTE.encode()),
+        "contract_diff": [], "unlisted": [],
     }  # fmt: skip
     # plan.md is re-planned from the amended spec, and the gate ran on the amended spec
     assert _art(w, job, "plan.md").provenance == "claude"
@@ -580,3 +581,63 @@ def test_the_coord_prompt_says_scope_paths_have_no_trailing_slash() -> None:
 
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
     assert "no trailing slash" in text and "out_of_scope" in text
+
+
+# --- the contract diff (#38) ---------------------------------------------------------------------
+
+
+def _arm_plan(w: World, edit: Any) -> None:
+    def draft(j: str) -> tuple[str, str]:
+        return AMENDED, edit(plan(j))
+
+    def extra(clone: Path, j: str) -> None:
+        (clone / ".vigil" / j / "spec_changelog.md").write_text(CHANGELOG)
+
+    w.standin.coord_drafts = [draft]
+    w.standin.coord_extra = extra
+
+
+def _widen(text: str) -> str:
+    head, rest = text.split("```json\n")
+    body, tail = rest.split("\n```")
+    raw = json.loads(body)
+    raw["workers"][0]["out_of_scope"] = ["vigild/**"]
+    return head + "```json\n" + json.dumps(raw, indent=1) + "\n```" + tail
+
+
+def test_out_of_scope_change_shows_in_contract_diff_and_unlisted(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    _arm_plan(w, _widen)
+    assert _replan(w, item).status_code == 200
+    am = _spec_item(w)["body"]["amendment"]
+    assert [d["field"] for d in am["contract_diff"]] == ["out_of_scope"]
+    assert [u["field"] for u in am["unlisted"]] == ["out_of_scope"]
+    prev = _art(w, job, "plan_previous.md")
+    assert prev is not None and "out_of_scope" not in prev.content
+
+
+def test_plan_previous_is_the_plan_before_the_approval(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    approved = _art(w, job, "plan.md").content
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    assert _art(w, job, "plan_previous.md").content == approved
+
+
+def test_no_plan_previous_means_a_null_contract_diff(world: World) -> None:
+    w = world
+    job, item = _held(w)
+    _arm(w)
+    assert _replan(w, item).status_code == 200
+    w.store.x("DELETE FROM artifacts WHERE job_id=? AND name='plan_previous.md'", (job,))
+    from vigild.jobs.service import JobService
+
+    svc = JobService(w.runner.cfg, w.store, w.runner)
+    assert svc._amendment(job)["amendment"]["contract_diff"] is None
+
+
+def test_coord_prompt_keeps_plan_fields_short() -> None:
+    text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
+    assert len(text.splitlines()) <= 40 and "out_of_scope" in text

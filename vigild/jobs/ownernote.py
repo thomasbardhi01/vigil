@@ -93,3 +93,120 @@ def author_contract(note: str) -> str:
         else:
             i += 1
     return "\n\n".join(sections) if sections else note.strip()
+
+
+# --- what an amendment changed that the coord did not say ---------------------------------------
+
+PLAN_FIELDS = (
+    "goal", "why", "value", "risk", "size", "test_cmd", "done_when", "files_in_scope",
+    "out_of_scope", "must_fail_first", "must_fail_first_reason", "depends_on", "labels",
+    "max_cost_usd", "verify_level",
+)  # fmt: skip
+
+
+def _workers(plan_text: str) -> dict[str, dict[str, object]]:
+    """plan.md's workers by task id ({} when it has none that parse)."""
+    from vigild.jobs.artifacts import parse_plan
+
+    out: dict[str, dict[str, object]] = {}
+    for w in parse_plan(spec_body(plan_text)).workers:
+        out[w.task_id] = w.model_dump()
+    return out
+
+
+def contract_diff(previous_plan: str, amended_plan: str) -> list[dict[str, object]]:
+    """Every worker-contract change between two plans: a task added or removed
+    (`field` "task") or one field of a task in both, as {task, field, before, after}."""
+    old, new = _workers(previous_plan), _workers(amended_plan)
+    # a re-plan renumbers its workers, so pair them: by id, then by goal
+    pairs: dict[str, str] = {t: t for t in old if t in new}
+    for t in old:
+        if t not in pairs:
+            g = next(
+                (n for n in new if n not in pairs.values() and new[n]["goal"] == old[t]["goal"]),
+                None,
+            )
+            if g is not None:
+                pairs[t] = g
+    out: list[dict[str, object]] = []
+    for tid in sorted(old.keys() - pairs.keys()):
+        out.append({"task": tid, "field": "task", "before": old[tid]["goal"], "after": None})
+    for tid in sorted(new.keys() - set(pairs.values())):
+        out.append({"task": tid, "field": "task", "before": None, "after": new[tid]["goal"]})
+    for o, n in pairs.items():
+        for f in PLAN_FIELDS:
+            before = old[o].get(f)
+            if f == "depends_on" and isinstance(before, list):
+                before = [pairs.get(str(d), d) for d in before]
+            if before != new[n].get(f):
+                out.append({"task": n, "field": f, "before": before, "after": new[n].get(f)})
+    return out
+
+
+def _heading_at(lines: list[str], i: int) -> str:
+    """The `##` section that line i of a spec is in (by its position in the full text)."""
+    for k in range(min(i, len(lines) - 1), -1, -1):
+        if lines[k].startswith("## "):
+            return lines[k][3:].strip()
+    return "(preamble)"
+
+
+def spec_changes(previous: str, amended: str) -> list[dict[str, object]]:
+    """The spec's changed hunks as {section, before, after}. A hunk's section comes from
+    its line numbers against the full spec text, never from a heading an earlier hunk
+    carried over."""
+    old = spec_body(previous).splitlines()
+    new = spec_body(amended).splitlines()
+    out: list[dict[str, object]] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        None, old, new, autojunk=False
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        section = _heading_at(old, i1) if tag == "delete" else _heading_at(new, j1)
+        out.append({"section": section, "before": old[i1:i2], "after": new[j1:j2]})
+    return out
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[\s_`]+", " ", text).strip().lower()
+
+
+def unlisted_changes(
+    previous_spec: str,
+    amended_spec: str,
+    previous_plan: str | None,
+    amended_plan: str | None,
+    changelog: str,
+    note: str = "",
+) -> list[dict[str, object]]:
+    """The changes the coord's changelog (or the owner's note) does not mention: a spec
+    hunk whose section name or changed text is not in them, a contract field whose name
+    or changed value is not, and a task added or removed (`field` "task") unless the
+    changelog names its task id."""
+    said = _norm(changelog + "\n" + note)
+    out: list[dict[str, object]] = []
+    for c in spec_changes(previous_spec, amended_spec):
+        lines = [str(x) for x in (*c["before"], *c["after"])]  # type: ignore[misc]
+        texts = [_norm(x.lstrip("-* ")) for x in lines if x.strip()]
+        if _norm(str(c["section"])).rstrip("s") in said or any(t and t in said for t in texts):
+            continue
+        out.append(
+            {"where": "spec", "section": c["section"], "before": c["before"], "after": c["after"]}
+        )
+    if previous_plan is None or amended_plan is None:
+        return out
+    for d in contract_diff(previous_plan, amended_plan):
+        if d["field"] == "task":
+            if not re.search(rf"(?<![\w-]){re.escape(str(d['task']))}(?![\w-])", changelog):
+                out.append({"where": "plan", **d})
+            continue
+        vals = {
+            _norm(str(v))
+            for side in (d["before"], d["after"])
+            for v in (side if isinstance(side, list) else [side])
+        }
+        if _norm(str(d["field"])) in said or any(v and len(v) > 3 and v in said for v in vals):
+            continue
+        out.append({"where": "plan", **d})
+    return out
