@@ -54,6 +54,7 @@ class Runner(Protocol):
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
     def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]: ...
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None: ...
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
     def fix_check(self, job_id: str, task_id: str) -> str | None: ...
     def fix_escalation(self, job_id: str, task_id: str) -> str | None: ...
@@ -1061,6 +1062,50 @@ class JobService:
         its own cap (review round 2, N5)."""
         self._offered(item_id, "retry")
         return self.resume(item_id, actor)
+
+    def republish(self, item_id: int, task_id: object, actor: Actor = Actor.OWNER) -> Job:
+        """Publish a failed task's verified head again (owner, 2026-10-30), without a
+        session, a reservation or a verifier run. The verifier's record (`tests.json`
+        `after.sha`) must match the vault's `refs/vigil/<task>`; otherwise 409 and nothing
+        changes. The job resumes with this task's publish ahead of its dispatch, the page
+        is resolved, and a `republish` event follows the publish. Owner only."""
+        from vigild.jobs.runner import RepublishRefused
+
+        if actor is not Actor.OWNER:
+            raise Forbidden("the owner republishes; the coord token can't")
+        if not isinstance(task_id, str) or not task_id:
+            raise Conflict("task_id must be a task's id")
+        with self.store.tx():
+            item = self._question(item_id)
+            tasks = item.body.get("tasks")
+            if item.job_id is None or not isinstance(tasks, dict) or task_id not in tasks:
+                raise Conflict(f"inbox item {item_id} isn't a failed-task page listing {task_id}")
+            job = self.store.get_job(item.job_id)
+            if job.state not in (JobState.BLOCKED, JobState.ESCALATED) or job.blocked_from is None:
+                raise Conflict(f"{job.id} is {job.state.value}; nothing to republish")
+            try:
+                task = self.store.get_task(task_id)
+            except KeyError as e:
+                raise Conflict(f"no task {task_id}") from e
+            if task.job_id != job.id or task.state != "failed":
+                raise Conflict(f"{task_id} is {task.state}, not a failed task of {job.id}")
+            try:
+                job = transition(
+                    self.store, job.id, job.blocked_from, actor, channel=_channel(actor),
+                    evidence={"inbox_item_id": item_id, "action": "republish"},
+                )  # fmt: skip
+            except TransitionError as e:
+                raise Conflict(str(e)) from e
+            try:  # checks, then the `owner_republish` event: it rolls back with the move
+                self.runner.owner_republish(job.id, task_id, item_id)
+            except RepublishRefused as e:
+                raise Conflict(str(e)) from e
+            self.store.resolve_inbox_item(item_id, actor.value)
+            for other in self.store.list_inbox():
+                if other.job_id == job.id and other.body.get("resumable") and other.id != item_id:
+                    self.store.resolve_inbox_item(other.id, actor.value)
+        self.last_run[job.id] = self.runner.on_resume(job.id)
+        return job
 
     @staticmethod
     def _check_note(note: object) -> None:

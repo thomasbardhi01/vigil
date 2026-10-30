@@ -387,6 +387,28 @@ def retry(request: Request, item_id: int) -> dict[str, Any]:
     return _act(request, item_id, "retry")
 
 
+@router.post("/api/inbox/{item_id}/republish", dependencies=[ADMIN])
+def republish(
+    request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """The owner publishes a failed task's verified head again: {"task_id": ...}. The
+    verifier's `after.sha` must equal the vault's `refs/vigil/<task>` (409 naming both
+    otherwise); no session, reservation or verifier run. Owner token only: the coord token
+    gets 403."""
+    if actor_of(request)[0] == "coord":
+        raise HTTPException(403, "the owner republishes a verified head; the coord token can't")
+    jobs = _svc(request).jobs
+    try:
+        job = jobs.republish(item_id, (body or {}).get("task_id"), _who(request))
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Forbidden as e:
+        raise HTTPException(403, str(e)) from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
+
+
 @router.post("/api/inbox/{item_id}/replan", dependencies=[ADMIN])
 def replan(
     request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
