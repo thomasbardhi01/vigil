@@ -131,6 +131,7 @@ from vigild.repos import (
     live_private,
     repo_rule_errors,
 )
+from vigild.review.evidence import triage_evidence
 from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.review.replay import (
     ReplayInvalid,
@@ -164,6 +165,9 @@ class ReviewInputs:
 # the draft PR title of a runner-file task while hidden tests are off (host policy)
 OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
 PR_TITLE_MAX = 200  # GitHub refuses a title over 256 characters (422)
+
+
+_EVIDENCE_MARKS = {"evidence_invalid", "evidence_error"}  # #183: only an invalid one shows them
 
 
 def pr_title(job_id: str, goal: str) -> str:
@@ -1815,7 +1819,9 @@ class JobRunner:
             session_dir=self._session_dir(coord.id),
             max_turns=40,
             max_minutes=COORD_MINUTES,
-            max_budget_usd=self.cfg.budgets.coord_session_usd,
+            max_budget_usd=self.sdk_budget(
+                coord.backend_preset or "", self.cfg.budgets.coord_session_usd
+            ),
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
@@ -2170,7 +2176,7 @@ class JobRunner:
                 repo=job.repo, preset=preset, model=self.cfg.preset(preset).model or "",
                 clone=clone, session_dir=self._session_dir(s.id), max_turns=40,
                 max_minutes=COORD_MINUTES,
-                max_budget_usd=amount,
+                max_budget_usd=self.sdk_budget(preset, amount),
                 mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
@@ -2622,6 +2628,13 @@ class JobRunner:
         )
         raw_len = int(row["n"] or 0) * CHARS_PER_TOKEN
         return worst_case_usd(prices, model, raw_len, MIN_OUTPUT_TOKENS)
+
+    def sdk_budget(self, preset: str, usd: float) -> float | None:
+        """The Agent SDK's `max_budget_usd` for a session on `preset`. A local
+        backend gets none: the CLI prices a model it doesn't know with a
+        fallback and would stop a session whose real spend is $0. Locality is
+        `configs/backends.yaml`'s answer alone; the gateway caps every call."""
+        return None if self.cfg.preset(preset).locality == "local" else usd
 
     def out_of_cap(self, task_id: str) -> str | None:
         """Why a worker session can't start for this task: what is left of its cap can't
@@ -3128,7 +3141,7 @@ class JobRunner:
             session_dir=self._session_dir(s.id),
             max_turns=max_turns,
             max_minutes=WORKER_MINUTES,
-            max_budget_usd=amount,  # what's left of the task's cap (N5)
+            max_budget_usd=self.sdk_budget(preset, amount),  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
@@ -4866,7 +4879,7 @@ class JobRunner:
             max_minutes=REVIEW_MINUTES,
             # the cap is checked call by call at the gateway, and a review may
             # go past it (owner, 2026-10-23): only the day stops the CLI
-            max_budget_usd=self.cfg.budgets.daily_usd,
+            max_budget_usd=self.sdk_budget(preset, self.cfg.budgets.daily_usd),
             mounts=self.workspace.overlays(clone),
             packet=packet,
             image=session_image,
@@ -4900,12 +4913,22 @@ class JobRunner:
         if out.status != "done":
             self.store.update_session(s.id, status="failed")
             return None, f"{role.value} session {out.status}: {(out.error or '')[:500]}"
+        spec_md = self.store.get_artifact(job.id, "spec.md")
+        spec = parse_spec(spec_md.content) if spec_md else parse_spec("")
+        raw, bad = triage_evidence(out.result.get("structured_output"), spec)
         try:
-            parsed = model.model_validate(out.result.get("structured_output"))
+            parsed = model.model_validate(raw)
         except ValidationError as e:
             self.store.update_session(s.id, status="failed")
             return None, str(e)[:1000]
         self.store.update_session(s.id, status="done")
+        if not self.store.is_replay(s.id):  # a replay belongs to no job or task
+            for i, why in bad:
+                self.store.add_event(
+                    "evidence_invalid",
+                    {"task_id": t.id, "role": role.value, "finding": i, "error": why},
+                    Provenance.CLAUDE, job_id=job.id, task_id=t.id,
+                )  # fmt: skip
         return parsed, ""
 
     # --- review replay (#47) ----------------------------------------------------------------
@@ -4991,7 +5014,13 @@ class JobRunner:
             assert isinstance(out, ReviewOutput)
             self.store.finish_replay(
                 rid, "done", verdict=out.verdict, cost_usd=cost,
-                findings=redact([f.model_dump(mode="json") for f in out.findings]),
+                findings=redact([
+                    f.model_dump(
+                        mode="json",
+                        exclude=None if f.evidence_invalid else _EVIDENCE_MARKS,
+                    )
+                    for f in out.findings
+                ]),
             )  # fmt: skip
         return self._replay_result(rid, rnd)
 
@@ -5162,8 +5191,8 @@ class JobRunner:
                 session_id=s.id, role=Role.COORD, job_id=job.id, task_id=None, repo=job.repo,
                 preset=preset, model=self.cfg.preset(preset).model or "", clone=clone,
                 session_dir=self._session_dir(s.id), max_turns=40, max_minutes=COORD_MINUTES,
-                max_budget_usd=amount, mounts=self.workspace.overlays(clone),
-                packet=packet.text, image=session_image,
+                max_budget_usd=self.sdk_budget(preset, amount),
+                mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
             out = self._run_session(

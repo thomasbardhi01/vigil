@@ -336,14 +336,28 @@ CHECKLIST = (
 )
 
 
-EvidenceKind = Literal["test", "diff_line", "spec_criterion", "runtime_log"]
+EvidenceKind = Literal["test", "diff_line", "spec_criterion", "spec_section", "runtime_log"]
 _DIFF_LINE = re.compile(r"^\S.*:L?\d+(-L?\d+)?$")  # path:12, path:L12, path:12-20
 _AC_ID = re.compile(r"^AC[-\s]?(\d+)$", re.IGNORECASE)  # AC3, AC-3, ac3, AC 3
+_GOAL_ITEM = re.compile(r"^goal\s*:?\s*([1-9]\d*)$")
+_SPEC_NAMES = frozenset({"done_when", "non_goals", "files_out_of_scope"})
+
+
+def normalise_spec_section(ref: str) -> str | None:
+    """`goal:N`, `done_when`, `non_goals` or `files_out_of_scope` from a ref in any case, with
+    spaces, `-` or `_` between words (`Goal 3`, `Non-goals`); None when it is none of them."""
+    low = ref.strip().lower()
+    m = _GOAL_ITEM.match(low)
+    if m is not None:
+        return f"goal:{m.group(1)}"
+    name = re.sub(r"[\s_-]+", "_", low)
+    return name if name in _SPEC_NAMES else None
 
 
 class Evidence(Strict):
     """What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,
-    `path:line`, an AC id (`AC3`) or a log excerpt id."""
+    `path:line`, an AC id (`AC3`), a spec section (`goal:3`, `done_when`, `non_goals`,
+    `files_out_of_scope`; #183) or a log excerpt id."""
 
     kind: EvidenceKind
     ref: str = Field(min_length=1, max_length=500)
@@ -359,6 +373,14 @@ class Evidence(Strict):
             if m is None:
                 raise ValueError("a spec_criterion evidence ref must be an AC id like AC3")
             self.ref = f"AC{m.group(1)}"
+        if self.kind == "spec_section":
+            ref = normalise_spec_section(self.ref)
+            if ref is None:
+                raise ValueError(
+                    "a spec_section evidence ref must be goal:N, done_when, non_goals or"
+                    " files_out_of_scope"
+                )
+            self.ref = ref
         return self
 
 
@@ -368,16 +390,35 @@ class Finding(Strict):
     line: int | None = Field(default=None, ge=0)
     claim: str = Field(min_length=1, max_length=4000)
     fix: str = Field(min_length=1, max_length=4000)
-    evidence: Evidence
+    evidence: Evidence | None = None
     confidence: float = Field(ge=0, le=1)
+    # #183: vigild sets these (never the model; the runner strips them from model output). A
+    # finding whose evidence failed validation is kept at its severity with `evidence` None.
+    evidence_invalid: bool = False
+    evidence_error: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _needs_evidence(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and data.get("evidence") is None
+            and not data.get("evidence_invalid")
+        ):
+            raise ValueError("evidence is required")
+        return data
 
 
 class StoredFinding(Finding):
     """A finding as read back from a stored artifact: one written before #105 has no evidence
     or confidence. New model output is parsed with `Finding`, never this."""
 
-    evidence: Evidence | None = None  # type: ignore[assignment]
     confidence: float | None = Field(default=None, ge=0, le=1)  # type: ignore[assignment]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _needs_evidence(cls, data: Any) -> Any:
+        return data
 
 
 class Checklist(Strict):

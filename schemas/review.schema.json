@@ -42,13 +42,14 @@
     },
     "Evidence": {
       "additionalProperties": false,
-      "description": "What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,\n`path:line`, an AC id (`AC3`) or a log excerpt id.",
+      "description": "What backs a finding (ADR-0006 C): its kind and a locator. The locator is a test id,\n`path:line`, an AC id (`AC3`), a spec section (`goal:3`, `done_when`, `non_goals`,\n`files_out_of_scope`; #183) or a log excerpt id.",
       "properties": {
         "kind": {
           "enum": [
             "test",
             "diff_line",
             "spec_criterion",
+            "spec_section",
             "runtime_log"
           ],
           "title": "Kind",
@@ -84,7 +85,33 @@
           "type": "number"
         },
         "evidence": {
-          "$ref": "#/$defs/Evidence"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Evidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "evidence_error": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Error"
+        },
+        "evidence_invalid": {
+          "default": false,
+          "title": "Evidence Invalid",
+          "type": "boolean"
         },
         "file": {
           "maxLength": 500,
@@ -120,7 +147,6 @@
         "file",
         "claim",
         "fix",
-        "evidence",
         "confidence"
       ],
       "title": "Finding",

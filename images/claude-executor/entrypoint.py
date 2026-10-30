@@ -456,11 +456,13 @@ def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
         "permission_mode": "bypassPermissions",
         "model": os.environ.get("VIGIL_MODEL"),
         "max_turns": int(os.environ.get("VIGIL_MAX_TURNS", "60")),
-        "max_budget_usd": float(os.environ.get("VIGIL_MAX_BUDGET_USD", "1.0")),
         "setting_sources": [],  # isolation: managed settings only; the packet carries CLAUDE.md
         "env": child_env,
         "stderr": stderr,  # piped to the harness, never the container's streams
     }
+    # set by vigild at container create, and not at all for a local preset
+    with contextlib.suppress(KeyError, ValueError):
+        opts["max_budget_usd"] = float(os.environ["VIGIL_MAX_BUDGET_USD"])
     opts["include_hook_events"] = True  # the Stop hook's answers, in the stream (item 6)
     resume_id = os.environ.get("VIGIL_RESUME_SESSION") or None
     opts["session_store"] = TranscriptStore(token)
