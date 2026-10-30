@@ -107,6 +107,7 @@ from vigild.jobs.acceptance import (
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec, render
 from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
 from vigild.jobs.bench import TAGS as BENCH_TAGS
+from vigild.jobs.cause import local_failure
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.evidence import executor_block, failure_diagnostic, without_executor
 from vigild.jobs.fixfindings import selectable
@@ -3025,7 +3026,15 @@ class JobRunner:
         if s is not None:
             self.store.update_session(s.id, status=state)
         self.store.update_task(task_id, state=state)
-        why = redact({"title": title, **body})
+        extra: dict[str, Any] = {}
+        preset = s.backend_preset if s is not None else None
+        if (
+            s is not None
+            and preset in self.cfg.backends.presets  # a deps job's session has no preset
+            and self.cfg.preset(preset).locality == "local"
+        ):
+            extra = local_failure(self.store, s.id, preset)  # #181: the page names why
+        why = redact({"title": title, **body, **extra})
         with self._why_lock:
             self._why[task_id] = why
         self.store.add_event("task_failed", why, Provenance.HUMAN, job_id=job_id, task_id=task_id)

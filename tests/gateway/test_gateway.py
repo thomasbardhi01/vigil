@@ -974,3 +974,13 @@ def test_every_upstream_url_is_built_one_way_for_each_kind(cfg: Config) -> None:
     tower, sonnet = cfg.preset("tower-qwen"), cfg.preset("claude-sonnet")
     assert Gateway._upstream_url(tower, "/v1/messages") == "http://tower:8080/v1/messages"
     assert Gateway._upstream_url(sonnet, "/v1/messages") == "https://api.anthropic.com/v1/messages"
+
+
+def test_an_upstream_error_leaves_an_event_for_the_page_cause(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    sid, tok = _session(store, budget, gw)
+    upstream.status = 503
+    assert client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 503
+    rows = store.q("SELECT data FROM events WHERE type='upstream_error' AND session_id=?", (sid,))
+    assert len(rows) == 1 and json.loads(rows[0]["data"])["status"] == 503

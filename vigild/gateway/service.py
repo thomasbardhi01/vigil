@@ -632,6 +632,15 @@ class Gateway:
             raise GatewayError(503, "api_error", f"{preset.key_ref} is not set in the env file")
         return key
 
+    def _upstream_error(self, gs: GatewaySession, data: dict[str, Any]) -> None:
+        """The backend's own failure for a session's call (an HTTP status with the
+        start of its body, or a transport error class): a call that has no
+        `model_calls` row. A page's `cause` is read from it (#181)."""
+        self.store.add_event(
+            "upstream_error", redact(data), Provenance.HUMAN,
+            job_id=gs.job_id, session_id=gs.session_id, task_id=gs.task_id,
+        )  # fmt: skip
+
     def _refuse(self, gs: GatewaySession, err: GatewayError) -> GatewayError:
         self.store.add_event(
             "gateway_refused",
@@ -763,6 +772,7 @@ class Gateway:
         except httpx2.TransportError as e:  # a timeout or a dropped connection
             self.release(hold)
             self._upstream(gs.preset, False, type(e).__name__, gs.session_id)
+            self._upstream_error(gs, {"error": type(e).__name__})
             raise
         except BaseException:
             self.release(hold)
@@ -809,6 +819,10 @@ class Gateway:
         try:
             data = await resp.aread()
             await resp.aclose()
+            if resp.status_code != 200:
+                self._upstream_error(
+                    gs, {"status": resp.status_code, "message": data[:300].decode(errors="replace")}
+                )
             if resp.status_code == 200:
                 try:
                     payload = json.loads(data)
