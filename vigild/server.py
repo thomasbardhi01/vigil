@@ -20,12 +20,13 @@ import uvicorn
 from vigild import config
 from vigild.api.app import create_app
 from vigild.budget import Budget
-from vigild.config import Config, Secrets
+from vigild.config import Config, ConfigError, Secrets
 from vigild.db import Store
 from vigild.devimage import DevImages
 from vigild.gateway.app import create_gateway_app
 from vigild.gateway.private import private_config
 from vigild.gateway.service import Gateway
+from vigild.jobs import rulings
 from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService, Runner
 from vigild.services import Services, Tokens
@@ -82,6 +83,9 @@ class NullRunner:
     def prepare_fix(self, job_id: str, task_id: str) -> int:
         raise RuntimeError("no runner attached")
 
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        raise RuntimeError("no runner attached")
+
     def replay_review(
         self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
     ) -> dict[str, Any]:
@@ -103,6 +107,18 @@ class Vigild:
     gateway: Gateway
     telemetry: Telemetry
     services: Services
+
+
+def refuse_coord_collision(tokens: Tokens) -> None:
+    """The coord token must differ from every other token: `identify` would read a shared
+    value as the owner's (first match wins). Names only, never values (#146)."""
+    for name, other in (
+        ("VIGIL_API_TOKEN", tokens.admin),
+        ("VIGIL_METRICS_TOKEN", tokens.read),
+        ("VIGIL_HEARTBEAT_TOKEN", tokens.heartbeat),
+    ):
+        if tokens.coord and tokens.coord == other:
+            raise ConfigError(f"VIGIL_COORD_TOKEN is the same as {name}; they must differ")
 
 
 def build(
@@ -135,7 +151,9 @@ def build(
         admin=secrets.get("VIGIL_API_TOKEN"),
         read=secrets.get("VIGIL_METRICS_TOKEN"),
         heartbeat=secrets.get("VIGIL_HEARTBEAT_TOKEN"),
+        coord=secrets.get("VIGIL_COORD_TOKEN"),
     )
+    refuse_coord_collision(tokens)
     jobs = JobService(cfg, store, runner or NullRunner())
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs, degraded=off)
     for f in sorted(off):
@@ -293,6 +311,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     v.services.jobs.files = files
     # the same mirror tells the gate which scope entries are directories
     v.services.jobs.dirs = lambda repo, base: lambda path: ws.mirror_is_dir(repo, base, path)
+    # the coord token's rulings: docs/owner-rulings.md on main, from the mirror (#146)
+    v.services.rulings_source = rulings.from_mirror(ws)
     return runner
 
 
@@ -313,6 +333,11 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
     threading.Thread(
         target=every, args=(RESERVATION_SWEEP_SECONDS, runner.page_stranded_drafts_sweep, stop),
         name="vigil-stranded", daemon=True,
+    ).start()  # fmt: skip
+    # a validated rebuild (the CLI's too) releases a stale-image hold
+    threading.Thread(
+        target=every, args=(RESERVATION_SWEEP_SECONDS, runner.release_stale_images, stop),
+        name="vigil-stale-images", daemon=True,
     ).start()  # fmt: skip
     if runner.pr_state is not None:
         # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
@@ -399,6 +424,8 @@ def main() -> None:
     log.info("reconcile: %s", runner.reconcile())
 
     def ready() -> None:
+        # a deploy whose rebuild failed: hold the repo's dispatch behind one page
+        log.info("stale images held: %s", runner.hold_stale_images())
         runner.start_deferred()
         start_pollers(v, app, runner)
 

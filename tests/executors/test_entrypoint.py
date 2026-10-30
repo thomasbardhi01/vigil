@@ -527,3 +527,21 @@ def test_a_cli_that_exits_leaves_its_redacted_stderr_tail_on_the_result_line(
     tail = result["cli_stderr_tail"]
     assert "pids: cannot fork" in tail and len(tail.encode()) <= 2000
     assert secret not in tail and "[redacted]" in tail
+
+
+def test_the_sdk_budget_comes_only_from_the_env_vigild_sets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ep = _entrypoint()
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_MAX_TURNS", "12")
+    monkeypatch.setenv("VIGIL_MAX_BUDGET_USD", "0.75")
+    opts = ep.agent_options("worker", TOKEN, print)
+    assert opts["max_budget_usd"] == 0.75 and opts["max_turns"] == 12
+    monkeypatch.delenv("VIGIL_MAX_BUDGET_USD")  # a local preset: vigild sets none
+    (tmp_path / ".vigil").mkdir()
+    (tmp_path / ".vigil" / "task.json").write_text('{"max_budget_usd": 9}')  # a worker's file
+    opts = ep.agent_options("worker", TOKEN, print)
+    assert "max_budget_usd" not in opts and opts["max_turns"] == 12
+    monkeypatch.setenv("VIGIL_MAX_BUDGET_USD", "lots")  # not a number: ignored
+    assert "max_budget_usd" not in ep.agent_options("worker", TOKEN, print)

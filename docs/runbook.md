@@ -65,6 +65,7 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | **You generate it** (below), with the `a1` prefix. Two runs of the command never give the same value, so it differs from `PHOENIX_SECRET`, which Phoenix requires. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
 | `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD` | Your Phoenix login (user `admin`) on first start. | Choose it. Changing it later has no effect; change the password in Phoenix. | 127.0.0.1 / `tailscale serve` only. | 1 | — |
 | `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | **You generate it** (below). | Full control of vigild. | 1 | `GET /api/health` → 200 |
+| `VIGIL_COORD_TOKEN` | The coord's own bearer token (issue #146): vigild records its approvals as `coord` over `mcp`; it must cite a ruling to approve and is refused for caps, rungs, merges and pinned specs. A client uses it when `VIGIL_API_ROLE=coord` (`vigil` CLI, `vigil mcp`). | **You generate it** (as `VIGIL_API_TOKEN`; it must differ). | Admin, except as listed. | 2 | `vigil doctor` |
 | `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | **You generate it** (below). Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
 | `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | **You generate it** (below). | Write heartbeats; nothing else. | 3 | — |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention): the decider route for **private** repos only. No repo lists it while both are public, and `vigil doctor` skips these then. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | skipped unless a repo lists `jev-cloudflare`; then reported missing |
@@ -817,6 +818,39 @@ GitHub). It logs to `~/vigil-data/logs/vigild.log`. The template is
   `launchctl kill` alone isn't enough: `KeepAlive` starts it again.
 - The log isn't rotated; truncate it with `: > ~/vigil-data/logs/vigild.log`
   when it grows.
+
+### Deploy production vigild
+
+Production runs from its own clone, `~/vigil-prod` (`$VIGIL_PROD_DIR`), that
+only `scripts/deploy.sh` writes to. Coord never runs git there. The owner
+points the launchd plist's `WorkingDirectory` at it.
+
+```sh
+scripts/deploy.sh [--prod-dir DIR] [--data-dir DIR] [--no-rebuild] [--dry-run]
+```
+
+In order, stopping at the first failure:
+1. **Idle check.** No job `building` or `in_review`, no session `running` or
+   `starting`, no `dev.vigil.job` container. Otherwise it names them and
+   exits 2 having changed nothing.
+2. **Fetch**, then decide from `git diff HEAD origin/main` before merging;
+   a dirty clone or a non-fast-forward stops it with vigild untouched.
+3. **Restart.** If the range touches `images/`, `prompts/`, `pyproject.toml`
+   or `uv.lock` (and `--no-rebuild` isn't set): `launchctl bootout`, then
+   fast-forward, rebuild each configured repo's dev image (`--rebuild`),
+   `launchctl bootstrap` the plist, then wait up to 60 s for
+   `127.0.0.1:8787`. vigild stays down during the rebuild so no job resumes
+   against stale images. A failed rebuild still starts vigild and exits
+   non-zero naming the repo: at start vigild finds the session image not
+   fresh, holds that repo's dispatch and pages once, "<repo>: image not
+   fresh after deploy" (Rebuild or Dismiss); a validated rebuild releases it. Otherwise: fast-forward and
+   `launchctl kickstart -k`.
+4. **`vigil doctor`.** A fail line makes the exit non-zero; nothing is undone.
+5. (The rebuild is folded into step 3 when image inputs changed.)
+6. **Summary:** `production <old> -> <new>` and the range's log.
+
+`--dry-run` prints the steps and changes nothing. The morning report carries
+a line `production <sha> / main <sha>`; they differ when a deploy is pending.
 
 ### Start vigild
 

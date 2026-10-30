@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -100,3 +101,46 @@ def test_a_new_review_without_evidence_is_still_refused() -> None:
     with pytest.raises(ValidationError) as e:
         ReviewOutput.model_validate(doc)
     assert "evidence" in str(e.value)
+
+
+@pytest.mark.parametrize(
+    ("ref", "want"),
+    [
+        ("goal:3", "goal:3"),
+        ("Goal: 3", "goal:3"),
+        (" GOAL 3 ", "goal:3"),
+        ("done_when", "done_when"),
+        ("Done When", "done_when"),
+        ("non-goals", "non_goals"),
+        ("Files out of scope", "files_out_of_scope"),
+    ],
+)
+def test_a_spec_section_ref_is_normalised(ref: str, want: str) -> None:
+    f = Finding.model_validate({**GOOD, "evidence": {"kind": "spec_section", "ref": ref}})
+    assert f.evidence is not None and f.evidence.ref == want
+
+
+@pytest.mark.parametrize("ref", ["goal", "goal:x", "goal:0", "Goal item three", "risks", "AC3"])
+def test_an_ill_formed_spec_section_ref_is_refused(ref: str) -> None:
+    with pytest.raises(ValidationError):
+        Finding.model_validate({**GOOD, "evidence": {"kind": "spec_section", "ref": ref}})
+
+
+def test_an_old_review_and_audit_written_before_spec_section_still_load() -> None:
+    """#183: stored files predate `spec_section`, `evidence_invalid` and `evidence_error`."""
+    from vigild.contract.models import CHECKLIST, StoredAudit, StoredReview
+
+    common = {"task_id": "j-w1", "job_id": "j", "head": "a" * 40, "shape": "docs", "rung": 0,
+              "provenance": "claude"}  # fmt: skip
+    old = {**BASE, "evidence": {"kind": "spec_criterion", "ref": "AC3"}, "confidence": 0.7}
+    rv = StoredReview.model_validate_json(
+        json.dumps({**common, "verdict": "changes", "findings": [old, BASE], "round": 1,
+                    "audit_required": False, "reviewer": "r",
+                    "checklist": {c: True for c in CHECKLIST}})
+    )  # fmt: skip
+    assert rv.findings[0].evidence_invalid is False and rv.findings[1].evidence is None
+    au = StoredAudit.model_validate_json(
+        json.dumps({**common, "auditor": "a", "findings": [{**old, "matched": 0}],
+                    "false_findings": []})
+    )  # fmt: skip
+    assert au.findings[0].evidence_error is None

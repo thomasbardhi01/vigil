@@ -419,6 +419,16 @@ def run_checks(
         )
     else:
         out.append(Check("VIGIL_API_TOKEN", False, "missing"))
+    # the coord's own token (#146): present, and not the owner's (vigild would read it as
+    # the owner). Names and pass/fail only.
+    coord = secrets.get("VIGIL_COORD_TOKEN")
+    out.append(
+        Check("VIGIL_COORD_TOKEN", False, "missing")
+        if not coord
+        else Check("VIGIL_COORD_TOKEN", False, "same as VIGIL_API_TOKEN")
+        if coord == token
+        else Check("VIGIL_COORD_TOKEN", True)
+    )
 
     if docker is None:
         out.append(Check("Docker", None, "not checked"))

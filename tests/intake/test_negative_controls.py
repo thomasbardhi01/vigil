@@ -90,6 +90,15 @@ PINNED: dict[str, dict[str, tuple[list[str], list[str]]]] = {
                 "Configs/budgets.yaml",
             ],
         ),
+        "docs/owner-rulings.md": (
+            ["docs/owner-rulings.md"],
+            [
+                "docs/owner-rulings.md.bak",
+                "docs/owner-ruling.md",
+                "docs/Owner-Rulings.md",
+                "x/docs/owner-rulings.md",
+            ],
+        ),
         "vigild/review/ladder.py": (
             ["vigild/review/ladder.py"],
             [

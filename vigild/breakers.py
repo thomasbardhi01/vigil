@@ -19,6 +19,7 @@ success closes it.
 | verifier_unknowns | repo:<name> | M `unknown` verdicts in a row |
 | decider_credit | route:jev-cloudflare | Cloudflare answers 2021: the route is off until reset |
 | decider_fallback_cap | repo:<name> | a Haiku fallback call would cross the repo's day cap |
+| stale_image | repo:<name> | at start, the repo's session image isn't fresh at main's key |
 
 **A read never moves a breaker** (review B6, A11): `is_open` and `blocking`
 only report. A backend breaker past its cool-down is `probe_ready`; its one
@@ -60,11 +61,20 @@ class Kind(StrEnum):
     # Jev costs cents a day; a repo's Haiku fallback crossing $1 means it has
     # drifted or is failing (owner ruling 4)
     DECIDER_FALLBACK = "decider_fallback_cap"
+    # a deploy left a repo's session image not fresh at main's key: its dispatch
+    # is held until a validated rebuild record for that key exists
+    STALE_IMAGE = "stale_image"
 
 
 GLOBAL = "global"
 GLOBAL_KINDS = (Kind.DAILY, Kind.MONTHLY, Kind.ESCALATIONS)
-REPO_KINDS = (Kind.WIP, Kind.REPO_FAILURES, Kind.VERIFIER_UNKNOWNS, Kind.DECIDER_FALLBACK)
+REPO_KINDS = (
+    Kind.WIP,
+    Kind.REPO_FAILURES,
+    Kind.VERIFIER_UNKNOWNS,
+    Kind.DECIDER_FALLBACK,
+    Kind.STALE_IMAGE,
+)
 CAP_KIND = {"daily": Kind.DAILY, "monthly": Kind.MONTHLY, "per_task": Kind.PER_TASK}
 
 
@@ -209,9 +219,10 @@ class Breakers:
         job_id: str | None = None,
         actions: tuple[str, ...] = ("reset", "abandon"),
         title: str | None = None,
+        page: dict[str, Any] | None = None,
     ) -> Breaker:
         """Open the breaker. It pages once: tripping an open breaker again adds
-        nothing to the inbox."""
+        nothing to the inbox. `page` adds to (or overrides) the page body."""
         with self.store.lock:
             b = self._ensure(kind, scope)
             if b.state in ("open", "half_open"):
@@ -230,6 +241,7 @@ class Breakers:
                         "scope": scope,
                         "detail": detail,
                         "actions": list(actions),
+                        **(page or {}),
                     },
                 )
                 item_id = getattr(item, "id", None)

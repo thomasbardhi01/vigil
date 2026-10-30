@@ -31,6 +31,14 @@ class Actor(StrEnum):
     COORD = "coord"
 
 
+def owner_side(actor: Actor, channel: str | None) -> bool:
+    """The owner from the inbox, or the coord token over mcp (#146): the two callers of
+    the inbox's actions. Overrides (`force`) stay the owner's from the inbox alone."""
+    return (actor is Actor.OWNER and channel == "inbox") or (
+        actor is Actor.COORD and channel == "mcp"
+    )
+
+
 class TransitionError(Exception):
     pass
 
@@ -49,9 +57,11 @@ Guard = Callable[[Ctx], list[str]]
 
 def _approval(c: Ctx) -> list[str]:
     errs: list[str] = []
-    if c.actor is not Actor.OWNER:
+    # the coord token (#146) approves over mcp, citing a ruling; everyone else is the owner
+    coord = c.actor is Actor.COORD and c.channel == "mcp" and bool(c.evidence.get("ruling"))
+    if c.actor is not Actor.OWNER and not coord:
         errs.append("only the owner approves a spec")
-    if c.channel != "inbox":
+    if c.channel != "inbox" and not coord:
         errs.append("approval happens only from the inbox")
     for name in ("spec.md", "plan.md"):
         if c.store.get_artifact(c.job.id, name) is None:
@@ -210,7 +220,7 @@ def _owner_fix(c: Ctx) -> list[str]:
     """The owner, from the inbox, sends a reviewed PR back with findings they chose
     ("fix with findings"); the standard fix round follows."""
     errs: list[str] = []
-    if c.actor is not Actor.OWNER or c.channel != "inbox":
+    if not owner_side(c.actor, c.channel):
         errs.append("only the owner, from the inbox, sends a ready job back for a fix")
     if c.evidence.get("action") != "fix":
         errs.append("a fix from ready needs action=fix")
@@ -274,7 +284,10 @@ def _killed(c: Ctx) -> bool:
     """The owner's kill, from the CLI or the API: the one way out of any live state,
     held ones included (a job that is stuck is the case it is for)."""
     return (
-        c.actor is Actor.OWNER and c.channel in KILL_CHANNELS and c.evidence.get("action") == "kill"
+        c.actor in (Actor.OWNER, Actor.COORD)
+        and c.channel in KILL_CHANNELS
+        and (c.actor is Actor.OWNER or c.channel == "mcp")
+        and c.evidence.get("action") == "kill"
     )
 
 
@@ -285,7 +298,7 @@ def _kill_guard(c: Ctx) -> list[str]:
 def _abandon(c: Ctx) -> list[str]:
     if _killed(c):
         return []
-    if c.actor is not Actor.OWNER or c.channel != "inbox":
+    if not owner_side(c.actor, c.channel):
         return ["only the owner, from the inbox, abandons a job"]
     return [] if c.evidence.get("action") == "abandon" else ["abandoning needs action=abandon"]
 
@@ -333,7 +346,7 @@ FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon", S.MERGED: "prs_me
 # once the deps job it waits on merged (round 3) or once a backend breaker's
 # probe closed it (review B6), and record it merged once the owner merged
 # every PR of it by hand (review B7). Everything else is the owner's.
-VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged")
+VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged", "image_fresh")
 NEVER_FORCED = {(S.SPEC_PENDING, S.APPROVED)}
 
 
@@ -353,6 +366,7 @@ def transition(
         frm = job.state
         ctx = Ctx(store, job, actor, channel, evidence)
         owner_inbox = actor is Actor.OWNER and channel == "inbox"
+        owner_side_ok = owner_side(actor, channel)
         blocked_from: JobState | None = None
         kill_hold = frm in HOLDS and to is S.ABANDONED and _killed(ctx)
 
@@ -407,7 +421,7 @@ def transition(
                 errors = _merged_by_hand(ctx)
                 if errors:
                     raise TransitionError("; ".join(errors))
-            if not owner_inbox and not vigild_may:
+            if not owner_side_ok and not vigild_may:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
             # the same invariant on the way back in: a held job resumes into review
             # only if its plan still has a PR for every task

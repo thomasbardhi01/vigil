@@ -368,3 +368,14 @@ def test_the_stop_hooks_inputs_live_in_a_root_owned_tmpfs(cfg: Config, spec: Ses
     opts = kw["tmpfs"][HOOK_DIR]
     assert HOOK_DIR == "/run/vigil" and "uid=0" in opts and "mode=0755" in opts
     assert kw["environment"]["VIGIL_HOOK_DIR"] == HOOK_DIR
+
+
+def test_the_sdk_budget_reaches_the_container_env_only_when_set(
+    cfg: Config, spec: SessionSpec
+) -> None:
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    assert env["VIGIL_MAX_BUDGET_USD"] == "1.0"
+    spec.max_budget_usd = None  # a local preset: no SDK budget
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    assert "VIGIL_MAX_BUDGET_USD" not in env
+    assert env["VIGIL_MAX_TURNS"] == "30"

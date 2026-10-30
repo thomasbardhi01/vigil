@@ -41,7 +41,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -131,6 +131,7 @@ from vigild.repos import (
     live_private,
     repo_rule_errors,
 )
+from vigild.review.evidence import triage_evidence
 from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.review.replay import (
     ReplayInvalid,
@@ -151,6 +152,12 @@ from vigild.workspace import Workspace, WorkspaceError
 log = logging.getLogger("vigild.runner")
 
 
+def live_task_count(tasks: Iterable[Any]) -> int:
+    """A job's tasks that are still its work: a replan's superseded workers and abandoned
+    ones don't count (one live task's PR closes the job's issue)."""
+    return sum(1 for t in tasks if t.state not in ("superseded", "abandoned"))
+
+
 @dataclass(frozen=True)
 class ReviewInputs:
     """What a reviewer's packet is made of (see `JobRunner._review_inputs`)."""
@@ -164,6 +171,9 @@ class ReviewInputs:
 # the draft PR title of a runner-file task while hidden tests are off (host policy)
 OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
 PR_TITLE_MAX = 200  # GitHub refuses a title over 256 characters (422)
+
+
+_EVIDENCE_MARKS = {"evidence_invalid", "evidence_error"}  # #183: only an invalid one shows them
 
 
 def pr_title(job_id: str, goal: str) -> str:
@@ -269,6 +279,11 @@ def as_outcome(run: dict[str, Any] | None) -> TestOutcome:
     if got in ("fail", "timeout"):
         return TestOutcome.FAIL
     return TestOutcome.UNKNOWN
+
+
+class RepublishRefused(ValueError):
+    """The owner's republish can't go ahead: the verifier's record and the vault disagree,
+    or one is missing."""
 
 
 class JobRunner:
@@ -786,6 +801,7 @@ class JobRunner:
                 self.session_images.ensure_fresh(repo, base_sha, force=True)
             else:
                 self.dev_images.ensure_fresh(repo, base_sha, force=True)
+            self.release_stale_images()
 
         def safe(j: str) -> None:
             try:
@@ -898,6 +914,81 @@ class JobRunner:
         breaker paged once); resetting the breaker resumes it."""
         self._block(job_id, f"breaker {b.kind.value} ({b.scope})")
         self.breakers.hold(b, job_id)
+
+    # --- stale images after a deploy -------------------------------------------------------
+
+    def _image_state(self, repo: str) -> tuple[bool, str, str | None, str]:
+        """(fresh, session key at main, newest validated session key, main's tip):
+        the check doctor runs ("session image fresh")."""
+        from vigild.doctor import stale_image_checks
+
+        assert self.session_images is not None
+        tip = self.workspace.head_sha(repo, "main")
+        checks = stale_image_checks(self.dev_images, self.session_images, repo, tip)
+        key = self.session_images.key(self.dev_images.tag(repo, self.dev_images.key(repo, tip)))
+        newest = self.dev_images.newest_validated(repo, ("session-validate",))
+        return all(c.ok for c in checks), key, (newest["key"] if newest else None), tip
+
+    def hold_stale_images(self) -> list[str]:
+        """At start: a repo whose session image isn't fresh at main's key (a
+        deploy whose rebuild failed) gets a `stale_image` hold: one page,
+        "image not fresh after deploy", and its dispatch paused. Returns the
+        repos held."""
+        held: list[str] = []
+        if self.session_images is None:
+            return held
+        for repo in self.cfg.repos.repos:
+            try:
+                fresh, key, newest, tip = self._image_state(repo)
+            except Exception:
+                log.exception("stale-image check failed for %s", repo)
+                continue
+            if fresh:
+                continue
+            held.append(repo)
+            self.breakers.trip(
+                Kind.STALE_IMAGE,
+                f"repo:{repo}",
+                {"key": key, "newest_validated": newest},
+                actions=("rebuild", "dismiss"),
+                title=f"{repo}: image not fresh after deploy",
+                page={
+                    "kind": "dev_image",
+                    "repo": repo,
+                    "key": key,
+                    "base_sha": tip,
+                    "image": key[:16],
+                    "stage": "session-validate",
+                    "failed_suites": [],
+                    "detail": {"key": key, "newest_validated": newest},
+                },
+            )
+        return held
+
+    def release_stale_images(self) -> list[str]:
+        """A validated rebuild record for the key releases the hold, and the jobs
+        it held resume. Returns the repos released."""
+        released: list[str] = []
+        if self.session_images is None:
+            return released
+        for b in self.breakers.open_breakers():
+            if b.kind is not Kind.STALE_IMAGE:
+                continue
+            repo = b.scope.removeprefix("repo:")
+            try:
+                fresh = self._image_state(repo)[0]
+            except Exception:
+                log.exception("stale-image check failed for %s", repo)
+                continue
+            if not fresh:
+                continue
+            with self.store.lock:
+                if self.breakers._page_open(b):
+                    self.store.resolve_inbox_item(int(b.item_id or 0), "vigild")
+                held = self.breakers.reset(b.id)
+            self._resume_held(held, Actor.VIGILD, {"action": "image_fresh", "repo": repo})
+            released.append(repo)
+        return released
 
     def on_breaker_reset(self, breaker_id: int, item_id: int) -> dict[str, list[str]]:
         """The owner reset a breaker from the inbox: every job it held goes
@@ -1810,7 +1901,9 @@ class JobRunner:
             session_dir=self._session_dir(coord.id),
             max_turns=40,
             max_minutes=COORD_MINUTES,
-            max_budget_usd=self.cfg.budgets.coord_session_usd,
+            max_budget_usd=self.sdk_budget(
+                coord.backend_preset or "", self.cfg.budgets.coord_session_usd
+            ),
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
@@ -2165,7 +2258,7 @@ class JobRunner:
                 repo=job.repo, preset=preset, model=self.cfg.preset(preset).model or "",
                 clone=clone, session_dir=self._session_dir(s.id), max_turns=40,
                 max_minutes=COORD_MINUTES,
-                max_budget_usd=amount,
+                max_budget_usd=self.sdk_budget(preset, amount),
                 mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
@@ -2617,6 +2710,13 @@ class JobRunner:
         )
         raw_len = int(row["n"] or 0) * CHARS_PER_TOKEN
         return worst_case_usd(prices, model, raw_len, MIN_OUTPUT_TOKENS)
+
+    def sdk_budget(self, preset: str, usd: float) -> float | None:
+        """The Agent SDK's `max_budget_usd` for a session on `preset`. A local
+        backend gets none: the CLI prices a model it doesn't know with a
+        fallback and would stop a session whose real spend is $0. Locality is
+        `configs/backends.yaml`'s answer alone; the gateway caps every call."""
+        return None if self.cfg.preset(preset).locality == "local" else usd
 
     def out_of_cap(self, task_id: str) -> str | None:
         """Why a worker session can't start for this task: what is left of its cap can't
@@ -3123,7 +3223,7 @@ class JobRunner:
             session_dir=self._session_dir(s.id),
             max_turns=max_turns,
             max_minutes=WORKER_MINUTES,
-            max_budget_usd=amount,  # what's left of the task's cap (N5)
+            max_budget_usd=self.sdk_budget(preset, amount),  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
@@ -3382,6 +3482,21 @@ class JobRunner:
             session_base=session_base,
             on_findings=lambda found: self._integrity_findings(job_id, task_id, s.id, found),
         )
+        # the stage's own verdict on this head, whatever follows (pass, fail, escalate): the
+        # owner's republish gates on it
+        self.store.add_event(
+            "acceptance",
+            {
+                "task": task_id,
+                "head": head,
+                "accepted": not errors,
+                "errors": [redact(str(e))[:300] for e in errors[:10]],
+            },
+            Provenance.HUMAN,
+            job_id=job_id,
+            session_id=s.id,
+            task_id=task_id,
+        )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
             self.store.add_event(
@@ -3403,20 +3518,48 @@ class JobRunner:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: stage 3 acceptance failed", {"errors": errors}
             )
+        pub = self._pub_inputs(
+            job, t, report, tests, head, base_sha, branch, overlap, hidden_on, pr_url
+        )
+        return self._publish_task(job, s, task_id, pub)
+
+    def _pub_inputs(
+        self,
+        job: Job,
+        t: Any,
+        report: WorkerReport,
+        tests: dict[str, Any] | None,
+        head: str,
+        base_sha: str,
+        branch: str,
+        overlap: list[str],
+        hidden_on: bool,
+        pr_url: str | None,
+    ) -> dict[str, Any]:
+        """What `_publish_task` needs for a verified, accepted head: the one place the PR
+        body and the owner-review flag are built, for the post-verify path and for the
+        owner's republish of a verified head."""
+        contract = t.contract
         runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests, hidden_on)
+        # The job row's own issue number (an int vigild stored), never text a worker wrote.
+        # One task closes the issue; with more, each PR only refs it, or the first merge
+        # would close it early.
+        issue_line = ""
+        if job.issue is not None:
+            verb = "Closes" if live_task_count(self.store.list_tasks(job.id)) == 1 else "Refs"
+            issue_line = f"{verb} #{int(job.issue)}\n\n"
         body = (
-            f"{report.summary}\n\n{runner_note}Job `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
-            f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
+            f"{report.summary}\n\n{issue_line}{runner_note}Job `{job.id}`, task `{t.id}` "
+            f"(tier `{t.tier}`: {t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
             f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
-        pub = {
+        return {
             "head": head, "base_sha": base_sha, "branch": branch, "body": body,
             "owner_review": bool(overlap and not hidden_on), "pr_url": pr_url,
             "runner_file_change": overlap,
         }  # fmt: skip
-        return self._publish_task(job, s, task_id, pub)
 
     def _publish_task(self, job: Job, s: SessionRow, task_id: str, pub: dict[str, Any]) -> bool:
         """Publish a verified, accepted head and open the task's PR. On a refusal the
@@ -3472,9 +3615,41 @@ class JobRunner:
             )
         return True
 
+    def _owner_event(self, task_id: str) -> tuple[int, dict[str, Any]] | None:
+        """The task's latest `owner_republish` event, if no `republish` event has consumed
+        it (the `republish` event records the id it consumed) and the task has not failed
+        since: a later `task_failed` (a vigild error during the publish, say) ends the
+        owner's request, so a retry after it starts a session, never the old head."""
+        rows = self.store.q(
+            "SELECT id, data FROM events WHERE task_id=? AND type='owner_republish' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        if not rows:
+            return None
+        eid = int(rows[0]["id"])
+        if self.store.q(
+            "SELECT 1 FROM events WHERE task_id=? AND type='task_failed' AND id>? LIMIT 1",
+            (task_id, eid),
+        ):
+            return None
+        for r in self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='republish' AND id>?", (task_id, eid)
+        ):
+            if json.loads(r["data"]).get("owner_event") == eid:
+                return None
+        return eid, json.loads(rows[0]["data"])
+
     def _republish_inputs(self, task_id: str) -> dict[str, Any] | None:
         """What a task's last publish refusal kept, if that refusal is its latest failure:
-        its result was imported, verified and accepted, so only the publish is retried."""
+        its result was imported, verified and accepted, so only the publish is retried.
+        The owner's republish (an unconsumed `owner_republish` event) comes first, its
+        inputs rebuilt from vigild's records."""
+        if self._owner_event(task_id) is not None:
+            try:
+                return self._owner_inputs(str(self.store.get_task(task_id).job_id), task_id)
+            except RepublishRefused:
+                log.warning("owner republish of %s no longer holds", task_id)
         rows = self.store.q(
             "SELECT type, data FROM events WHERE task_id=? "
             "AND type IN ('task_failed','publish_refused') ORDER BY id DESC LIMIT 2",
@@ -3496,6 +3671,7 @@ class JobRunner:
         pub = self._republish_inputs(task_id)
         s = self._last_worker(task_id)
         assert pub is not None and s is not None  # dispatch checked, before it set `running`
+        owner = self._owner_event(task_id)  # the owner's, consumed by this event
         try:
             ok = self._publish_task(job, s, task_id, pub)
         except Exception as e:  # vigild trouble: the task fails, nothing is left running
@@ -3508,11 +3684,72 @@ class JobRunner:
                 {"error": f"{type(e).__name__}: {e}"},
             )
         result = self._task_pr(task_id) if ok else self._why.get(task_id, {}).get("error")
+        data = {"task": task_id, "head": pub["head"], "result": result}
+        if owner is not None:
+            data["inbox_item_id"] = owner[1].get("inbox_item_id")
+            data["owner_event"] = owner[0]
         self.store.add_event(
-            "republish", {"task": task_id, "head": pub["head"], "result": result},
-            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            "republish", data, Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return ok
+
+    def _owner_inputs(self, job_id: str, task_id: str) -> dict[str, Any]:
+        """The publish inputs of a failed task's verified head, from vigild's records:
+        the verifier's `after.sha` must be the vault's `refs/vigil/<task>`, and a publish
+        attempt on record after that `tests.json` shows the head was accepted (the record
+        is written before acceptance, scope and integrity checks)."""
+        job = self.store.get_job(job_id)
+        t = self.store.get_task(task_id)
+        art = self.store.get_artifact(job_id, "tests.json", task_id)
+        try:
+            tests = json.loads(art.content) if art else None
+        except json.JSONDecodeError:
+            tests = None
+        after = ((tests or {}).get("after") or {}).get("sha")
+        if art is None or tests is None or not isinstance(after, str) or not after:
+            raise RepublishRefused(f"{task_id} has no verifier record with an after.sha")
+        ref = self.workspace.task_ref(job.repo, task_id)
+        if ref != after:
+            raise RepublishRefused(
+                f"{task_id}: the verifier's head is {after}, the vault's refs/vigil/{task_id} "
+                f"is {ref or 'missing'}"
+            )
+        verdict = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='acceptance' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        got = json.loads(verdict[0]["data"]) if verdict else None
+        if got is None or got.get("head") != after:
+            raise RepublishRefused(f"no acceptance verdict recorded for {after}")
+        if got.get("accepted") is not True:
+            first = (got.get("errors") or ["no reason recorded"])[0]
+            raise RepublishRefused(f"acceptance refused {after}: {first}")
+        raw = self.store.get_artifact(job_id, "worker_report.json", task_id)
+        if raw is None or self._last_worker(task_id) is None:
+            raise RepublishRefused(f"{task_id} has no worker report or session on record")
+        try:
+            report = WorkerReport.model_validate_json(raw.content)
+            base_sha = self.workspace.base_sha(task_id)
+        except (ValidationError, WorkspaceError, OSError, KeyError, ValueError) as e:
+            raise RepublishRefused(f"{task_id}: its record is unusable: {e}"[:300]) from e
+        overlap = [str(p) for p in tests.get("runner_files") or []]
+        return self._pub_inputs(
+            job, t, report, tests, after, base_sha, str(t.contract["branch"]), overlap,
+            not tests.get("hidden_disabled"),
+            self._task_pr(task_id) if self._task_head(task_id) else None,
+        )  # fmt: skip
+
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        """The owner's republish of a failed task's verified head: check vigild's records
+        and the vault (`_owner_inputs`), then record an `owner_republish` event the
+        dispatch that follows works from, restart or not. Refuses (`RepublishRefused`)
+        before anything is written."""
+        pub = self._owner_inputs(job_id, task_id)
+        self.store.add_event(
+            "owner_republish", {"task": task_id, "head": pub["head"], "inbox_item_id": item_id},
+            Provenance.HUMAN, job_id=job_id, task_id=task_id,
+        )  # fmt: skip
 
     # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 
@@ -4731,7 +4968,7 @@ class JobRunner:
             max_minutes=REVIEW_MINUTES,
             # the cap is checked call by call at the gateway, and a review may
             # go past it (owner, 2026-10-23): only the day stops the CLI
-            max_budget_usd=self.cfg.budgets.daily_usd,
+            max_budget_usd=self.sdk_budget(preset, self.cfg.budgets.daily_usd),
             mounts=self.workspace.overlays(clone),
             packet=packet,
             image=session_image,
@@ -4765,12 +5002,22 @@ class JobRunner:
         if out.status != "done":
             self.store.update_session(s.id, status="failed")
             return None, f"{role.value} session {out.status}: {(out.error or '')[:500]}"
+        spec_md = self.store.get_artifact(job.id, "spec.md")
+        spec = parse_spec(spec_md.content) if spec_md else parse_spec("")
+        raw, bad = triage_evidence(out.result.get("structured_output"), spec)
         try:
-            parsed = model.model_validate(out.result.get("structured_output"))
+            parsed = model.model_validate(raw)
         except ValidationError as e:
             self.store.update_session(s.id, status="failed")
             return None, str(e)[:1000]
         self.store.update_session(s.id, status="done")
+        if not self.store.is_replay(s.id):  # a replay belongs to no job or task
+            for i, why in bad:
+                self.store.add_event(
+                    "evidence_invalid",
+                    {"task_id": t.id, "role": role.value, "finding": i, "error": why},
+                    Provenance.CLAUDE, job_id=job.id, task_id=t.id,
+                )  # fmt: skip
         return parsed, ""
 
     # --- review replay (#47) ----------------------------------------------------------------
@@ -4856,7 +5103,13 @@ class JobRunner:
             assert isinstance(out, ReviewOutput)
             self.store.finish_replay(
                 rid, "done", verdict=out.verdict, cost_usd=cost,
-                findings=redact([f.model_dump(mode="json") for f in out.findings]),
+                findings=redact([
+                    f.model_dump(
+                        mode="json",
+                        exclude=None if f.evidence_invalid else _EVIDENCE_MARKS,
+                    )
+                    for f in out.findings
+                ]),
             )  # fmt: skip
         return self._replay_result(rid, rnd)
 
@@ -5027,8 +5280,8 @@ class JobRunner:
                 session_id=s.id, role=Role.COORD, job_id=job.id, task_id=None, repo=job.repo,
                 preset=preset, model=self.cfg.preset(preset).model or "", clone=clone,
                 session_dir=self._session_dir(s.id), max_turns=40, max_minutes=COORD_MINUTES,
-                max_budget_usd=amount, mounts=self.workspace.overlays(clone),
-                packet=packet.text, image=session_image,
+                max_budget_usd=self.sdk_budget(preset, amount),
+                mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
             out = self._run_session(

@@ -314,3 +314,10 @@ def test_the_workers_schema_leaves_out_the_executor_field(clone: Path) -> None:
     p = assemble_worker(clone, _contract(), untrusted={})
     assert '"executor"' not in p.parts["output_schema"]
     assert '"self_check"' in p.parts["output_schema"]
+
+
+def test_reviewer_and_auditor_prompts_name_spec_section_for_non_ac_points() -> None:
+    for role in ("reviewer", "auditor"):
+        text = " ".join((PROMPTS_DIR / f"{role}.md").read_text().split())
+        assert "spec_section" in text and "goal:N" in text and "done_when" in text, role
+        assert "AC ids only" in text, role

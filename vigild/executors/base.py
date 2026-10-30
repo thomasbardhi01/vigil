@@ -38,7 +38,7 @@ class SessionSpec:
     session_dir: Path
     max_turns: int
     max_minutes: int
-    max_budget_usd: float
+    max_budget_usd: float | None  # None: no SDK budget (a local preset; the gateway is the cap)
     mounts: list[Mount] = field(default_factory=list)
     traceparent: str | None = None
     packet: str = ""
