@@ -272,6 +272,14 @@ you. There is no timer and no launchd job.
   uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
   ```
 
+  It prints `data dir: <path>` first (`VIGIL_DATA_DIR`, else the config): the record
+  it writes is a `dev_images` row there, the same row the inbox Rebuild writes, and
+  vigild reads only that data dir. If the build is cut short (Docker gone, a crash)
+  it exits non-zero, names the stage (`build`, `validate`, `session-build`,
+  `session-validate`) and the reason, and says no record was written; nothing is
+  then fresh, so run it again. **Rebuild builds at main's tip**, not at the commit
+  the page was raised on, so a fix that merged since is built.
+
 - **The `rebuilds-images` label.** CI's `image-key` workflow (`.github/workflows/image-key.yml`) puts it on a PR that
   changes an input of a dev-image key or of the executor layer: a repo's dev
   Dockerfile, vigil's `pyproject.toml` or `uv.lock`, a repo's `dev_suites` or
