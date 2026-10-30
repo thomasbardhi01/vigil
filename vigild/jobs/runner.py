@@ -2878,7 +2878,10 @@ class JobRunner:
             )
             return
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
-        if len(broke) < len(task_ids):  # all out of cap: a budget outcome, not a repo failure
+        # a worker's question is a wait for the owner, not a failure (#71)
+        asking = [t for t, v in tasks.items() if v.get("question") and v["state"] == "waiting"]
+        if len(broke) < len(task_ids) and len(asking) < len(task_ids):
+            # all out of cap: a budget outcome; all asking: a wait; neither is a repo failure
             self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
@@ -3178,8 +3181,16 @@ class JobRunner:
             }
             if escalated or attempt >= self.cfg.routing.escalate_attempt:
                 fresh_fix["history"] = self._findings_history(t, fix_round)
+        untrusted = decisions.section(self.store, job_id)
+        answers = [
+            str(e.data.get("note", ""))
+            for e in self.store.events(job_id=job_id)
+            if e.type == "owner_answer" and e.task_id == task_id
+        ]
+        if answers:  # the owner's answers to this worker's earlier question(s), in order
+            untrusted["owner answer"] = "\n\n".join(answers)
         packet = assemble_worker(
-            clone, contract, untrusted=decisions.section(self.store, job_id),
+            clone, contract, untrusted=untrusted,
             approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
         )  # fmt: skip
         resume = self._resume_from(prev.id) if prev and forks else None
@@ -3332,19 +3343,21 @@ class JobRunner:
         ask = self.workspace.read_blob(job.repo, head, f"{art_dir}/ask_coord.json", 16 << 10)
         if ask is not None:
             try:
-                question = str(json.loads(ask).get("question", ""))[:4000]
+                question = str(json.loads(ask).get("question", ""))
             except json.JSONDecodeError, AttributeError:
                 question = "(unreadable ask_coord.json)"
             self.store.create_inbox_item(
                 "questions",
                 "ask_coord",
                 job_id,
-                f"{task_id} asks its coord",
+                f"{task_id} is waiting on you",
                 {
                     "question": question,
                     "task_id": task_id,
                     "coord_session_id": job.coord_session_id,
-                    "resumable": False,
+                    "actions": ["resume", "abandon"],
+                    "next": "Answer with a note on resume: it goes to the worker as your answer.",
+                    "resumable": True,
                 },
                 Provenance.CLAUDE,
                 own_job=True,
@@ -3353,7 +3366,7 @@ class JobRunner:
                 job_id,
                 s,
                 task_id,
-                f"{task_id} asks its coord",
+                f"{task_id} is waiting on you",
                 {"question": question},
                 state="waiting",
             )

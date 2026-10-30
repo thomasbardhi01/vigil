@@ -1021,13 +1021,32 @@ class JobService:
             raise Conflict(f"inbox item {item_id} is not an open question or page")
         return item
 
-    def resume(self, item_id: int, actor: Actor = Actor.OWNER) -> Job:
+    @staticmethod
+    def _asking(item: InboxItem) -> list[str]:
+        """The tasks a page holds that are waiting on the owner's answer (a worker's
+        `ask_coord`): the question item's own task, or a failed-worker page's tasks
+        that carry a `question`."""
+        if item.kind == "ask_coord":
+            return [str(item.body["task_id"])] if item.body.get("task_id") else []
+        tasks = item.body.get("tasks")
+        if not isinstance(tasks, dict):
+            return []
+        return [str(t) for t, v in tasks.items() if isinstance(v, dict) and v.get("question")]
+
+    def resume(self, item_id: int, actor: Actor = Actor.OWNER, note: object = None) -> Job:
         """The owner resumes the job a page is about: a held job returns to the
-        state it left, and the runner picks up its remaining work."""
+        state it left, and the runner picks up its remaining work. With a `note` on a
+        worker's question, the note is the answer: an `owner_answer` event per asking
+        task, fenced into that worker's packet when it runs again."""
         with self.store.tx():
             item = self._question(item_id)
             if not item.body.get("resumable") or item.job_id is None:
                 raise Conflict(f"inbox item {item_id} has nothing to resume")
+            asking = self._asking(item)
+            if note is not None:
+                self._check_note(note)
+                if not asking:
+                    raise Conflict(f"inbox item {item_id} holds no worker question to answer")
             job = self.store.get_job(item.job_id)
             if job.state in (JobState.BLOCKED, JobState.ESCALATED):
                 assert job.blocked_from is not None
@@ -1043,6 +1062,15 @@ class JobService:
             self.store.add_event(
                 "resume", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
+            if note is not None:
+                for tid in asking:
+                    self.store.add_event(
+                        "owner_answer",
+                        {"inbox_item_id": item_id, "note": note},
+                        Provenance.HUMAN,
+                        job_id=job.id,
+                        task_id=tid,
+                    )
             self.store.resolve_inbox_item(item_id, actor.value)
             # round 3, F7: one resume per hold; the job's other resumable pages close
             for other in self.store.list_inbox():

@@ -358,12 +358,24 @@ def approve(
 
 
 @router.post("/api/inbox/{item_id}/resume", dependencies=[ADMIN])
-def resume(request: Request, item_id: int) -> dict[str, Any]:
+def resume(
+    request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """Resume a held job. With {"note": "..."} (8 KB at most) on a worker's question, the
+    note is the owner's answer, fenced into the re-run worker's packet."""
+    note = (body or {}).get("note")
+    if note is not None and not isinstance(note, str):
+        raise HTTPException(422, "note must be text")
+    note = _coord_note(request, body or {}, note)
     jobs = _svc(request).jobs
     try:
-        job = jobs.resume(item_id, _who(request))
+        job = jobs.resume(item_id, _who(request), note)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
+    except NoteTooLarge as e:
+        raise HTTPException(413, str(e)) from e
+    except BadNote as e:
+        raise HTTPException(422, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     # `queued`: the job's current run finishes first, then this one (2a round 3)
