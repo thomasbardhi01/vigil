@@ -161,9 +161,21 @@ def test_a_task_that_is_not_failed_is_refused(world: World) -> None:
     assert not _events(w, "owner_republish")
 
 
-def test_a_head_that_failed_acceptance_is_never_republished(world: World) -> None:
-    """tests.json is written before stage 3: a verifier record and a vault ref aren't
-    proof the head was accepted."""
+def _verdicts(w: World, tid: str) -> list[dict[str, Any]]:
+    return [e for e in _events(w, "acceptance") if e["task_id"] == tid]
+
+
+def test_the_normal_path_records_the_acceptance_verdict(world: World) -> None:
+    w = world
+    job, tid, _item = _failed(w)
+    (ok,) = _verdicts(w, tid)
+    assert ok["accepted"] is True and ok["errors"] == []
+    assert ok["head"] == _record(w, job, tid)["after"]["sha"] and ok["task"] == tid
+
+
+def test_a_failed_acceptance_is_recorded_and_never_republished(world: World) -> None:
+    """tests.json is written before stage 3: the verifier's record and a vault ref aren't
+    proof the head was accepted; the stage's own verdict is."""
     from tests.jobs.test_coord_loop import _flaky
 
     w = world
@@ -172,37 +184,57 @@ def test_a_head_that_failed_acceptance_is_never_republished(world: World) -> Non
     tid = f"{job}-w1"
     item = _failure_item(w, job)
     assert "stage 3 acceptance failed" in json.dumps(item["body"]["tasks"])
-    repo = w.store.get_job(job).repo
-    assert _record(w, job, tid)["after"]["sha"] == w.runner.workspace.task_ref(repo, tid)
+    after = _record(w, job, tid)["after"]["sha"]
+    assert after == w.runner.workspace.task_ref(w.store.get_job(job).repo, tid)
+    first = _verdicts(w, tid)[0]
+    assert first["accepted"] is False and first["head"] == after and first["errors"]
     r = _post(w, item["id"], tid)
-    assert r.status_code == 409, r.text
-    assert "never accepted" in r.text
+    assert r.status_code == 409 and f"acceptance refused {after}" in r.text, r.text
     assert not _events(w, "owner_republish")
     assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]
 
 
-def test_a_refusal_before_the_current_record_is_not_evidence(world: World) -> None:
+def test_the_latest_verdict_for_the_verified_head_decides(world: World) -> None:
     w = world
     job, tid, item = _failed(w)
+    a = _record(w, job, tid)["after"]["sha"]
+    b = w.runner.workspace.base_sha(tid)  # a second import, B
+    assert a != b
     rec = _record(w, job, tid)
+    rec["after"]["sha"] = b
     w.store.add_artifact(job, "tests.json", json.dumps(rec), Provenance.HUMAN, task_id=tid)
-    w.store.x(
-        "UPDATE artifacts SET created_at='2999-01-01T00:00:00' WHERE name='tests.json' "
-        "AND id=(SELECT MAX(id) FROM artifacts WHERE name='tests.json' AND task_id=?)",
-        (tid,),
+    _vault_ref(w, job, tid, b)
+    # B verified but not yet judged: A's pass doesn't carry over
+    r = _post(w, item["id"], tid)
+    assert r.status_code == 409 and f"no acceptance verdict recorded for {b}" in r.text, r.text
+    w.store.add_event(
+        "acceptance",
+        {"task": tid, "head": b, "accepted": False, "errors": ["out of scope: x"]},
+        Provenance.HUMAN,
+        job_id=job,
+        task_id=tid,
     )
     r = _post(w, item["id"], tid)
-    assert r.status_code == 409 and "never accepted" in r.text, r.text
+    assert r.status_code == 409 and f"acceptance refused {b}: out of scope: x" in r.text, r.text
     assert not _events(w, "owner_republish")
+    w.store.add_event(
+        "acceptance",
+        {"task": tid, "head": b, "accepted": True, "errors": []},
+        Provenance.HUMAN,
+        job_id=job,
+        task_id=tid,
+    )
+    assert w.runner._owner_inputs(job, tid)["head"] == b
 
 
-def test_a_task_that_predates_156_republishes_on_its_task_failed_event(world: World) -> None:
+def test_a_task_with_no_acceptance_verdict_is_a_409(world: World) -> None:
     w = world
-    _job, tid, item = _failed(w)
-    w.store.x("DELETE FROM events WHERE type='publish_refused' AND task_id=?", (tid,))
+    job, tid, item = _failed(w)
+    after = _record(w, job, tid)["after"]["sha"]
+    w.store.x("DELETE FROM events WHERE type='acceptance' AND task_id=?", (tid,))
     r = _post(w, item["id"], tid)
-    assert r.status_code == 200, r.text
-    assert w.store.get_task(tid).state in ("pr_open", "reviewed")
+    assert r.status_code == 409 and f"no acceptance verdict recorded for {after}" in r.text
+    assert not _events(w, "owner_republish")
 
 
 def test_the_owner_event_survives_a_hold_and_republishes_with_no_session(world: World) -> None:

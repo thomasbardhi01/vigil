@@ -3387,6 +3387,21 @@ class JobRunner:
             session_base=session_base,
             on_findings=lambda found: self._integrity_findings(job_id, task_id, s.id, found),
         )
+        # the stage's own verdict on this head, whatever follows (pass, fail, escalate): the
+        # owner's republish gates on it
+        self.store.add_event(
+            "acceptance",
+            {
+                "task": task_id,
+                "head": head,
+                "accepted": not errors,
+                "errors": [redact(str(e))[:300] for e in errors[:10]],
+            },
+            Provenance.HUMAN,
+            job_id=job_id,
+            session_id=s.id,
+            task_id=task_id,
+        )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
             self.store.add_event(
@@ -3597,19 +3612,17 @@ class JobRunner:
                 f"{task_id}: the verifier's head is {after}, the vault's refs/vigil/{task_id} "
                 f"is {ref or 'missing'}"
             )
-        attempted = False
-        for r in self.store.q(
-            "SELECT type, data FROM events WHERE task_id=? AND ts>=? "
-            "AND type IN ('publish_refused','task_failed')",
-            (task_id, art.created_at),  # timestamps are whole seconds: a tie counts as after
-        ):
-            d = json.loads(r["data"])
-            if r["type"] == "publish_refused" and d.get("head") == after:
-                attempted = True
-            if r["type"] == "task_failed" and d.get("title") == f"{task_id}: publish refused":
-                attempted = True
-        if not attempted:
-            raise RepublishRefused("the head was never accepted (no publish attempt on record)")
+        verdict = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='acceptance' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        got = json.loads(verdict[0]["data"]) if verdict else None
+        if got is None or got.get("head") != after:
+            raise RepublishRefused(f"no acceptance verdict recorded for {after}")
+        if got.get("accepted") is not True:
+            first = (got.get("errors") or ["no reason recorded"])[0]
+            raise RepublishRefused(f"acceptance refused {after}: {first}")
         raw = self.store.get_artifact(job_id, "worker_report.json", task_id)
         if raw is None or self._last_worker(task_id) is None:
             raise RepublishRefused(f"{task_id} has no worker report or session on record")
