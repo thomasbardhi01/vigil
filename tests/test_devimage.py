@@ -11,9 +11,10 @@ from typing import Any
 import pytest
 
 from tests.conftest import git
+from tests.test_devimage_failed_names import IDS, big_output
 from vigild.config import Config, RepoPolicy
 from vigild.db import Store
-from vigild.devimage import DevImages, StaleDevImage, missing_tools, tools_in
+from vigild.devimage import TAIL, DevImages, StaleDevImage, missing_tools, tools_in
 from vigild.verifier import RunResult
 from vigild.workspace import Workspace
 
@@ -57,6 +58,7 @@ class FakeDocker:
 class FakeSuites:
     def __init__(self) -> None:
         self.exit: dict[str, int] = {}
+        self.output: str | None = None
         self.ran: list[tuple[str, str, list[str]]] = []
 
     def run(
@@ -64,7 +66,7 @@ class FakeSuites:
     ) -> RunResult:
         files = sorted(p.name for p in source.iterdir())
         self.ran.append((image, command, files))
-        return RunResult(self.exit.get(command, 0), f"ran {command}")
+        return RunResult(self.exit.get(command, 0), self.output or f"ran {command}")
 
 
 @pytest.fixture
@@ -345,3 +347,15 @@ def test_on_rebuild_validates_at_mains_tip_not_the_pages_stale_base(world: Any) 
     JobRunner.on_rebuild(me, REPO, stale)  # type: ignore[arg-type]
     row = images.latest(REPO)
     assert row is not None and row["ok"] and row["base_sha"] == tip
+
+
+def test_a_validation_record_stores_names(world: Any) -> None:
+    images, _, suites, _, base, _ = world
+    suites.exit = {c: 1 for c in images.cfg.repo("o/fixture").dev_suites.values()}
+    suites.output = big_output()
+    with pytest.raises(StaleDevImage):
+        images.ensure_fresh("o/fixture", base)
+    body = json.loads(images.latest("o/fixture")["output"])
+    for s in body["suites"].values():
+        assert s["failed_tests"] == IDS
+        assert "VIGIL-REPORT" not in s["tail"] and len(s["tail"]) <= TAIL
