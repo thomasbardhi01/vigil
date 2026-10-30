@@ -227,7 +227,7 @@ def test_the_coord_gets_the_approved_spec_and_the_note_as_an_owner_section(world
     (packet,) = packets
     # an owner section, trusted: it survives the removal of every fenced block
     acted_on = strip_fenced(packet)
-    assert "# 3a. Owner's amendment" in acted_on
+    assert "# 3a. Amendment" in acted_on
     assert NOTE in acted_on and "<<<UNTRUSTED" not in packet.split("# 3a.")[1].split("# 4.")[0]
     # the previously approved spec, whole, in that section
     section = acted_on.split("# 3a.")[1].split("# 4.")[0]
@@ -604,6 +604,7 @@ def test_a_coord_replan_note_reaches_the_coord_packet_labelled_as_the_coords(
     section = strip_fenced(packet).split("# 3a.")[1].split("# 4.")[0]
     assert LABEL in section and NOTE in section
     assert "The owner sent this job back" not in section and "The owner's note" not in section
+    assert "Owner's amendment" not in packet and "from the owner" not in packet.split("# 4.")[0]
     assert _art(w, job, "owner_note.md").content.startswith(LABEL)
 
 

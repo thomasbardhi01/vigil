@@ -45,7 +45,7 @@ TITLES = {
     "contract": "3. Contract",
     "feature_index": "1a. Feature-map index (one line per row)",
     "prefill": "3b. Prefill (vigild's own computation, paths read at base_sha)",
-    "owner": "3a. Owner's amendment (from the owner, not fenced)",
+    "owner": "3a. Amendment (the owner's or the coord's, as its note says; not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
     "self_check": "6. Self-check",
