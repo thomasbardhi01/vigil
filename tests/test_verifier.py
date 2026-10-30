@@ -1327,3 +1327,219 @@ def test_an_unknown_encoding_attribute_still_checks_out(ws: Workspace, tmp_path:
     src = ws.verify_checkout(REPO, "enc", sha)
     assert _g(src, "rev-parse", "HEAD^{tree}") == _g(ws.vault(REPO), "rev-parse", f"{sha}^{{tree}}")
     assert len(_history_facts(src)["commits"]) == 1
+
+
+# --- #31 items 4 and 7: vitest project dirs and exact-path case matching ------------------------
+
+_PA_PKG = {
+    "server/package.json": (
+        '{"scripts": {"test": "vitest run", "lint": "eslint src", "build": "tsc",'
+        ' "test:pg": "vitest run --config vitest.pg.config.ts"}}'
+    ),
+    "executor/package.json": (
+        '{"scripts": {"test": "vitest run", "lint": "eslint src", "build": "tsc"}}'
+    ),
+}
+_PG_URL = "postgresql://ci:ci@127.0.0.1:5432/pa_pg_test"
+_CI_URL = "postgresql://ci:ci@127.0.0.1:5432/ci"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "dirs"),
+    [
+        ("pnpm -C server exec vitest run x", ("server",)),
+        ("pnpm --dir server exec vitest run x", ("server",)),
+        ("cd web && pnpm -C server exec vitest run x", ("web/server",)),
+        ("cd web && pnpm exec vitest run x", ("web",)),
+        ("vitest run x", ("",)),
+    ],
+)
+def test_ac1_pnpm_dir_is_read_for_a_direct_vitest_command(cmd: str, dirs: tuple[str, ...]) -> None:
+    from vigild.verifier import plan_reports
+
+    assert plan_reports(cmd, None).vitest_dirs == dirs
+
+
+def test_ac2_each_report_maps_to_its_commands_dir() -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(
+        "pnpm -C server exec vitest run a && pnpm -C executor exec vitest run b"
+        " && pnpm -C server exec vitest run c",
+        None,
+    )
+    assert plan.report_dirs == {
+        "vitest-1.xml": "server",
+        "vitest-2.xml": "executor",
+        "vitest-3.xml": "server",
+    }
+    assert plan.vitest_dirs == ("server", "executor")  # deduplicated, as before
+    scripts = plan_reports("pnpm -C server test && cd executor && pnpm test", {
+        **_PA_PKG, "executor/package.json": _PA_PKG["executor/package.json"],
+        "package.json": '{"scripts": {"test": "vitest run"}}',
+    }.get)  # fmt: skip
+    assert scripts.report_dirs == {"vitest-1.xml": "server", "vitest-2.xml": "executor"}
+    assert plan_reports("pytest -q tests", None).report_dirs == {}
+
+
+def test_ac3_a_case_carries_its_project_from_the_report_parse() -> None:
+    from vigild.verifier import Case, parse_junit
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    assert Case("a::t", "a", "pass").project is None
+    assert parse_junit(xml)[0].project is None
+    assert parse_junit(xml, project="server")[0].project == "server"
+
+
+def test_ac3_run_sets_projects_from_the_mapping_it_is_given(tmp_path: Path) -> None:
+    from vigild.verifier import RunResult, Verifier
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    py = b'<testsuite><testcase classname="tests.test_a" name="test_a"/></testsuite>'
+
+    class Ws:
+        def verify_checkout(self, repo: str, name: str, sha: str, **kw: Any) -> Path:
+            src = tmp_path / name / "src"
+            src.mkdir(parents=True)
+            return src
+
+    class Runner:
+        def run(self, *a: Any, **k: Any) -> RunResult:
+            return RunResult(
+                0, "", reports={"vitest-1.xml": xml, "vitest-2.xml": xml, "pytest.xml": py}
+            )
+
+    v = Verifier(Ws(), Runner())  # type: ignore[arg-type]
+    run = v._run("r", "img", "n", "sha", "cmd", "cmd", [], report_dirs={"vitest-1.xml": "server"})
+    by_status = [(c.file, c.project) for c in run["_cases"]]
+    assert ("test/a.test.ts", "server") in by_status
+    assert ("test/a.test.ts", "<unknown>") in by_status  # vitest-2.xml has no mapped dir
+    assert ("tests.test_a", None) in by_status
+
+
+def test_ac3_ac_run_uses_the_plan_it_built_from_base_blobs(tmp_path: Path) -> None:
+    from vigild.verifier import RunResult, Verifier
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    reads: list[tuple[str, str]] = []
+
+    class Ws:
+        def read_blob(self, repo: str, sha: str, path: str) -> str | None:
+            reads.append((sha, path))
+            return '{"scripts": {"test": "vitest run"}}' if path == "server/package.json" else None
+
+        def verify_checkout(self, repo: str, name: str, sha: str, **kw: Any) -> Path:
+            src = tmp_path / name / "src"
+            src.mkdir(parents=True)
+            return src
+
+    class Runner:
+        def run(self, *a: Any, **k: Any) -> RunResult:
+            return RunResult(0, "", reports={"vitest-1.xml": xml})
+
+    v = Verifier(Ws(), Runner())  # type: ignore[arg-type]
+    seen: list[Any] = []
+    real = v._run
+
+    def spy(*a: Any, **k: Any) -> dict[str, Any]:
+        out = real(*a, **k)
+        seen.append(out["_cases"])
+        return out
+
+    v._run = spy  # type: ignore[method-assign]
+    entry = v._ac_run(
+        "r", "img", "ac1", "headsha", "pnpm -C server test", ["AC1"], ("b", []), "basesha"
+    )
+    assert entry["selected"] == 1
+    assert seen[0][0].project == "server"
+    assert reads and all(sha == "basesha" for sha, _ in reads)  # never the head's blobs
+
+
+def test_ac4_vitest_cases_match_the_full_repo_path() -> None:
+    from vigild.verifier import Case, belongs
+
+    def case(file: str, project: str | None) -> Case:
+        return Case(f"{file}::t", file, "pass", project=project)
+
+    files = ["server/test/a.test.ts", "client/test/a.test.ts"]
+    assert belongs(case("test/a.test.ts", "server"), files)
+    assert belongs(case("test/a.test.ts", "client"), files)
+    assert not belongs(case("test/a.test.ts", "executor"), files)
+    assert not belongs(case("test/a.test.ts", "server"), ["client/test/a.test.ts"])
+    # no suffix match: a deeper path in the same project is another file
+    assert not belongs(case("a.test.ts", "server"), ["server/test/a.test.ts"])
+    # no double prefix, when the dir is empty or already leads the file
+    assert belongs(case("test/a.test.ts", ""), ["test/a.test.ts"])
+    assert belongs(case("server/test/a.test.ts", "server"), ["server/test/a.test.ts"])
+    # a nested dir
+    assert belongs(case("t/a.test.ts", "web/server"), ["web/server/t/a.test.ts"])
+
+
+def test_ac4_an_unknown_project_matches_exactly_or_not_at_all() -> None:
+    from vigild.verifier import Case, belongs
+
+    unknown = Case("test/a.test.ts::t", "test/a.test.ts", "pass", project="<unknown>")
+    assert not belongs(unknown, ["server/test/a.test.ts"])  # no suffix guess
+    assert belongs(unknown, ["test/a.test.ts"])  # an exact path is still its own
+
+
+def test_ac4_pytest_cases_keep_module_prefix_matching() -> None:
+    from vigild.verifier import Case, belongs
+
+    c = Case("tests.test_a.TestX::t", "tests.test_a.TestX", "pass")
+    assert belongs(c, ["pkg/tests/test_a.py"]) and not belongs(c, ["tests/test_b.py"])
+
+
+# AC7: real commands, planned as on main; none refused or escalated by the fail-closed rule.
+_REAL: list[tuple[str, tuple[str, ...], dict[str, str], list[str]]] = [
+    (
+        "pnpm -C server lint && pnpm -C server test",
+        ("server",), {"vitest-1.xml": "server"}, ["`pnpm -C server lint`"],
+    ),
+    (
+        f"pnpm -C executor run build && DATABASE_URL={_CI_URL} pnpm -C server build",
+        (), {}, ["`pnpm -C executor run build`", "`DATABASE_URL"],
+    ),
+    (
+        f"export DATABASE_URL={_PG_URL} TEST_PG_DATABASE_URL={_PG_URL} && "
+        "pnpm -C server exec prisma generate && pnpm -C server exec prisma migrate deploy && "
+        "pnpm -C server test:pg",
+        ("server",), {"vitest-1.xml": "server"}, [],
+    ),
+    (
+        "pnpm -C executor lint && pnpm -C executor test",
+        ("executor",), {"vitest-1.xml": "executor"}, ["`pnpm -C executor lint`"],
+    ),
+    ("pnpm -C server test test/x.test.ts", ("server",), {"vitest-1.xml": "server"}, []),
+    ("uv run --offline pytest -q -p no:cacheprovider -n auto", (), {}, []),
+    ("uv run pytest -q tests/gateway/test_own_call_key.py -k before_insert", (), {}, []),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("cmd", "dirs", "reports", "problems"), _REAL)
+def test_ac7_real_commands_plan_as_before(
+    cmd: str, dirs: tuple[str, ...], reports: dict[str, str], problems: list[str]
+) -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(cmd, _PA_PKG.get)
+    assert plan.vitest_dirs == dirs
+    assert getattr(plan, "report_dirs", reports) == reports
+    assert [p for p in plan.problems if not any(p.startswith(x) for x in problems)] == []
+    assert len(plan.problems) == len(problems)
+    names = {f"vitest-{i}.xml" for i in range(1, len(reports) + 1)}
+    assert all(f"--outputFile.junit=/tmp/vigil-report/{n}" in plan.command for n in names)
+
+
+def test_ac7_realistic_cases_are_matched_as_before() -> None:
+    from vigild.verifier import Case, belongs
+
+    # ParkAgent's server suite: vitest names a file relative to its project dir
+    server = Case("test/api/x.test.ts::row", "test/api/x.test.ts", "pass")
+    assert belongs(server, ["server/test/api/x.test.ts"])
+    assert belongs(server, ["test/api/x.test.ts"])
+    assert not belongs(server, ["server/test/api/y.test.ts"])
+    # Vigil's own pytest ids
+    py = Case("tests.gateway.test_own_call_key::test_k", "tests.gateway.test_own_call_key", "pass")
+    assert belongs(py, ["tests/gateway/test_own_call_key.py"])
+    assert not belongs(py, ["tests/gateway/test_other.py"])
