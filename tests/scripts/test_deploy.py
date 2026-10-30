@@ -33,9 +33,7 @@ REPOS_YAML = "repos:\n  owner/alpha:\n    intake: true\n  owner/beta:\n    intak
 
 
 def _git(cwd: Path, *args: str) -> str:
-    r = subprocess.run(
-        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
-    )
+    r = subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
     return r.stdout.strip()
 
 
@@ -56,14 +54,18 @@ class Env:
         origin = tmp / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.dev = tmp / "dev"
-        subprocess.run(["git", "clone", "-q", str(origin), str(self.dev)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(self.dev)], check=True, capture_output=True
+        )
         for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
             _git(self.dev, "config", k, v)
         (self.dev / "configs").mkdir()
         (self.dev / "configs" / "repos.yaml").write_text(REPOS_YAML)
         self.commit("init", {"README.md": "x\n"})
         self.prod = tmp / "prod"
-        subprocess.run(["git", "clone", "-q", str(origin), str(self.prod)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(self.prod)], check=True, capture_output=True
+        )
         for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
             _git(self.prod, "config", k, v)
 
@@ -88,7 +90,15 @@ class Env:
         env.pop("VIGIL_PROD_DIR", None)
         env.pop("VIGIL_DATA_DIR", None)
         return subprocess.run(
-            ["bash", str(SCRIPT), "--prod-dir", str(self.prod), "--data-dir", str(self.data), *args],
+            [
+                "bash",
+                str(SCRIPT),
+                "--prod-dir",
+                str(self.prod),
+                "--data-dir",
+                str(self.data),
+                *args,
+            ],
             env=env,
             capture_output=True,
             text=True,
