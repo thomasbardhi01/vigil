@@ -71,12 +71,25 @@ def test_contract_diff_each_field(field: str) -> None:
     ]
 
 
-def test_contract_diff_each_field_task_added_and_removed() -> None:
-    other = WORKER | {"task_id": "j-w2"}
-    added = contract_diff(_plan(), _plan([WORKER, other]))
-    assert [(e["task_id"], e["field"]) for e in added] == [("j-w2", "task")]
-    removed = contract_diff(_plan([WORKER, other]), _plan())
-    assert [(e["task_id"], e["field"]) for e in removed] == [("j-w2", "task")]
+_OTHER = WORKER | {"task_id": "j-w2"}
+_MORE = [*VERIFY, {"criterion": "AC2", "level": 0, "why_not_higher": "y"}]
+
+
+@pytest.mark.parametrize(
+    ("name", "previous", "amended", "task_id", "field"),
+    [
+        ("verify", _plan(), _plan(verify=_MORE), None, "verify"),
+        ("task added", _plan(), _plan([WORKER, _OTHER]), "j-w2", "task"),
+        ("task removed", _plan([WORKER, _OTHER]), _plan(), "j-w2", "task"),
+    ],
+)
+def test_contract_diff_each_field_plan_level(
+    name: str, previous: str, amended: str, task_id: str | None, field: str
+) -> None:
+    got = contract_diff(previous, amended)
+    assert len(got) == 1
+    assert got[0]["task_id"] == task_id and got[0]["field"] == field
+    assert got[0]["previous"] != got[0]["amended"]
 
 
 def test_contract_diff_each_field_ignores_why_value_risk_size() -> None:
@@ -86,13 +99,6 @@ def test_contract_diff_each_field_ignores_why_value_risk_size() -> None:
 def test_contract_diff_matches_tasks_by_task_id_only() -> None:
     a, b = WORKER, WORKER | {"task_id": "j-w2", "goal": "other"}
     assert contract_diff(_plan([a, b]), _plan([b, a])) == []
-
-
-def test_contract_diff_the_verify_list_is_one_entry() -> None:
-    more = [*VERIFY, {"criterion": "AC2", "level": 0, "why_not_higher": "y"}]
-    got = contract_diff(_plan(), _plan(verify=more))
-    assert len(got) == 1 and got[0]["task_id"] is None and got[0]["field"] == "verify"
-    assert got[0]["previous"] != got[0]["amended"]
 
 
 def test_contract_diff_interface() -> None:
