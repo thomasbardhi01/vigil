@@ -305,7 +305,11 @@ stateDiagram-v2
   (`POST /api/inbox/{id}/replan` with `{"note": "..."}`, 8 KB at most;
   also accepted on a failed build's replan): the coord is handed the
   previously approved spec and the note and returns an amended spec and a
-  changelog, the gate runs on it, and the new item shows the diff. The job
+  changelog, the gate runs on it, and the new item shows the diff and the
+  worker-contract diff (`plan_previous.md`, stored with the note on the same
+  baseline rule, against `plan.md`: only test_cmd, scope, must-fail-first, cost,
+  depends_on, labels, goal, done_when and verify level; tasks matched by id) and
+  lists every change the changelog doesn't name (`amendment.unlisted`; no model). The job
   stays `spec_pending`; this is never an approval (decision `hidden-tests-runner-files`).
   **A replan starts the coord fresh** (#78, ADR-0005), with or without a note:
   its packet holds spec.md (the amended baseline, or the current spec), the
