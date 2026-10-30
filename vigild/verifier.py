@@ -689,6 +689,7 @@ class Verifier:
                 [(head, tests), pin],
             )  # fmt: skip
             before["applied"] = tests
+            self._collection_failure(before, tests, test_cmd)
             record["before"] = before
         after = self._run(repo, image, f"{task_id}-after", head, test_cmd, command, [pin])
         if not after["_report"] and after["outcome"] == "pass":
@@ -722,7 +723,11 @@ class Verifier:
                 "note": "neither base nor before produced a report: what ran can't be compared",
             }
         if before is not None:
-            record["ids"] = self._ids(before, after, tests)
+            record["ids"] = self._ids(
+                before, after, tests,
+                base["_cases"] if base["_report"] else None,
+                base2["_cases"] if base2 and base2["_report"] else None,
+            )  # fmt: skip
         else:
             # #31 item 1: no "before" run, so name the worker's tests from the after run
             record["ids"] = self._ids_after(
@@ -1075,7 +1080,52 @@ class Verifier:
         return out
 
     @staticmethod
-    def _ids(before: dict[str, Any], after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
+    def _module_path(name: str) -> str:
+        """The repo path of a JUnit collection-error name: `tests.test_a` is
+        `tests/test_a.py` (a path-style name is taken as it is)."""
+        return name if name.endswith(".py") else name.replace(".", "/") + ".py"
+
+    @staticmethod
+    def _exact_file(case: Case, files: set[str]) -> bool:
+        """Is a pytest case (`tests.test_a` or `tests.test_a.TestX`) in one of these
+        exact repo paths? `belongs` matches a suffix; this does not."""
+        parts = case.file.split(".")
+        return any("/".join(parts[:k]) + ".py" in files for k in range(1, len(parts) + 1))
+
+    @staticmethod
+    def _collection_failure(before: dict[str, Any], tests: list[str], test_cmd: str) -> None:
+        """#161: a pytest collection error (exit 2, a JUnit `<error>` on a module, no
+        classname) counts as failing before only when every erroring module is, by exact
+        path, one of the worker's own new or changed test files (`tests`, never a
+        conftest). Any other error, a failing case or another exit leaves the outcome
+        `unknown`. A stub import is as cheap as `assert False`: must-fail-first proves
+        only that the base lacks something the test needs."""
+        cases: list[Case] = before.get("_cases") or []
+        if before["exit"] != 2 or not before["_report"] or not runs_pytest(test_cmd):
+            return
+        mods = [c for c in cases if c.status == "error" and not c.file]
+        mine = {t for t in tests if t.rsplit("/", 1)[-1] != "conftest.py"}
+        if not mods or any(c.status != "error" or c.file for c in cases):
+            return
+        names = [c.id.removeprefix("::") for c in mods]
+        if not all(Verifier._module_path(n) in mine for n in names):
+            return
+        before["outcome"] = "fail"
+        before["failed_at_collection"] = {
+            "modules": sorted(redact(n) for n in names),
+            "error": redact("\n".join(ln for ln in before["tail"].splitlines() if ln[:1] == "E"))[
+                :400
+            ],
+        }
+
+    @staticmethod
+    def _ids(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        tests: list[str],
+        base: list[Case] | None = None,
+        base2: list[Case] | None = None,
+    ) -> dict[str, Any]:
         b, a = before.get("_cases"), after.get("_cases")
         if not before.get("_report") or not after.get("_report"):
             return {"checked": False, "note": "test ids not checked: the runner gave no report"}
@@ -1083,6 +1133,20 @@ class Verifier:
             c.id for c in b or [] if c.status in ("failure", "error") and belongs(c, tests)
         )
         passing = {c.id for c in a or [] if c.status == "pass"}
+        fac = before.get("failed_at_collection")
+        if fac:
+            # The before run never executed these files, so only after-run ids the base
+            # runs lack can have "failed before"; without a base report none can be told.
+            # Unstable base ids are settled as `_new_cases` settles them; a case's file
+            # is matched exactly, never by suffix.
+            files = {Verifier._module_path(n) for n in fac["modules"]}
+            mine = [c for c in a or [] if Verifier._exact_file(c, files)]
+            new = Verifier._new_cases(mine, base, base2, sorted(files)) if base is not None else []
+            return {
+                "checked": True,
+                "failing_before": sorted(c.id for c in new),
+                "not_passing_after": sorted(c.id for c in mine if c.status in ("failure", "error")),
+            }
         return {
             "checked": True,
             "failing_before": failing,

@@ -302,17 +302,213 @@ def test_an_unrelated_failure_at_before_is_not_must_fail_first(
     assert rec["ids"]["checked"] is True and rec["ids"]["failing_before"] == []
 
 
-def test_a_collection_error_at_before_is_unknown(ws: Workspace, tmp_path: Path) -> None:
+NEW_MODULE_TEST = "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
+
+
+def _new_module(c: Path) -> None:
+    (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+def test_a_collection_error_in_the_workers_new_test_counts_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """#161: the most common test-first shape. The new module imports code the base lacks,
+    so the before run fails at collection (pytest exit 2); the module's ids come from after."""
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail" and rec["before"]["exit"] == 2
+    fac = rec["before"]["failed_at_collection"]
+    assert fac["modules"] == ["tests.test_new"] and "newmod" in fac["error"]
+    assert len(fac["error"]) <= 400
+    assert rec["after"]["outcome"] == "pass"
+    assert rec["ids"] == {
+        "checked": True,
+        "failing_before": ["tests.test_new::test_thing"],
+        "not_passing_after": [],
+    }
+    from vigild.jobs.acceptance import check_tests
+
+    spec = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+    assert check_tests(spec, rec) == []
+
+
+def test_a_collection_error_in_a_base_test_file_stays_unknown(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A file the worker did not add or change can't be what fails before, even beside
+    the worker's own erroring module."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_broken.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
+
+
+def test_a_collection_error_in_a_conftest_stays_unknown(ws: Workspace, tmp_path: Path) -> None:
     def edit(c: Path) -> None:
-        (c / "tests" / "test_new.py").write_text(
-            "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
-        )
-        (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+        _new_module(c)
+        (c / "tests" / "conftest.py").write_text("import no_such_module_anywhere\n")
 
     base, head = _session(ws, tmp_path, edit)
-    rec = _verify(ws, base, head, "pytest -q tests/test_new.py")
-    assert rec["before"]["outcome"] == "unknown"  # pytest exit 2: collection error
-    assert rec["after"]["outcome"] == "pass"
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] != "fail"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+
+
+def test_a_workers_test_that_errors_at_collection_after_still_fails(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)  # src/newmod.py never added
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["after"]["outcome"] != "pass"
+    assert rec["ids"]["failing_before"] == []  # after has no ids for the module
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
+
+
+def _newmod_only(c: Path) -> None:
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+SPEC = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+
+
+def test_only_new_ids_in_an_edited_base_file_count_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """The before run never executed the edited file, so a test that passes on the base
+    can't have "failed before"; only ids the base runs lack count."""
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n\n" + old + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_old::test_fresh"]
+    assert rec["ids"]["not_passing_after"] == []
+
+
+def test_an_old_skipped_test_in_the_erroring_file_does_not_block_acceptance(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """Only failures and errors after count against the worker; a skip the base
+    already had doesn't."""
+    from vigild.jobs.acceptance import check_tests
+
+    seed = fixture_repo["seed"]
+    old = (seed / "tests" / "test_old.py").read_text()
+    (seed / "tests" / "test_old.py").write_text(
+        "import pytest\n\n" + old
+        + "\n\n@pytest.mark.skip(reason='old')\ndef test_parked():\n    assert False\n"
+    )  # fmt: skip
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "an old skipped test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        text = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n" + text + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["not_passing_after"] == []
+    assert "tests.test_old::test_fresh" in rec["ids"]["failing_before"]
+    assert check_tests(SPEC, rec) == []
+
+
+def test_an_import_only_edit_of_a_base_file_proves_nothing(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text("from src.newmod import thing\n\n" + old)
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["failing_before"] == []
+    assert check_tests(SPEC, rec)
+
+
+def test_a_module_is_attributed_by_exact_path_not_by_suffix(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A pre-broken base tests/test_a.py must not be taken for the worker's pkg/tests/test_a.py."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_a.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        (c / "pkg" / "tests").mkdir(parents=True)
+        (c / "pkg" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests pkg")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+
+
+def test_the_collection_error_text_is_redacted(ws: Workspace, tmp_path: Path) -> None:
+    secret = "ghs_" + "a1B2c3D4e5F6g7H8i9J0"
+
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(
+            f'raise ImportError("{secret}")\n\n\ndef test_x():\n    pass\n'
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    fac = rec["before"]["failed_at_collection"]
+    assert secret not in str(fac) and secret not in str(rec["before"])
+
+
+def test_ids_cover_only_the_erroring_worker_module(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        _new_module(c)
+        (c / "tests" / "test_clean.py").write_text("def test_clean():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_new::test_thing"]
+
+
+def test_collection_errors_beside_passing_cases_stay_unknown(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q --continue-on-collection-errors tests")
+    assert (
+        "failed_at_collection" not in rec["before"]
+    )  # passing cases ran: not a collection-only exit
+    assert not rec["ids"].get("failing_before")
+    assert check_tests({**SPEC, "test_cmd": rec["test_cmd"]}, rec)
 
 
 def test_zero_tests_through_a_pipe_is_unknown_at_head(ws: Workspace, tmp_path: Path) -> None:
