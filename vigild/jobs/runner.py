@@ -82,7 +82,13 @@ from vigild.gateway.service import (
     Gateway,
     worst_case_usd,
 )
-from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
+from vigild.github.publish import (
+    BranchMoved,
+    LegacyBranch,
+    PublishError,
+    artifact_paths,
+    vigild_paths,
+)
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
@@ -257,6 +263,9 @@ class Pager(Protocol):
 SPEC_WAIT = frozenset({JobState.SPEC_PENDING})  # where a coord or an author waits
 BUILD_WAIT = frozenset({JobState.BUILDING})  # where a worker waits
 REVIEW_WAIT = frozenset({JobState.IN_REVIEW})  # where a review reserve waits
+
+
+BRANCH_MOVED_WHY = "branch moved on the remote"
 
 
 class PublishSkipped(PublishError):
@@ -2880,6 +2889,9 @@ class JobRunner:
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
         if len(broke) < len(task_ids):  # all out of cap: a budget outcome, not a repo failure
             self.job_failed(self.store.get_job(job_id))
+        moved = {tid: t["branch_moved"] for tid, t in tasks.items() if t.get("branch_moved")}
+        if moved:  # someone pushed to the branch: a retry would loop or overwrite them
+            can_retry = False
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
             job_id,
@@ -2895,9 +2907,12 @@ class JobRunner:
             job_id,
             f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300],
             {
-                "kind": "escalated" if escalated else "worker_failed",
+                "kind": (
+                    "branch_moved" if moved else "escalated" if escalated else "worker_failed"
+                ),
                 "tasks": tasks,
                 "actions": actions,
+                **({"branches": sorted(moved.values())} if moved else {}),
             },
             resumable=can_retry,
         )
@@ -3592,7 +3607,10 @@ class JobRunner:
                 "publish_refused", redact(pub), Provenance.HUMAN,
                 job_id=job_id, session_id=s.id, task_id=task_id,
             )  # fmt: skip
-            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+            moved = {"branch_moved": pub["branch"]} if isinstance(e, BranchMoved) else {}
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e), **moved}
+            )
         head, branch, overlap = pub["head"], pub["branch"], pub["runner_file_change"]
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         facts = self._pub_facts(job.repo, branch, pub["base_sha"])  # vault git: outside the tx
@@ -4116,6 +4134,10 @@ class JobRunner:
                 left[tid] = str(e)[:300]
                 legacy.add(tid)
                 continue
+            except BranchMoved as e:  # like legacy: only replan or abandon
+                left[tid] = f"{BRANCH_MOVED_WHY}: {e}"[:300]
+                legacy.add(tid)
+                continue
             except (PublishError, WorkspaceError, KeyError, OSError, ValueError) as e:
                 left[tid] = f"its PR could not be brought up to date without .vigil/: {e}"[:300]
                 continue
@@ -4427,9 +4449,14 @@ class JobRunner:
         if left:
             self._block(job_id, f".vigil/ on the PR head of {sorted(left)}")
             body: dict[str, Any] = {"kind": "vigil_in_pr", "tasks": left}
-            if legacy:  # retry can't help: the branch predates stripping
+            if legacy:  # retry can't help: the branch predates stripping, or moved
                 body["actions"] = ["replan", "abandon"]
-                body["next"] = "the branch predates artifact stripping and needs the owner's hand"
+                if any(left[t].startswith(BRANCH_MOVED_WHY) for t in legacy):
+                    body["next"] = "branch moved on the remote: someone else pushed to it"
+                else:
+                    body["next"] = (
+                        "the branch predates artifact stripping and needs the owner's hand"
+                    )
             else:
                 body["actions"] = ["retry", "abandon"]
             self._page(
