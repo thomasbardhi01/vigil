@@ -83,6 +83,9 @@ class NullRunner:
     def prepare_fix(self, job_id: str, task_id: str) -> int:
         raise RuntimeError("no runner attached")
 
+    def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None:
+        raise RuntimeError("no runner attached")
+
     def replay_review(
         self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
     ) -> dict[str, Any]:
@@ -331,6 +334,11 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
         target=every, args=(RESERVATION_SWEEP_SECONDS, runner.page_stranded_drafts_sweep, stop),
         name="vigil-stranded", daemon=True,
     ).start()  # fmt: skip
+    # a validated rebuild (the CLI's too) releases a stale-image hold
+    threading.Thread(
+        target=every, args=(RESERVATION_SWEEP_SECONDS, runner.release_stale_images, stop),
+        name="vigil-stale-images", daemon=True,
+    ).start()  # fmt: skip
     if runner.pr_state is not None:
         # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
         threading.Thread(
@@ -416,6 +424,8 @@ def main() -> None:
     log.info("reconcile: %s", runner.reconcile())
 
     def ready() -> None:
+        # a deploy whose rebuild failed: hold the repo's dispatch behind one page
+        log.info("stale images held: %s", runner.hold_stale_images())
         runner.start_deferred()
         start_pollers(v, app, runner)
 
