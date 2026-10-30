@@ -31,8 +31,9 @@ from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import public_view
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
-from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
+from vigild.intake.spec_gate import check_job_spec, check_task
 from vigild.jobs import decisions
+from vigild.jobs.acceptance import plan_runner_class
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
@@ -43,7 +44,7 @@ from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import is_bench_repo
 from vigild.router.rules import RoutingError, route
-from vigild.verifier import runner_overlap
+from vigild.verifier import runner_class
 
 
 class Runner(Protocol):
@@ -52,6 +53,7 @@ class Runner(Protocol):
     def on_resume(self, job_id: str, *, replan: bool = False) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]: ...
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
     def fix_check(self, job_id: str, task_id: str) -> str | None: ...
     def fix_escalation(self, job_id: str, task_id: str) -> str | None: ...
@@ -375,10 +377,11 @@ class JobService:
         # vigild computes the runner-file class; a caller's value is replaced
         task = task.model_copy(
             update={
-                "runner_file_change": runner_overlap(
+                "runner_file_change": runner_class(
                     task.spec.files_in_scope,
                     self.cfg.repo(task.repo).runner_config,
                     task.spec.test_cmd or "",
+                    (),  # a bare task has no approved spec, so no AC commands
                 )
             }
         )
@@ -580,12 +583,15 @@ class JobService:
         plan = self.store.get_artifact(job_id, "plan.md")
         if plan is None:
             return {}
-        runner_config = self.cfg.repo(self.store.get_job(job_id).repo).runner_config
-        out: dict[str, list[str]] = {}
-        for w in parse_plan(plan.content).workers:
-            if hit := runner_overlap(w.files_in_scope, runner_config, w.test_cmd):
-                out[w.task_id] = hit
-        return out
+        job = self.store.get_job(job_id)
+        spec = self.store.get_artifact(job_id, "spec.md")
+        classes = plan_runner_class(
+            spec.content if spec else "",
+            parse_plan(plan.content).workers,
+            self.cfg.repo(job.repo).runner_config,
+            self.runner.base_reader(job.repo, job.base),
+        )
+        return {t: hit for t, hit in classes.items() if hit}
 
     def _hidden_frozen(self, job_id: str) -> dict[str, bool]:
         """The host switch as it is when the spec is gated: recorded in `spec_gate.json`,
@@ -770,9 +776,7 @@ class JobService:
                         "must_fail_first": w.must_fail_first,
                         "must_fail_first_reason": w.must_fail_first_reason,
                         # round 3, F1: the spec lets this worker change how tests run
-                        "changes_how_tests_run": runner_files_named(
-                            w.files_in_scope, self.cfg.repo(job.repo).runner_config, w.test_cmd
-                        ),
+                        "changes_how_tests_run": flagged.get(w.task_id, []),
                         # owner ruling, 2026-10-23: hidden tests (names and
                         # categories only) and an owner look
                         "runner_file_change": flagged.get(w.task_id, []),
@@ -1225,10 +1229,27 @@ class JobService:
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
             self._close_out(job.id, breakers)
+        self._stop_abandoned(job.id)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
+
+    def _stop_abandoned(self, job_id: str, wait: float = 30.0) -> None:
+        """An inbox or breaker abandon stops what the job still has running the way a kill
+        does (stop, revoke, drain, settle, remove the containers), then records the same
+        `job_killed` event. A step that fails is logged; the job is already abandoned, and
+        `vigil kill` finishes it (#162)."""
+        with self._kill_lock(job_id):
+            try:
+                effects = self._kill_effects(job_id, wait)
+            except KillFailed:
+                return  # logged by `_kill_failed`; no event, so a later kill runs it again
+            self.store.add_event(
+                "job_killed",
+                {"actor": Actor.OWNER.value, "channel": "inbox", "from": "abandon", **effects},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
 
     def _close_out(self, job_id: str, breakers: Any) -> None:
         """What giving a job up leaves behind, closed: its tasks that have no open PR are

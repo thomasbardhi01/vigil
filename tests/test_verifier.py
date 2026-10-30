@@ -302,17 +302,213 @@ def test_an_unrelated_failure_at_before_is_not_must_fail_first(
     assert rec["ids"]["checked"] is True and rec["ids"]["failing_before"] == []
 
 
-def test_a_collection_error_at_before_is_unknown(ws: Workspace, tmp_path: Path) -> None:
+NEW_MODULE_TEST = "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
+
+
+def _new_module(c: Path) -> None:
+    (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+def test_a_collection_error_in_the_workers_new_test_counts_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """#161: the most common test-first shape. The new module imports code the base lacks,
+    so the before run fails at collection (pytest exit 2); the module's ids come from after."""
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail" and rec["before"]["exit"] == 2
+    fac = rec["before"]["failed_at_collection"]
+    assert fac["modules"] == ["tests.test_new"] and "newmod" in fac["error"]
+    assert len(fac["error"]) <= 400
+    assert rec["after"]["outcome"] == "pass"
+    assert rec["ids"] == {
+        "checked": True,
+        "failing_before": ["tests.test_new::test_thing"],
+        "not_passing_after": [],
+    }
+    from vigild.jobs.acceptance import check_tests
+
+    spec = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+    assert check_tests(spec, rec) == []
+
+
+def test_a_collection_error_in_a_base_test_file_stays_unknown(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A file the worker did not add or change can't be what fails before, even beside
+    the worker's own erroring module."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_broken.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
+
+
+def test_a_collection_error_in_a_conftest_stays_unknown(ws: Workspace, tmp_path: Path) -> None:
     def edit(c: Path) -> None:
-        (c / "tests" / "test_new.py").write_text(
-            "from src.newmod import thing\n\n\ndef test_thing():\n    assert thing() == 1\n"
-        )
-        (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+        _new_module(c)
+        (c / "tests" / "conftest.py").write_text("import no_such_module_anywhere\n")
 
     base, head = _session(ws, tmp_path, edit)
-    rec = _verify(ws, base, head, "pytest -q tests/test_new.py")
-    assert rec["before"]["outcome"] == "unknown"  # pytest exit 2: collection error
-    assert rec["after"]["outcome"] == "pass"
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] != "fail"
+    assert "failed_at_collection" not in rec["before"]
+    assert not rec["ids"].get("failing_before")
+
+
+def test_a_workers_test_that_errors_at_collection_after_still_fails(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(NEW_MODULE_TEST)  # src/newmod.py never added
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["after"]["outcome"] != "pass"
+    assert rec["ids"]["failing_before"] == []  # after has no ids for the module
+    from vigild.jobs.acceptance import check_tests
+
+    assert check_tests({"test_cmd": "pytest -q tests", "must_fail_first": True}, rec)
+
+
+def _newmod_only(c: Path) -> None:
+    (c / "src" / "newmod.py").write_text("def thing():\n    return 1\n")
+
+
+SPEC = {"test_cmd": "pytest -q tests", "must_fail_first": True}
+
+
+def test_only_new_ids_in_an_edited_base_file_count_as_failing_before(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """The before run never executed the edited file, so a test that passes on the base
+    can't have "failed before"; only ids the base runs lack count."""
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n\n" + old + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_old::test_fresh"]
+    assert rec["ids"]["not_passing_after"] == []
+
+
+def test_an_old_skipped_test_in_the_erroring_file_does_not_block_acceptance(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """Only failures and errors after count against the worker; a skip the base
+    already had doesn't."""
+    from vigild.jobs.acceptance import check_tests
+
+    seed = fixture_repo["seed"]
+    old = (seed / "tests" / "test_old.py").read_text()
+    (seed / "tests" / "test_old.py").write_text(
+        "import pytest\n\n" + old
+        + "\n\n@pytest.mark.skip(reason='old')\ndef test_parked():\n    assert False\n"
+    )  # fmt: skip
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "an old skipped test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        text = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text(
+            "from src.newmod import thing\n" + text + "\n\ndef test_fresh():\n    assert thing()\n"
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["not_passing_after"] == []
+    assert "tests.test_old::test_fresh" in rec["ids"]["failing_before"]
+    assert check_tests(SPEC, rec) == []
+
+
+def test_an_import_only_edit_of_a_base_file_proves_nothing(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    def edit(c: Path) -> None:
+        _newmod_only(c)
+        old = (c / "tests" / "test_old.py").read_text()
+        (c / "tests" / "test_old.py").write_text("from src.newmod import thing\n\n" + old)
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["ids"]["failing_before"] == []
+    assert check_tests(SPEC, rec)
+
+
+def test_a_module_is_attributed_by_exact_path_not_by_suffix(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A pre-broken base tests/test_a.py must not be taken for the worker's pkg/tests/test_a.py."""
+    seed = fixture_repo["seed"]
+    (seed / "tests" / "test_a.py").write_text("import no_such_module_anywhere\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a broken base test")
+    git(seed, "push", "-q", "origin", "main")
+
+    def edit(c: Path) -> None:
+        (c / "pkg" / "tests").mkdir(parents=True)
+        (c / "pkg" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "__init__.py").write_text("")
+        (c / "pkg" / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests pkg")
+    assert rec["before"]["outcome"] == "unknown"
+    assert "failed_at_collection" not in rec["before"]
+
+
+def test_the_collection_error_text_is_redacted(ws: Workspace, tmp_path: Path) -> None:
+    secret = "ghs_" + "a1B2c3D4e5F6g7H8i9J0"
+
+    def edit(c: Path) -> None:
+        (c / "tests" / "test_new.py").write_text(
+            f'raise ImportError("{secret}")\n\n\ndef test_x():\n    pass\n'
+        )
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    fac = rec["before"]["failed_at_collection"]
+    assert secret not in str(fac) and secret not in str(rec["before"])
+
+
+def test_ids_cover_only_the_erroring_worker_module(ws: Workspace, tmp_path: Path) -> None:
+    def edit(c: Path) -> None:
+        _new_module(c)
+        (c / "tests" / "test_clean.py").write_text("def test_clean():\n    assert True\n")
+
+    base, head = _session(ws, tmp_path, edit)
+    rec = _verify(ws, base, head, "pytest -q tests")
+    assert rec["before"]["outcome"] == "fail"
+    assert rec["ids"]["failing_before"] == ["tests.test_new::test_thing"]
+
+
+def test_collection_errors_beside_passing_cases_stay_unknown(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    base, head = _session(ws, tmp_path, _new_module)
+    rec = _verify(ws, base, head, "pytest -q --continue-on-collection-errors tests")
+    assert (
+        "failed_at_collection" not in rec["before"]
+    )  # passing cases ran: not a collection-only exit
+    assert not rec["ids"].get("failing_before")
+    assert check_tests({**SPEC, "test_cmd": rec["test_cmd"]}, rec)
 
 
 def test_zero_tests_through_a_pipe_is_unknown_at_head(ws: Workspace, tmp_path: Path) -> None:
@@ -1131,3 +1327,233 @@ def test_an_unknown_encoding_attribute_still_checks_out(ws: Workspace, tmp_path:
     src = ws.verify_checkout(REPO, "enc", sha)
     assert _g(src, "rev-parse", "HEAD^{tree}") == _g(ws.vault(REPO), "rev-parse", f"{sha}^{{tree}}")
     assert len(_history_facts(src)["commits"]) == 1
+
+
+# --- #31 items 4 and 7: vitest project dirs and exact-path case matching ------------------------
+
+_PA_PKG = {
+    "server/package.json": (
+        '{"scripts": {"test": "vitest run", "lint": "eslint src", "build": "tsc",'
+        ' "test:pg": "vitest run --config vitest.pg.config.ts"}}'
+    ),
+    "executor/package.json": (
+        '{"scripts": {"test": "vitest run", "lint": "eslint src", "build": "tsc"}}'
+    ),
+}
+_PG_URL = "postgresql://ci:ci@127.0.0.1:5432/pa_pg_test"
+_CI_URL = "postgresql://ci:ci@127.0.0.1:5432/ci"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "dirs"),
+    [
+        ("pnpm -C server exec vitest run x", ("server",)),
+        ("pnpm --dir server exec vitest run x", ("server",)),
+        ("cd web && pnpm -C server exec vitest run x", ("web/server",)),
+        ("cd web && pnpm exec vitest run x", ("web",)),
+        ("vitest run x", ("",)),
+    ],
+)
+def test_ac1_pnpm_dir_is_read_for_a_direct_vitest_command(cmd: str, dirs: tuple[str, ...]) -> None:
+    from vigild.verifier import plan_reports
+
+    assert plan_reports(cmd, None).vitest_dirs == dirs
+
+
+def test_ac2_each_report_maps_to_its_commands_dir() -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(
+        "pnpm -C server exec vitest run a && pnpm -C executor exec vitest run b"
+        " && pnpm -C server exec vitest run c",
+        None,
+    )
+    assert plan.report_dirs == {
+        "vitest-1.xml": "server",
+        "vitest-2.xml": "executor",
+        "vitest-3.xml": "server",
+    }
+    assert plan.vitest_dirs == ("server", "executor")  # deduplicated, as before
+    scripts = plan_reports("pnpm -C server test && cd executor && pnpm test", {
+        **_PA_PKG, "executor/package.json": _PA_PKG["executor/package.json"],
+        "package.json": '{"scripts": {"test": "vitest run"}}',
+    }.get)  # fmt: skip
+    assert scripts.report_dirs == {"vitest-1.xml": "server", "vitest-2.xml": "executor"}
+    assert plan_reports("pytest -q tests", None).report_dirs == {}
+
+
+def test_ac3_a_case_carries_its_project_from_the_report_parse() -> None:
+    from vigild.verifier import Case, parse_junit
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    assert Case("a::t", "a", "pass").project is None
+    assert parse_junit(xml)[0].project is None
+    assert parse_junit(xml, project="server")[0].project == "server"
+
+
+def test_ac3_run_sets_projects_from_the_mapping_it_is_given(tmp_path: Path) -> None:
+    from vigild.verifier import RunResult, Verifier
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    py = b'<testsuite><testcase classname="tests.test_a" name="test_a"/></testsuite>'
+
+    class Ws:
+        def verify_checkout(self, repo: str, name: str, sha: str, **kw: Any) -> Path:
+            src = tmp_path / name / "src"
+            src.mkdir(parents=True)
+            return src
+
+    class Runner:
+        def run(self, *a: Any, **k: Any) -> RunResult:
+            return RunResult(
+                0, "", reports={"vitest-1.xml": xml, "vitest-2.xml": xml, "pytest.xml": py}
+            )
+
+    v = Verifier(Ws(), Runner())  # type: ignore[arg-type]
+    run = v._run("r", "img", "n", "sha", "cmd", "cmd", [], report_dirs={"vitest-1.xml": "server"})
+    by_status = [(c.file, c.project) for c in run["_cases"]]
+    assert ("test/a.test.ts", "server") in by_status
+    assert ("test/a.test.ts", "<unknown>") in by_status  # vitest-2.xml has no mapped dir
+    assert ("tests.test_a", None) in by_status
+
+
+def test_ac3_ac_run_uses_the_plan_it_built_from_base_blobs(tmp_path: Path) -> None:
+    from vigild.verifier import RunResult, Verifier
+
+    xml = b'<testsuite><testcase classname="test/a.test.ts" name="ok"/></testsuite>'
+    reads: list[tuple[str, str]] = []
+
+    class Ws:
+        def read_blob(self, repo: str, sha: str, path: str) -> str | None:
+            reads.append((sha, path))
+            return '{"scripts": {"test": "vitest run"}}' if path == "server/package.json" else None
+
+        def verify_checkout(self, repo: str, name: str, sha: str, **kw: Any) -> Path:
+            src = tmp_path / name / "src"
+            src.mkdir(parents=True)
+            return src
+
+    class Runner:
+        def run(self, *a: Any, **k: Any) -> RunResult:
+            return RunResult(0, "", reports={"vitest-1.xml": xml})
+
+    v = Verifier(Ws(), Runner())  # type: ignore[arg-type]
+    seen: list[Any] = []
+    real = v._run
+
+    def spy(*a: Any, **k: Any) -> dict[str, Any]:
+        out = real(*a, **k)
+        seen.append(out["_cases"])
+        return out
+
+    v._run = spy  # type: ignore[method-assign]
+    entry = v._ac_run(
+        "r", "img", "ac1", "headsha", "pnpm -C server test", ["AC1"], ("b", []), "basesha"
+    )
+    assert entry["selected"] == 1
+    assert seen[0][0].project == "server"
+    assert reads and all(sha == "basesha" for sha, _ in reads)  # never the head's blobs
+
+
+def test_ac4_vitest_cases_match_the_full_repo_path() -> None:
+    from vigild.verifier import Case, belongs
+
+    def case(file: str, project: str | None) -> Case:
+        return Case(f"{file}::t", file, "pass", project=project)
+
+    files = ["server/test/a.test.ts", "client/test/a.test.ts"]
+    assert belongs(case("test/a.test.ts", "server"), files)
+    assert belongs(case("test/a.test.ts", "client"), files)
+    assert not belongs(case("test/a.test.ts", "executor"), files)
+    assert not belongs(case("test/a.test.ts", "server"), ["client/test/a.test.ts"])
+    # no suffix match: a deeper path in the same project is another file
+    assert not belongs(case("a.test.ts", "server"), ["server/test/a.test.ts"])
+    # no double prefix, when the dir is empty or already leads the file
+    assert belongs(case("test/a.test.ts", ""), ["test/a.test.ts"])
+    assert belongs(case("server/test/a.test.ts", "server"), ["server/test/a.test.ts"])
+    # a nested dir
+    assert belongs(case("t/a.test.ts", "web/server"), ["web/server/t/a.test.ts"])
+
+
+def test_ac4_an_unknown_project_matches_exactly_or_not_at_all() -> None:
+    from vigild.verifier import Case, belongs
+
+    unknown = Case("test/a.test.ts::t", "test/a.test.ts", "pass", project="<unknown>")
+    assert not belongs(unknown, ["server/test/a.test.ts"])  # no suffix guess
+    assert belongs(unknown, ["test/a.test.ts"])  # an exact path is still its own
+
+
+def test_ac4_pytest_cases_keep_module_prefix_matching() -> None:
+    from vigild.verifier import Case, belongs
+
+    c = Case("tests.test_a.TestX::t", "tests.test_a.TestX", "pass")
+    assert belongs(c, ["pkg/tests/test_a.py"]) and not belongs(c, ["tests/test_b.py"])
+
+
+# AC7: real commands, planned as on main; none refused or escalated by the fail-closed rule.
+_REAL: list[tuple[str, tuple[str, ...], dict[str, str], list[str]]] = [
+    (
+        "pnpm -C server lint && pnpm -C server test",
+        ("server",), {"vitest-1.xml": "server"}, ["`pnpm -C server lint`"],
+    ),
+    (
+        f"pnpm -C executor run build && DATABASE_URL={_CI_URL} pnpm -C server build",
+        (), {}, ["`pnpm -C executor run build`", "`DATABASE_URL"],
+    ),
+    (
+        f"export DATABASE_URL={_PG_URL} TEST_PG_DATABASE_URL={_PG_URL} && "
+        "pnpm -C server exec prisma generate && pnpm -C server exec prisma migrate deploy && "
+        "pnpm -C server test:pg",
+        ("server",), {"vitest-1.xml": "server"}, [],
+    ),
+    (
+        "pnpm -C executor lint && pnpm -C executor test",
+        ("executor",), {"vitest-1.xml": "executor"}, ["`pnpm -C executor lint`"],
+    ),
+    ("pnpm -C server test test/x.test.ts", ("server",), {"vitest-1.xml": "server"}, []),
+    ("uv run --offline pytest -q -p no:cacheprovider -n auto", (), {}, []),
+    ("uv run pytest -q tests/gateway/test_own_call_key.py -k before_insert", (), {}, []),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("cmd", "dirs", "reports", "problems"), _REAL)
+def test_ac7_real_commands_plan_as_before(
+    cmd: str, dirs: tuple[str, ...], reports: dict[str, str], problems: list[str]
+) -> None:
+    from vigild.verifier import plan_reports
+
+    plan = plan_reports(cmd, _PA_PKG.get)
+    assert plan.vitest_dirs == dirs
+    assert getattr(plan, "report_dirs", reports) == reports
+    assert [p for p in plan.problems if not any(p.startswith(x) for x in problems)] == []
+    assert len(plan.problems) == len(problems)
+    names = {f"vitest-{i}.xml" for i in range(1, len(reports) + 1)}
+    assert all(f"--outputFile.junit=/tmp/vigil-report/{n}" in plan.command for n in names)
+
+
+def test_ac7_realistic_cases_are_matched_as_before() -> None:
+    from vigild.verifier import Case, belongs
+
+    # ParkAgent's server suite: vitest names a file relative to its project dir
+    server = Case("test/api/x.test.ts::row", "test/api/x.test.ts", "pass")
+    assert belongs(server, ["server/test/api/x.test.ts"])
+    assert belongs(server, ["test/api/x.test.ts"])
+    assert not belongs(server, ["server/test/api/y.test.ts"])
+    # Vigil's own pytest ids
+    py = Case("tests.gateway.test_own_call_key::test_k", "tests.gateway.test_own_call_key", "pass")
+    assert belongs(py, ["tests/gateway/test_own_call_key.py"])
+    assert not belongs(py, ["tests/gateway/test_other.py"])
+
+
+@pytest.mark.parametrize(
+    ("cmd", "dirs"),
+    [
+        ("pnpm -C server exec vitest run --dir test", ("server",)),
+        ("pnpm exec vitest run --dir src", ("",)),
+        ("cd web && pnpm --dir server exec vitest run -C x", ("web/server",)),
+    ],
+)
+def test_vitest_own_dir_option_is_not_pnpms(cmd: str, dirs: tuple[str, ...]) -> None:
+    from vigild.verifier import plan_reports
+
+    assert plan_reports(cmd, None).vitest_dirs == dirs

@@ -33,6 +33,7 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import hashlib
 import json
@@ -44,7 +45,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -74,7 +75,13 @@ from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_too
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.executors.hosts import HostRefused
 from vigild.executors.runtime import job_scope
-from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
+from vigild.gateway.service import (
+    CHARS_PER_TOKEN,
+    MIN_OUTPUT_TOKENS,
+    TOKEN_TTL_MARGIN_MIN,
+    Gateway,
+    worst_case_usd,
+)
 from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
@@ -88,6 +95,7 @@ from vigild.jobs.acceptance import (
     contract_text,
     escalates,
     live_workers,
+    plan_runner_class,
     worker_acs,
 )
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec, render
@@ -101,6 +109,7 @@ from vigild.jobs.integrity import Finding, finding_id
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
+from vigild.metering.prices import PriceTable
 from vigild.packets.assemble import (
     COORD_PACKETS,
     assemble_audit,
@@ -136,7 +145,7 @@ from vigild.router.rules import CoordShape, RoutingError, request_paths, route, 
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import Halted, Verifier, halt_when, runner_like, runner_overlap
+from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_class, runner_like
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -154,6 +163,20 @@ class ReviewInputs:
 
 # the draft PR title of a runner-file task while hidden tests are off (host policy)
 OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
+PR_TITLE_MAX = 200  # GitHub refuses a title over 256 characters (422)
+
+
+def pr_title(job_id: str, goal: str) -> str:
+    """`[vigil <job>] ` and the goal's first line, cut at a word to fit: a replan's goal
+    can run to thousands of characters (vi-0008, 2026-10-29)."""
+    prefix = f"[vigil {job_id}] "
+    first = (goal.strip().splitlines() or [""])[0].strip()
+    room = PR_TITLE_MAX - len(prefix)
+    if len(first) > room:
+        first = first[: room - 1].rsplit(" ", 1)[0].rstrip(" ,;:.") + "…"
+    return prefix + first
+
+
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
@@ -753,9 +776,12 @@ class JobRunner:
         self._page(None, title, body)
 
     def on_rebuild(self, repo: str, base_sha: str) -> None:
-        """The owner asked for a failed dev image to be built again."""
+        """The owner asked for a failed dev image to be built again. The page's
+        `base_sha` is where it failed, possibly behind a fix that has since merged, so
+        the build is at main's tip (the same commit `vigil dev-image` builds at)."""
 
         def go(_: str) -> None:
+            base_sha = self.workspace.head_sha(repo, "main")
             if self.session_images is not None:
                 self.session_images.ensure_fresh(repo, base_sha, force=True)
             else:
@@ -1434,18 +1460,33 @@ class JobRunner:
         for r in rows:
             if not r["session_id"]:
                 self.budget.settle(int(r["id"]), 0.0)  # nothing metered: the hold goes back
-        # a session row nothing is running any more
-        if idle:
-            for s in self.store.list_sessions(job_id):
-                if s.status in LIVE_SESSION:
-                    self.store.update_session(s.id, status="killed", ended_at=iso())
         purge = getattr(self.executor, "purge_job", None)
-        removed = {"containers": 0, "networks": 0}
+        removed: dict[str, Any] = {"containers": 0, "networks": 0}
+        purge_failed = False
         if purge is not None:
             try:
                 removed = purge(job_id, sids)
             except Exception:
+                purge_failed = True
                 log.exception("kill %s: removing its containers failed", job_id)
+        # a session whose containers are gone is over; one with a container that would not
+        # go (named in `containers_failed`) stays as it is, so the owner sees it
+        failed = [str(n) for n in removed.get("failed", [])]
+        unreachable = [str(h) for h in removed.get("hosts_unreachable", [])]
+        stuck = {
+            sid
+            for sid in {s.id for s in self.store.list_sessions(job_id)}
+            if any(n in (f"vigil-{sid}", f"vigil-{sid}-egress") for n in failed)
+        }
+        for s in self.store.list_sessions(job_id):
+            if (
+                s.status in LIVE_SESSION
+                and s.id not in stuck
+                and not purge_failed
+                and (idle or purge is not None)
+            ):
+                self.store.update_session(s.id, status="killed", ended_at=iso())
+        stopped = [sid for sid in stopped if sid not in stuck and not purge_failed]
         still = set(self.budget.open_reservation_ids())
         return {
             "sessions_stopped": stopped,
@@ -1457,6 +1498,13 @@ class JobRunner:
             "reservations_open": [r for r in held if r in still],
             "containers_removed": removed["containers"],
             "networks_removed": removed["networks"],
+            "containers_failed": failed,
+            "kill_errors": {str(k): str(v) for k, v in removed.get("kill_errors", {}).items()},
+            "unowned": [str(n) for n in removed.get("unowned", [])],
+            "hosts_unreachable": unreachable,
+            # clean: nothing of the job is known to be left, on any host. A stuck verifier,
+            # probe or deps container counts, as does a host that could not be reached
+            "clean": not purge_failed and not failed and not unreachable,
         }
 
     def _replan_notes(self, job_id: str) -> list[str]:
@@ -2188,6 +2236,25 @@ class JobRunner:
 
     # --- stages 2-3: planning and building -----------------------------------------------
 
+    def _has_existing_tests(self, repo: str, base: str, files: list[str]) -> bool:
+        """Is there a test for this scope at the base branch (as last mirrored)? An in-scope
+        path that is a test file, or the packet assembler's related test: a path under
+        tests/ named test_<stem>*.py for a scope entry without `*`. Rules 4 and 6 read it."""
+        paths = self.workspace.mirror_paths(repo, base)
+        for f in files:
+            if "*" in f:
+                continue
+            if TEST_FILE.search(f) and self.workspace.mirror_file(repo, base, f) is not None:
+                return True
+            stem = PurePosixPath(f).stem
+            if any(
+                p.startswith("tests/")
+                and fnmatch.fnmatchcase(PurePosixPath(p).name, f"test_{stem}*.py")
+                for p in paths
+            ):
+                return True
+        return False
+
     def _task(self, job_id: str, repo: str, base: str, source: str, w: WorkerContract) -> Task:
         cap = (
             self.cfg.budgets.bench_task_usd if source == "bench" else self.cfg.budgets.per_task_usd
@@ -2216,9 +2283,23 @@ class JobRunner:
             depends_on=w.depends_on,
             labels=w.labels,
             size=w.size,
-            runner_file_change=runner_overlap(
-                w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd
-            ),
+            has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
+            runner_file_change=self._plan_runner_files(job_id, repo, w),
+        )
+
+    def _plan_runner_files(self, job_id: str, repo: str, w: WorkerContract) -> list[str]:
+        """The task's runner files, counting the approved spec's AC commands (#142)."""
+        art = self.store.get_artifact(job_id, "spec.md")
+        plan = self.store.get_artifact(job_id, "plan.md")
+        workers = parse_plan(plan.content).workers if plan else [w]
+        classes = plan_runner_class(
+            art.content if art else "",
+            workers,
+            self.cfg.repo(repo).runner_config,
+            self.base_reader(repo, self.store.get_job(job_id).base),
+        )
+        return classes.get(w.task_id) or runner_class(
+            w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd, ()
         )
 
     def build(self, job_id: str) -> None:
@@ -2322,16 +2403,23 @@ class JobRunner:
                     admitted.append(tid)
                 if not admitted:
                     return {}
-                retrying = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                failed = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                # a publish refusal's retry republishes its recorded head (#152): it
+                # reserves nothing and starts no session, so the cap floor doesn't apply
+                republish = [t for t in failed if self._republish_inputs(t) is not None]
+                # no session, and no reservation, for a task that can't afford one call (#121)
+                broke = {t: w for t in admitted if t not in republish and (w := self.out_of_cap(t))}
+                startable = [t for t in admitted if t not in broke]
+                retrying = [t for t in startable if t in failed]
                 try:
-                    held = self._reserve_wave(job_id, admitted)
+                    held = self._reserve_wave(job_id, [t for t in startable if t not in republish])
                 except Refused:
                     return None
                 for tid in admitted:
                     self.store.update_task(tid, state="running")  # its place in the stack
             routed_before = {tid: self.store.get_task(tid) for tid in retrying}
             try:
-                for tid in retrying:
+                for tid in (t for t in retrying if t not in republish):
                     # another attempt; the third is routed by rule 5 (escalated)
                     attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
                     self._reroute(job_id, tid, attempt=attempt + 1)
@@ -2347,7 +2435,7 @@ class JobRunner:
                     if t.tier and t.tier_reason and t.backend_preset:  # it ran: it was routed
                         self.store.route_task(tid, tier=t.tier, tier_reason=t.tier_reason,
                                               backend_preset=t.backend_preset)  # fmt: skip
-                for tid in admitted:
+                for tid in startable:
                     self.store.update_task(tid, state="failed" if tid in retrying else "waiting")
                     self._queue_leave(self._queue_key(job_id, "worker", tid))  # no thread will wait
                 self._block(job_id, f"routing: {e}")
@@ -2361,7 +2449,11 @@ class JobRunner:
             # a worker the day had no room for waits in its own thread (the budget
             # queue), so the others run and free the money
             return {
-                tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
+                tid: functools.partial(self._republish, job_id, tid)
+                if tid in republish
+                else functools.partial(self._out_of_cap_fail, job_id, tid, broke[tid])
+                if tid in broke
+                else functools.partial(self._run_worker, job_id, tid, *held[tid])
                 if tid in held
                 else functools.partial(self._run_queued_worker, job_id, tid)
                 for tid in admitted
@@ -2505,6 +2597,74 @@ class JobRunner:
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
+    def call_floor_usd(self, task_id: str) -> float:
+        """The least one call costs the gateway's way (#121): its own worst-case arithmetic
+        at its output floor (`MIN_OUTPUT_TOKENS`), over the smallest input any call of
+        this task has had (none yet: no input). 0 for a task with no priced model."""
+        t = self.store.get_task(task_id)
+        if t.contract.get("shape") == "deps":
+            return 0.0
+        model = self.cfg.preset(t.backend_preset or self.cfg.routing.fallback).model or ""
+        prices = PriceTable(self.cfg.prices)
+        if not prices.has(model):
+            return 0.0
+        (row,) = self.store.q(
+            "SELECT MIN(tokens_in + tokens_cache_read + tokens_cache_write_5m"
+            " + tokens_cache_write_1h) AS n FROM model_calls WHERE task_id=?"
+            " AND tokens_in + tokens_cache_read + tokens_cache_write_5m"
+            " + tokens_cache_write_1h > 0",
+            (task_id,),
+        )
+        raw_len = int(row["n"] or 0) * CHARS_PER_TOKEN
+        return worst_case_usd(prices, model, raw_len, MIN_OUTPUT_TOKENS)
+
+    def out_of_cap(self, task_id: str) -> str | None:
+        """Why a worker session can't start for this task: what is left of its cap can't
+        afford one call at the gateway's floor. A budget outcome, not a repo failure."""
+        left = self.remaining(task_id)[2]
+        if left < MIN_RETRY_USD:
+            return None  # the task's own cap is spent: the per-task cap breaker's page, as before
+        floor = self.call_floor_usd(task_id)
+        if left >= floor:
+            return None
+        return (
+            f"out of cap: ${left:.2f} left, under the floor for one call (${floor:.2f}); "
+            "replan to give a fresh worker its own cap"
+        )
+
+    def _out_of_cap_fail(self, job_id: str, task_id: str, why: str) -> bool:
+        """No container, no session, no reservation: the task fails with the reason."""
+        return self._fail(
+            job_id, None, task_id, f"{task_id}: out of cap", {"error": why, "out_of_cap": True}
+        )
+
+    def _cli_stderr(self, out: ExecOutcome) -> str:
+        """The last 2,000 bytes of the worker CLI's stderr, redacted (#121). Untrusted
+        text: a packet takes it only through `packets.fence()`."""
+        raw = out.result.get("cli_stderr_tail")
+        if not raw and out.exit_code not in (0, None):
+            raw = out.error  # no result line: the container's own stderr tail
+        text = str(redact(str(raw or "")))
+        return text.encode()[-2000:].decode(errors="ignore")
+
+    def _overlap(
+        self, repo: str, contract: dict[str, Any], ac_runs: list[tuple[str, list[str]]]
+    ) -> list[str]:
+        """A task's runner files at verify time (#142, #144): the one classification,
+        over the AC commands the verifier will run."""
+        spec = contract["spec"]
+        return runner_class(
+            spec.get("files_in_scope") or [],
+            self.cfg.repo(repo).runner_config,
+            str(spec.get("test_cmd") or ""),
+            [c for c, _ in ac_runs],
+        )
+
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
+        """Reads a file at the base branch's tip from vigild's mirror (never a session
+        clone): plan time's reader, as verify's is the vault blob at the base sha."""
+        return lambda path: self.workspace.mirror_file(repo, base, path)
+
     def _ac_commands(
         self, job_id: str, repo: str, base_sha: str, contract: dict[str, Any]
     ) -> tuple[list[tuple[str, list[str]]], list[str]]:
@@ -2582,7 +2742,16 @@ class JobRunner:
             if self.store.get_task(tid).state != "escalated":
                 lefts.append(left)
         # retry is offered while every task it would run has budget left
-        can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
+        broke = [tid for tid, t in tasks.items() if t.get("out_of_cap")]
+        can_retry = (
+            bool(lefts)
+            and all(x >= MIN_RETRY_USD for x in lefts)
+            and not any(
+                self.out_of_cap(tid)
+                for tid in task_ids
+                if self.store.get_task(tid).state != "escalated"
+            )
+        )  # a retry that can't make one call isn't offered (#121)
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
             # item 5: a child deps job; this job resumes on its own when it merges
@@ -2609,7 +2778,8 @@ class JobRunner:
             )
             return
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
-        self.job_failed(self.store.get_job(job_id))
+        if len(broke) < len(task_ids):  # all out of cap: a budget outcome, not a repo failure
+            self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
             job_id,
@@ -2989,6 +3159,9 @@ class JobRunner:
         if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
             self._close_killed(job_id)
             return False
+        cli_stderr = self._cli_stderr(out) if out.status != "done" else ""
+        if cli_stderr:
+            self.store.update_session(s.id, detail={"cli_stderr_tail": cli_stderr})
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
             self.store.update_session(
@@ -3003,6 +3176,8 @@ class JobRunner:
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
             )  # fmt: skip
             if self._resumable(task_id):
+                if (why := self.out_of_cap(task_id)) is not None:
+                    return self._out_of_cap_fail(job_id, task_id, why)
                 _, _, left = self.remaining(task_id)
                 try:
                     rid = self.budget.reserve(
@@ -3034,8 +3209,8 @@ class JobRunner:
                 s,
                 task_id,
                 f"{task_id}: worker session {out.status}",
-                {"error": out.error or ""},
-            )
+                {"error": out.error or "", "cli_stderr_tail": cli_stderr},
+            )  # fmt: skip
         if not self.store.q("SELECT 1 FROM model_calls WHERE session_id=? LIMIT 1", (s.id,)):
             # no work, never green (#102): the gateway metered nothing for this session
             return self._fail(
@@ -3117,12 +3292,7 @@ class JobRunner:
             if test_cmd.strip()
             else ([], [])
         )
-        overlap = runner_overlap(
-            contract["spec"].get("files_in_scope") or [],
-            self.cfg.repo(job.repo).runner_config,
-            test_cmd,
-            *(c for c, _ in ac_runs),
-        )
+        overlap = self._overlap(job.repo, contract, ac_runs)
         # host policy: off (the default), nothing hidden is looked up, run or tagged, and
         # the task is verified on its visible tests and goes to the owner as a draft PR
         hidden_on = (
@@ -3241,31 +3411,48 @@ class JobRunner:
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
+        pub = {
+            "head": head, "base_sha": base_sha, "branch": branch, "body": body,
+            "owner_review": bool(overlap and not hidden_on), "pr_url": pr_url,
+            "runner_file_change": overlap,
+        }  # fmt: skip
+        return self._publish_task(job, s, task_id, pub)
+
+    def _publish_task(self, job: Job, s: SessionRow, task_id: str, pub: dict[str, Any]) -> bool:
+        """Publish a verified, accepted head and open the task's PR. On a refusal the
+        inputs are kept (`publish_refused`), so a retry can republish without a session."""
+        contract = self.store.get_task(task_id).contract
+        job_id = job.id
         try:
             url = self._publish(
                 job,
                 repo=job.repo,
-                head=head,
-                base_sha=base_sha,
-                branch=branch,
+                head=pub["head"],
+                base_sha=pub["base_sha"],
+                branch=pub["branch"],
                 base=job.base,
                 title=(
                     OWNER_REVIEW_TITLE
-                    if overlap and not hidden_on
-                    else f"[vigil {job_id}] {contract['spec']['goal']}"
+                    if pub["owner_review"]
+                    else pr_title(job_id, contract["spec"]["goal"])
                 ),
-                body=body,
+                body=pub["body"],
                 scope=[
                     *contract["spec"]["files_in_scope"],
                     *artifact_paths(job_id, task_id),
                     *vigild_paths(job_id),
                 ],
-                existing=pr_url,
+                existing=pub["pr_url"],
             )
         except PublishError as e:
+            self.store.add_event(
+                "publish_refused", redact(pub), Provenance.HUMAN,
+                job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+        head, branch, overlap = pub["head"], pub["branch"], pub["runner_file_change"]
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
-        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        facts = self._pub_facts(job.repo, branch, pub["base_sha"])  # vault git: outside the tx
         # #34: the state and the event with its URL land together, or neither does
         with self.store.tx():
             self.store.update_task(task_id, state="pr_open")
@@ -3284,6 +3471,48 @@ class JobRunner:
                 task_id=task_id,
             )
         return True
+
+    def _republish_inputs(self, task_id: str) -> dict[str, Any] | None:
+        """What a task's last publish refusal kept, if that refusal is its latest failure:
+        its result was imported, verified and accepted, so only the publish is retried."""
+        rows = self.store.q(
+            "SELECT type, data FROM events WHERE task_id=? "
+            "AND type IN ('task_failed','publish_refused') ORDER BY id DESC LIMIT 2",
+            (task_id,),
+        )
+        if len(rows) < 2 or rows[1]["type"] != "publish_refused":
+            return None
+        if json.loads(rows[0]["data"]).get("title") != f"{task_id}: publish refused":
+            return None
+        if self._last_worker(task_id) is None:
+            return None
+        pub: dict[str, Any] = json.loads(rows[1]["data"])
+        return pub
+
+    def _republish(self, job_id: str, task_id: str) -> bool:
+        """Retry after a publish refusal (#152): republish the recorded vault head. No
+        worker session, no reservation, no verifier run; the title is recomputed."""
+        job = self.store.get_job(job_id)
+        pub = self._republish_inputs(task_id)
+        s = self._last_worker(task_id)
+        assert pub is not None and s is not None  # dispatch checked, before it set `running`
+        try:
+            ok = self._publish_task(job, s, task_id, pub)
+        except Exception as e:  # vigild trouble: the task fails, nothing is left running
+            log.exception("republish %s failed", task_id)
+            return self._fail(
+                job_id,
+                s,
+                task_id,
+                f"{task_id}: vigild error",
+                {"error": f"{type(e).__name__}: {e}"},
+            )
+        result = self._task_pr(task_id) if ok else self._why.get(task_id, {}).get("error")
+        self.store.add_event(
+            "republish", {"task": task_id, "head": pub["head"], "result": result},
+            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+        )  # fmt: skip
+        return ok
 
     # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 

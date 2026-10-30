@@ -321,3 +321,23 @@ def test_a_build_finds_dockers_credential_helper_off_path(
     )
     assert ok, out
     assert "built" in out
+
+
+def test_on_rebuild_validates_at_mains_tip_not_the_pages_stale_base(world: Any) -> None:
+    import types
+
+    from vigild.jobs.runner import JobRunner
+
+    images, _, _, ws, stale, ctx = world
+    seed = ctx["seed"]
+    (seed / "uv.lock").write_text("version = 3\n")  # the fix merged: a new key at main
+    git(seed, "commit", "-qam", "fix")
+    git(seed, "push", "-q", "origin", "main")
+    tip = ws.head_sha(REPO, "main")
+    assert tip != stale
+    me = types.SimpleNamespace(
+        session_images=None, dev_images=images, workspace=ws, background=False
+    )
+    JobRunner.on_rebuild(me, REPO, stale)  # type: ignore[arg-type]
+    row = images.latest(REPO)
+    assert row is not None and row["ok"] and row["base_sha"] == tip

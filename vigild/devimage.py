@@ -136,6 +136,15 @@ def image_prefix(data_path: Path, kind: str) -> str:
     return f"vigil-{kind}-{hashlib.sha256(str(resolved).encode()).hexdigest()[:8]}"
 
 
+def instance_id(data_path: Path) -> str:
+    """This vigild's identity: sha256 of its resolved data dir, 12 hex digits. Production
+    gets one too. Every container and network vigild creates carries it (`dev.vigil.
+    instance`), so a kill or a purge finds only this vigild's own, never another vigild's
+    with the same per-database job id (#162)."""
+    resolved = data_path.expanduser().resolve()
+    return hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+
+
 class DevImages:
     def __init__(
         self,
@@ -157,6 +166,7 @@ class DevImages:
         self.clock = clock
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self.stage = ""  # where a build is now; the CLI names it if the build is cut short
 
     # --- identity -------------------------------------------------------------------
 
@@ -218,6 +228,7 @@ class DevImages:
         `source="vault"`: a commit only vigild's vault has (a deps job's head,
         plan 2a item 5): built from its lockfiles, its suites run on it."""
         with self._lock(repo):
+            self.stage = ""  # not a stale stage from an earlier build
             key = self.key(repo, base_sha, source)
             tag = self.tag(repo, key)
             last = self.latest(repo, key)
@@ -276,6 +287,7 @@ class DevImages:
         pol = self.cfg.repo(repo)
         tag = self.tag(repo, key)
         ctx = Path(tempfile.mkdtemp(prefix="vigil-devctx-"))
+        self.stage = "build"
         try:
             self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx, source)
             ok, out = self.docker.build(ctx, self.dockerfile(repo), tag, timeout_s=BUILD_SECONDS)
@@ -285,6 +297,7 @@ class DevImages:
         if not ok or image_id is None:
             failed: dict[str, Any] = {"build": out[-TAIL:]}
             return self._record(repo, key, tag, None, False, "build", failed, base_sha)
+        self.stage = "validate"
         src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source=source)
         suites: dict[str, dict[str, Any]] = {}
         try:
@@ -488,6 +501,7 @@ class SessionImages:
             return tag
 
     def _build(self, repo: str, key: str, tag: str, dev_tag: str, base_sha: str) -> Validation:
+        self.dev.stage = "session-build"
         ok, out = self.dev.docker.build(
             EXECUTOR_LAYER,
             EXECUTOR_LAYER / "Dockerfile",
@@ -505,6 +519,7 @@ class SessionImages:
         if not ok or image_id is None:
             fail: dict[str, Any] = {"build": out[-TAIL:]}
             return self.dev._record(repo, key, tag, None, False, "session-build", fail, base_sha)
+        self.dev.stage = "session-validate"
         code, check = self.dev.docker.run_check(tag, SESSION_CHECK)
         body: dict[str, Any] = {"check": check[-TAIL:], "base": dev_tag}
         return self.dev._record(

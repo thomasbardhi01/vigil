@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,9 @@ class RecordingRunner:
     approved: list[str] = field(default_factory=list)
     resumed: list[str] = field(default_factory=list)
     rebuilt: list[tuple[str, str]] = field(default_factory=list)
+
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
+        return lambda path: None
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         self.created.append(job_id)

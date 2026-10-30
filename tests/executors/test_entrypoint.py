@@ -481,3 +481,49 @@ def test_kill_strays_runs_as_the_root_harness_under_init_or_as_pid_1(
     ep.kill_strays()
     assert bool(sent) is kills
     assert all(p == -1 for p, _ in sent)
+
+
+def test_a_cli_that_exits_leaves_its_redacted_stderr_tail_on_the_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#121: the SDK raises when the CLI exits -6; the harness keeps the last 2,000
+    bytes of the CLI's stderr, redacted, on its result line."""
+    import types
+
+    work, base = _work(tmp_path)
+    task = {"task_id": "fx-0001-w1", "job_id": "fx-0001", "branch": BRANCH, "base_sha": base}
+    (work / ".vigil" / "task.json").write_text(json.dumps(task))
+    ep = _harness(tmp_path, work)
+    secret = "ghs_" + "a1B2c3D4e5F6g7H8i9J0"
+
+    class Msg:
+        pass
+
+    async def query(prompt: str, options: Any) -> Any:
+        for i in range(60):
+            options.kwargs["stderr"](f"line {i} {'y' * 100}\n")
+        options.kwargs["stderr"](f"pids: cannot fork GITHUB_TOKEN={secret}\n")
+        raise RuntimeError("Command failed with exit code -6")
+        yield
+
+    class Options:
+        def __init__(self, **kw: Any) -> None:
+            self.kwargs = kw
+
+    sdk = types.ModuleType("claude_agent_sdk")
+    for name in (
+        "AssistantMessage", "ResultMessage", "SystemMessage",
+        "ToolResultBlock", "ToolUseBlock", "UserMessage",
+    ):  # fmt: skip
+        setattr(sdk, name, type(name, (Msg,), {}))
+    sdk.ClaudeAgentOptions = Options  # type: ignore[attr-defined]
+    sdk.query = query  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"gateway_token": TOKEN}) + "\n"))
+    assert ep.main() == 4
+    result = [json.loads(x) for x in capsys.readouterr().out.splitlines()][-1]["vigil_result"]
+    assert result["status"] == "failed" and "exit code -6" in result["error"]
+    tail = result["cli_stderr_tail"]
+    assert "pids: cannot fork" in tail and len(tail.encode()) <= 2000
+    assert secret not in tail and "[redacted]" in tail

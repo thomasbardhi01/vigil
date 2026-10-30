@@ -1139,6 +1139,21 @@ class Store:
             ),
         )
 
+    def recorded_container_ids(self, job_id: str = "") -> set[str]:
+        """The Docker ids (worker, egress sidecar, network) the executor recorded for a
+        job's sessions, as `container` events; every job's when `job_id` is empty. Ids
+        are globally unique, so they name exactly vigild's own objects (#162)."""
+        sql, args = "SELECT data FROM events WHERE type='container'", []
+        if job_id:
+            sql += " AND job_id=?"
+            args.append(job_id)
+        out: set[str] = set()
+        for r in self.q(sql, tuple(args)):
+            cid = json.loads(r["data"]).get("id")
+            if isinstance(cid, str) and cid:
+                out.add(cid)
+        return out
+
     def events(
         self, *, job_id: str | None = None, session_id: str | None = None, after: int = 0
     ) -> list[EventRow]:

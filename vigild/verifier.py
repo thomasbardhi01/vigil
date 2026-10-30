@@ -192,6 +192,15 @@ def runner_overlap(
     return sorted({f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)})
 
 
+def runner_class(
+    scope: Iterable[str], runner_config: Iterable[str], test_cmd: str, ac_cmds: Iterable[str]
+) -> list[str]:
+    """The one runner-file classification (#142): a task's scope entries that name a
+    runner file, counting the scripts its `test_cmd` and the approved spec's AC commands
+    run. Plan time, the inbox, hidden-test authoring and verify all call this."""
+    return runner_overlap(scope, runner_config, test_cmd, *ac_cmds)
+
+
 @dataclass(frozen=True)
 class HiddenSuite:
     """A task's hidden tests: files in a vault commit that is on no pushed
@@ -273,6 +282,8 @@ class ReportPlan:
     reports: int
     problems: list[str]
     vitest_dirs: tuple[str, ...] = ()  # repo-relative dirs of the vitest projects it runs
+    # report name (`vitest-<n>.xml`) -> the repo-relative dir of the n-th vitest command
+    report_dirs: Mapping[str, str] = field(default_factory=dict)
 
 
 def _flags(n: int) -> str:
@@ -297,6 +308,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
     problems: list[str] = []
     out, pos, n, reporting = [], 0, 0, 0
     vitest_dirs: list[str] = []
+    report_dirs: dict[str, str] = {}
     cwd = ""
     for c in parse(test_cmd).commands:
         if c.program == "cd" and c.args:
@@ -308,7 +320,17 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if _runs_vitest(c):
             n += 1
             reporting += 1
-            vitest_dirs.append(cwd)
+            where = cwd
+            if c.program == "pnpm":
+                pargs = list(c.args)
+                i = 0  # only pnpm's own options: stop at `exec`, `run` or a script name
+                while i < len(pargs) and pargs[i].startswith("-"):
+                    if pargs[i] in ("-C", "--dir") and i + 1 < len(pargs):
+                        where = "/".join(x for x in (cwd, pargs[i + 1].strip("/")) if x)
+                        i += 1
+                    i += 1
+            vitest_dirs.append(where)
+            report_dirs[f"vitest-{n}.xml"] = where
             end = c.start + len(c.text.rstrip())
             out.append(test_cmd[pos:end] + _flags(n))
             pos = end
@@ -364,6 +386,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
             continue  # PYTEST_ADDOPTS reaches it through pnpm
         n += 1
         vitest_dirs.append(where)
+        report_dirs[f"vitest-{n}.xml"] = where
         body = " ".join([script, *(shlex.quote(a) for a in extra)]) + _flags(n)
         lead = c.text[: len(c.text) - len(c.text.lstrip())]
         dir_opt = f"-C {shlex.quote(where)} " if where and where != cwd else ""
@@ -378,7 +401,9 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         problems.append(
             "runs no test runner vigil can read (pytest, vitest, or a pnpm script that runs one)"
         )
-    return ReportPlan("".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)))
+    return ReportPlan(
+        "".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)), report_dirs
+    )
 
 
 def can_report(test_cmd: str, read: ReadFile | None = None) -> bool:
@@ -395,9 +420,15 @@ class Case:
     file: str
     status: str  # pass | failure | error | skipped | xfail
     assertion: bool = False  # a failure carrying the task's HMAC tag (hidden runs only)
+    # a vitest case's project dir (repo-relative; "" is the root), from the plan that built
+    # the command; UNKNOWN_PROJECT when its report has no dir; None for pytest and unmapped
+    project: str | None = None
 
 
-def parse_junit(data: bytes, tag: str = "") -> list[Case]:
+UNKNOWN_PROJECT = "<unknown>"
+
+
+def parse_junit(data: bytes, tag: str = "", project: str | None = None) -> list[Case]:
     if len(data) > MAX_REPORT or b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         return []
     try:
@@ -426,6 +457,7 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
                 tc.get("file") or classname,
                 status,
                 assertion,
+                project,
             )
         )
     return cases
@@ -434,6 +466,13 @@ def parse_junit(data: bytes, tag: str = "") -> list[Case]:
 def belongs(case: Case, files: Iterable[str]) -> bool:
     """Is a report's test case in one of these repo files? pytest names a
     module (`tests.test_a`); vitest a path relative to its project dir."""
+    if case.project is not None:
+        # vitest, with the dir its command ran in: the full repo path, exact, never a suffix
+        proj = case.project
+        if proj == UNKNOWN_PROJECT:
+            return case.file in files
+        full = case.file if not proj or case.file.startswith(proj + "/") else f"{proj}/{case.file}"
+        return full in files
     parts = case.file.split(".")
     # pytest: a module, or module.Class(.Nested): try each prefix as a .py path
     guesses = {case.file} | {"/".join(parts[:k]) + ".py" for k in range(1, len(parts) + 1)}
@@ -657,16 +696,24 @@ class Verifier:
             "runner_files": overlap,
             "runner_file_changed": bool(set(overlap) & changed_paths),
         }
-        command = with_reports(test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        # one plan, from the base's blobs: the command that runs and the report -> dir map
+        # that reads its reports (never re-planned from the worker's head)
+        plan = plan_reports(test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        command, dirs = plan.command, plan.report_dirs
         pin = (base_sha, pinned)
-        base = self._run(repo, image, f"{task_id}-base", base_sha, test_cmd, command, [pin])
+        base = self._run(
+            repo, image, f"{task_id}-base", base_sha, test_cmd, command, [pin], report_dirs=dirs
+        )
         record["base"] = base
         base2: dict[str, Any] | None = None
         if base["_report"]:
             # A second base run finds ids that change per run (phase 1 run, finding
             # #1). It costs one more run the length of the base's, and only when the
             # base reported.
-            base2 = self._run(repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin])
+            base2 = self._run(
+                repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin],
+                report_dirs=dirs,
+            )  # fmt: skip
             if base2["_report"] and base2["_cases"]:
                 record["base_repeat"] = {
                     k: base2[k] for k in ("sha", "exit", "outcome", "tests") if k in base2
@@ -677,11 +724,14 @@ class Verifier:
         if must_fail_first:
             before = self._run(
                 repo, image, f"{task_id}-before", base_sha, test_cmd, command,
-                [(head, tests), pin],
+                [(head, tests), pin], report_dirs=dirs,
             )  # fmt: skip
             before["applied"] = tests
+            self._collection_failure(before, tests, test_cmd)
             record["before"] = before
-        after = self._run(repo, image, f"{task_id}-after", head, test_cmd, command, [pin])
+        after = self._run(
+            repo, image, f"{task_id}-after", head, test_cmd, command, [pin], report_dirs=dirs
+        )
         if not after["_report"] and after["outcome"] == "pass":
             # owner direction, round 3: "tests ran" can't be confirmed without a report
             after["outcome"] = "unknown"
@@ -713,7 +763,11 @@ class Verifier:
                 "note": "neither base nor before produced a report: what ran can't be compared",
             }
         if before is not None:
-            record["ids"] = self._ids(before, after, tests)
+            record["ids"] = self._ids(
+                before, after, tests,
+                base["_cases"] if base["_report"] else None,
+                base2["_cases"] if base2 and base2["_report"] else None,
+            )  # fmt: skip
         else:
             # #31 item 1: no "before" run, so name the worker's tests from the after run
             record["ids"] = self._ids_after(
@@ -752,7 +806,9 @@ class Verifier:
         plan = plan_reports(cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
         if plan.problems:
             return {**entry, "outcome": "unknown", "selected": 0, "note": "; ".join(plan.problems)}
-        run = self._run(repo, image, name, head, cmd, plan.command, [pin])
+        run = self._run(
+            repo, image, name, head, cmd, plan.command, [pin], report_dirs=plan.report_dirs
+        )
         return self._ac_entry(cmd, acs, run)
 
     @staticmethod
@@ -812,9 +868,8 @@ class Verifier:
         runs it only as a subprocess. Only the base run gets the tag in its
         environment: the base's own code runs there, never a worker's."""
         assert self.host_key is not None
-        command = with_reports(
-            hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path)
-        )
+        plan = plan_reports(hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
+        command = plan.command
         mine: list[str] = []
         if head is not None:
             mine = sorted(
@@ -834,6 +889,7 @@ class Verifier:
                 keep_output=True, tag=tag,
                 put=[helper_file(hidden.prefix.rstrip("/"), hidden.vitest)],
                 env={TAG_ENV: tag if tagged else "untagged"}, subject=subject,
+                report_dirs=plan.report_dirs,
             )  # fmt: skip
         finally:
             shutil.rmtree(subject.parent, ignore_errors=True)
@@ -1066,7 +1122,52 @@ class Verifier:
         return out
 
     @staticmethod
-    def _ids(before: dict[str, Any], after: dict[str, Any], tests: list[str]) -> dict[str, Any]:
+    def _module_path(name: str) -> str:
+        """The repo path of a JUnit collection-error name: `tests.test_a` is
+        `tests/test_a.py` (a path-style name is taken as it is)."""
+        return name if name.endswith(".py") else name.replace(".", "/") + ".py"
+
+    @staticmethod
+    def _exact_file(case: Case, files: set[str]) -> bool:
+        """Is a pytest case (`tests.test_a` or `tests.test_a.TestX`) in one of these
+        exact repo paths? `belongs` matches a suffix; this does not."""
+        parts = case.file.split(".")
+        return any("/".join(parts[:k]) + ".py" in files for k in range(1, len(parts) + 1))
+
+    @staticmethod
+    def _collection_failure(before: dict[str, Any], tests: list[str], test_cmd: str) -> None:
+        """#161: a pytest collection error (exit 2, a JUnit `<error>` on a module, no
+        classname) counts as failing before only when every erroring module is, by exact
+        path, one of the worker's own new or changed test files (`tests`, never a
+        conftest). Any other error, a failing case or another exit leaves the outcome
+        `unknown`. A stub import is as cheap as `assert False`: must-fail-first proves
+        only that the base lacks something the test needs."""
+        cases: list[Case] = before.get("_cases") or []
+        if before["exit"] != 2 or not before["_report"] or not runs_pytest(test_cmd):
+            return
+        mods = [c for c in cases if c.status == "error" and not c.file]
+        mine = {t for t in tests if t.rsplit("/", 1)[-1] != "conftest.py"}
+        if not mods or any(c.status != "error" or c.file for c in cases):
+            return
+        names = [c.id.removeprefix("::") for c in mods]
+        if not all(Verifier._module_path(n) in mine for n in names):
+            return
+        before["outcome"] = "fail"
+        before["failed_at_collection"] = {
+            "modules": sorted(redact(n) for n in names),
+            "error": redact("\n".join(ln for ln in before["tail"].splitlines() if ln[:1] == "E"))[
+                :400
+            ],
+        }
+
+    @staticmethod
+    def _ids(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        tests: list[str],
+        base: list[Case] | None = None,
+        base2: list[Case] | None = None,
+    ) -> dict[str, Any]:
         b, a = before.get("_cases"), after.get("_cases")
         if not before.get("_report") or not after.get("_report"):
             return {"checked": False, "note": "test ids not checked: the runner gave no report"}
@@ -1074,6 +1175,20 @@ class Verifier:
             c.id for c in b or [] if c.status in ("failure", "error") and belongs(c, tests)
         )
         passing = {c.id for c in a or [] if c.status == "pass"}
+        fac = before.get("failed_at_collection")
+        if fac:
+            # The before run never executed these files, so only after-run ids the base
+            # runs lack can have "failed before"; without a base report none can be told.
+            # Unstable base ids are settled as `_new_cases` settles them; a case's file
+            # is matched exactly, never by suffix.
+            files = {Verifier._module_path(n) for n in fac["modules"]}
+            mine = [c for c in a or [] if Verifier._exact_file(c, files)]
+            new = Verifier._new_cases(mine, base, base2, sorted(files)) if base is not None else []
+            return {
+                "checked": True,
+                "failing_before": sorted(c.id for c in new),
+                "not_passing_after": sorted(c.id for c in mine if c.status in ("failure", "error")),
+            }
         return {
             "checked": True,
             "failing_before": failing,
@@ -1174,6 +1289,7 @@ class Verifier:
         tag: str = "",
         env: Mapping[str, str] | None = None,
         subject: Path | None = None,
+        report_dirs: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         halted = _HALTED.get()
         if halted is not None and halted():
@@ -1191,7 +1307,16 @@ class Verifier:
             )
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)
-        cases = [c for data in r.reports.values() for c in parse_junit(data, tag)]
+        dirs = report_dirs or {}
+        cases = [
+            c
+            for name_, data in r.reports.items()
+            for c in parse_junit(
+                data,
+                tag,
+                dirs.get(name_, UNKNOWN_PROJECT) if name_.startswith("vitest-") else None,
+            )
+        ]
         got = judge(test_cmd, r.exit, r.timed_out, r.output)
         out: dict[str, Any] = {
             "sha": sha,

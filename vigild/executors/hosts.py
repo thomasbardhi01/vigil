@@ -12,12 +12,16 @@ from the same placement as the session, so both run on one host.
 from __future__ import annotations
 
 import contextlib
+import functools
+import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from vigild.config import Config, SandboxHost
+
+log = logging.getLogger(__name__)
 
 Use = Literal["jobs", "bench"]
 # Copying a worker's files to a remote host (and its results back) over the Docker
@@ -125,6 +129,8 @@ class Hosts:
         self._runners: dict[str, Any] = {}
         # which session containers pruning may remove (vigild's records); none until set
         self.prune_ok: Callable[[str], bool] | None = None
+        # the Docker ids vigild recorded for a job ("" = every job): what a kill removes first
+        self.recorded: Callable[[str], set[str]] | None = None
 
     def client(self, host: SandboxHost) -> Any:
         with self._lock:
@@ -151,7 +157,13 @@ class Hosts:
         with self._lock:
             have = self._runtimes.get(h.name)
         if have is None:
-            have = DockerRuntime(self.cfg, self.client(h), host=h, prune_ok=self.prune_ok)
+            have = DockerRuntime(
+                self.cfg,
+                self.client(h),
+                host=h,
+                prune_ok=self.prune_ok,
+                recorded=lambda job_id: self.recorded(job_id) if self.recorded else set(),
+            )
             with self._lock:
                 have = self._runtimes.setdefault(h.name, have)
         return have
@@ -218,6 +230,53 @@ class HostExecutor:
             p = self._where.get(session_id)
         if p is not None:
             self.hosts.runtime(p).stop(session_id)
+
+    def _kill_hosts(self) -> list[tuple[str, Callable[[], Any]]]:
+        """Every configured sandbox host, each with a lazy way to its runtime: a kill must
+        reach a remote host after a restart too, before any session was placed on it in
+        this process."""
+        sh = self.hosts.cfg.sandbox_hosts
+        return [(h.name, functools.partial(self.hosts.runtime, Placement(h))) for h in sh.hosts]
+
+    def _on_every_host(self, call: Callable[[Any], Any]) -> tuple[list[Any], list[str]]:
+        """`call(runtime)` on each host: the results, and the hosts that could not be
+        reached. The local host is not excused: its error propagates."""
+        local = self.hosts.cfg.sandbox_hosts.local.name
+        out: list[Any] = []
+        down: list[str] = []
+        for name, runtime in self._kill_hosts():
+            try:
+                out.append(call(runtime()))
+            except Exception:
+                if name == local:
+                    raise
+                log.exception("kill: host %s could not be reached", name)
+                down.append(name)
+        return out, down
+
+    def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
+        """Kill a job's containers on every host (kill, #52; `DockerRuntime.stop_job`)."""
+        sids = list(session_ids)
+        counts, _down = self._on_every_host(lambda r: int(r.stop_job(job_id, sids)))
+        return sum(counts)
+
+    def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, Any]:
+        """Remove a job's containers and networks on every host and say which are still
+        there (kill, #52; `DockerRuntime.purge_job`). `hosts_unreachable` names a host that
+        could not be reached: its containers are not known to be gone."""
+        sids = list(session_ids)
+        ones, down = self._on_every_host(lambda r: r.purge_job(job_id, sids))
+        out: dict[str, Any] = {
+            "containers": 0, "networks": 0, "failed": [], "kill_errors": {},
+            "unowned": [], "hosts_unreachable": down,
+        }  # fmt: skip
+        for one in ones:
+            out["containers"] += one["containers"]
+            out["networks"] += one["networks"]
+            out["failed"] += one["failed"]
+            out["kill_errors"].update(one.get("kill_errors", {}))
+            out["unowned"] += one.get("unowned", [])
+        return out
 
     def run_deps(
         self, image: str, work: Any, command: str, timeout_s: int = 900

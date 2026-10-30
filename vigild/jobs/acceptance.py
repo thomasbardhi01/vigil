@@ -21,7 +21,7 @@ from vigild.intake.paths import in_scope
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.artifacts import ac_refs, parse_spec
 from vigild.jobs.integrity import Finding, blocking, check_integrity
-from vigild.verifier import TEST_FILE, ReadFile, invoked_scripts
+from vigild.verifier import TEST_FILE, ReadFile, invoked_scripts, runner_class
 from vigild.workspace import Workspace
 
 ASSERT = re.compile(r"\b(assert|expect|should|XCTAssert)")
@@ -108,6 +108,24 @@ def ac_commands(
 ) -> list[tuple[str, list[str]]]:
     """The runnable part of `ac_plan`."""
     return ac_plan(spec_md, read, only)[0]
+
+
+def plan_runner_class(
+    spec_md: str,
+    workers: Sequence[Any],
+    runner_config: Sequence[str],
+    read: ReadFile | None = None,
+) -> dict[str, list[str]]:
+    """Each plan worker's runner files (#142), from the approved spec's AC commands as
+    the verifier reads them: the same parser, the same per-worker AC split, and (#144)
+    the same reader, the base's files, so a command verify refuses is dropped here too."""
+    idents = [c.ident for c in parse_spec(spec_md).criteria]
+    texts = [f"{w.why or ''} {w.done_when or ''}" for w in workers]
+    out: dict[str, list[str]] = {}
+    for w, mine in zip(workers, texts, strict=True):
+        cmds = [c for c, _ in ac_commands(spec_md, read, worker_acs(idents, texts, mine))]
+        out[w.task_id] = runner_class(w.files_in_scope, runner_config, w.test_cmd, cmds)
+    return out
 
 
 def live_workers(tasks: Iterable[Any]) -> list[Any]:

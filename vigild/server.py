@@ -67,6 +67,9 @@ class NullRunner:
     def busy(self, job_id: str) -> bool:
         return False
 
+    def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
+        return lambda path: None
+
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
         return None
 
@@ -205,6 +208,7 @@ def build_executors(cfg: Config, client: Any, store: Any) -> tuple[Any, Any, Any
 
     hosts = Hosts(cfg, make_client=lambda h: client_for(h) if h.remote else client)
     hosts.prune_ok = prunable_sessions(store)  # live work is never pruned
+    hosts.recorded = store.recorded_container_ids  # the ids a kill removes first (#162)
     return hosts, HostExecutor(hosts), HostTestRunner(hosts)
 
 
@@ -334,6 +338,7 @@ def check_sandbox_hosts(cfg: Config, hosts: Any = None, **kw: Any) -> None:
     """ADR-0004: vigild refuses to start if a configured remote sandbox host
     fails a rule, and prunes each remote host's own labelled images to its disk
     budget. With only the default `local`, nothing remote is touched."""
+    from vigild.devimage import instance_id
     from vigild.executors.disk import enforce_budget
     from vigild.executors.hostcheck import HostRuleError, require_hosts
     from vigild.executors.hosts import HostRefused, Hosts
@@ -349,6 +354,7 @@ def check_sandbox_hosts(cfg: Config, hosts: Any = None, **kw: Any) -> None:
                     hosts.client(h),
                     int(h.disk_budget_gb * (1 << 30)),
                     may_prune=hosts.prune_ok or (lambda session: False),
+                    instance=instance_id(cfg.vigild.data_path),
                 )
                 log.info("sandbox host %s: pruned %d over-budget item(s)", h.name, len(gone))
             except HostRefused as e:  # rule 6 below reports it; new sessions are refused
