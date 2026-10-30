@@ -179,9 +179,10 @@ def parallel_pairs(workers: list[WorkerContract]) -> list[tuple[WorkerContract, 
     ]
 
 
+_VIGIL = r"\.vigil(?![\w-]|\.\w)"  # the path itself, never `.vigil.py` or `.vigilrc`
 VIGIL_FORBIDDEN = re.compile(
-    r"\b(no|not|never|without|zero|nothing|none|exclud\w*|free of|absent)\b[^.\n]*\.vigil\b"
-    r"|\.vigil\b[^.\n]*\b(absent|excluded|forbidden|not (?:be )?(?:committed|present|included))",
+    rf"\b(no|not|never|without|zero|nothing|none|exclud\w*|free of|absent)\b[^.\n]*{_VIGIL}"
+    rf"|{_VIGIL}[^.\n]*\b(absent|excluded|forbidden|not (?:be )?(?:committed|present|included))",
     re.I,
 )
 VIGIL_OWNED = (

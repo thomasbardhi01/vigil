@@ -258,3 +258,90 @@ def test_mirror_is_dir_sees_a_directory_at_the_base_tip(
     assert not ws.mirror_is_dir("o/fixture", "main", "README.md")
     assert not ws.mirror_is_dir("o/fixture", "main", "nope")
     assert not ws.mirror_is_dir("o/fixture", "main;rm", "docs")
+
+
+# --- published_diff (#194): the diff as it will be published, without `.vigil` ---
+
+PD_REPO = "o/fixture"
+
+
+def _result(
+    ws: Workspace,
+    tmp_path: Path,
+    add: dict[str, str],
+    remove: tuple[str, ...] = (),
+    tag: str = "pd",
+) -> tuple[str, str]:
+    """A worker result whose index is edited with plumbing (so case variants like
+    `.VIGIL/x` and `.Vigil/y` survive a case-insensitive disk); returns (base, head)."""
+    from tests.harness import finish_session
+
+    branch = f"vigil/{tag}"
+    clone = ws.clone(PD_REPO, f"fx-0001-{tag}", branch=branch, base="main")
+    base = ws.base_sha(f"fx-0001-{tag}")
+    for path in remove:
+        git(clone, "update-index", "--force-remove", path)
+        (clone / path).unlink()
+    for path, text in add.items():
+        (clone / ".blob").write_text(text)
+        sha = git(clone, "hash-object", "-w", ".blob")
+        git(clone, "update-index", "--add", "--cacheinfo", f"100644,{sha},{path}")
+    (clone / ".blob").unlink()
+    git(clone, "commit", "-qm", "edit")
+    git(clone, "reset", "-q", "--hard")
+    out = tmp_path / f"out-{tag}"
+    r = finish_session(clone, out, branch=branch, base_sha=base)
+    head = ws.import_result(PD_REPO, f"fx-0001-{tag}", out, branch, base, head=r["head"])
+    return base, head
+
+
+def _files(diff: str) -> list[str]:
+    return [ln.split(" b/", 1)[1] for ln in diff.splitlines() if ln.startswith("diff --git ")]
+
+
+def test_published_diff_drops_vigil_in_any_case(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(
+        ws, tmp_path, {".VIGIL/x": "1", ".Vigil/y": "2", ".vigil/z": "3", "docs/real.md": "r"}
+    )
+    assert _files(ws.published_diff(PD_REPO, base, head)) == ["docs/real.md"]
+    assert ".VIGIL/x" in ws.full_diff(PD_REPO, base, head)  # the vault does hold it
+
+
+def test_published_diff_keeps_lookalikes(ws: Workspace, tmp_path: Path) -> None:
+    names = {".vigil.py": "a", ".vigilx/a": "b", "sub/.vigil/b": "c", ".vigil/gone": "d"}
+    base, head = _result(ws, tmp_path, names)
+    assert _files(ws.published_diff(PD_REPO, base, head)) == [
+        ".vigil.py",
+        ".vigilx/a",
+        "sub/.vigil/b",
+    ]
+
+
+def test_published_diff_of_only_vigil_changes_is_empty(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path, {".vigil/a": "1", ".VIGIL/b": "2"})
+    assert ws.published_diff(PD_REPO, base, head) == ""
+
+
+def test_published_diff_shows_the_deletion_of_a_file_moved_into_vigil(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    base, head = _result(ws, tmp_path, {".vigil/README.md": "# fixture\n"}, remove=("README.md",))
+    diff = ws.published_diff(PD_REPO, base, head)
+    assert _files(diff) == ["README.md"] and "deleted file mode" in diff
+
+
+def test_published_diff_with_a_real_change_beside_vigil_shows_only_it(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    base, head = _result(ws, tmp_path, {".vigil/plan.md": "p", "NEW.md": "new\n"})
+    diff = ws.published_diff(PD_REPO, base, head)
+    assert _files(diff) == ["NEW.md"] and "+new" in diff and ".vigil" not in diff
+
+
+def test_published_diff_has_no_argv_limit(ws: Workspace, tmp_path: Path) -> None:
+    pad = "d" * 190
+    names = {f"big/{pad}/{i:05d}.txt": str(i) for i in range(5000)}
+    names[".vigil/x"] = "v"
+    base, head = _result(ws, tmp_path, names)
+    files = _files(ws.published_diff(PD_REPO, base, head))
+    assert len(files) == 5000 and all(f.startswith("big/") for f in files)
