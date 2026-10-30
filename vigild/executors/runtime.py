@@ -127,7 +127,8 @@ def worker_kwargs(
     }
     if spec.max_budget_usd is not None:  # none for a local preset (the gateway is the cap)
         env["VIGIL_MAX_BUDGET_USD"] = str(spec.max_budget_usd)
-    if spec.model and cfg.preset(spec.preset).locality == "local":
+    preset = cfg.backends.presets.get(spec.preset)  # a test spec may name none
+    if spec.model and preset is not None and preset.locality == "local":
         # the CLI's small/background model is the local one, so it tries no hosted call (#197)
         env["VIGIL_SMALL_FAST_MODEL"] = spec.model
     if spec.traceparent:
