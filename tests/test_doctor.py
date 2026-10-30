@@ -343,3 +343,33 @@ def test_doctor_fails_when_the_coord_token_is_missing_or_the_owner_one(cfg: Conf
     (c,) = _token_lines(same, cfg).values()
     assert (c.ok, c.note) == (False, "same as VIGIL_API_TOKEN")
     assert "same-fake-value-000" not in render([c])
+
+
+def test_unowned_containers_check_passes_when_none() -> None:
+    class RT:
+        def unowned(self) -> list[Any]:
+            return []
+
+    c = doctor.unowned_containers_check(RT())
+    assert (c.name, c.ok, c.note) == ("unowned containers (0)", True, "")
+
+
+def test_unowned_containers_check_fails_naming_them() -> None:
+    from vigild.executors.runtime import Unowned
+
+    class RT:
+        def unowned(self) -> list[Any]:
+            return [Unowned("vigil-s1", "id1", "vi-1"), Unowned("vigil-s2", "id2", "")]
+
+    c = doctor.unowned_containers_check(RT())
+    assert c.name == "unowned containers (2)" and c.ok is False
+    assert c.note == "vigil-s1, vigil-s2"
+
+
+def test_unowned_containers_check_reports_a_daemon_error_by_kind() -> None:
+    class RT:
+        def unowned(self) -> list[Any]:
+            raise OSError("socket /secret/path")
+
+    c = doctor.unowned_containers_check(RT())
+    assert c.ok is False and c.note == "OSError"

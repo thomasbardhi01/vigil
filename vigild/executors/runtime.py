@@ -22,6 +22,7 @@ import tarfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -647,6 +648,32 @@ def require_local_files(host: SandboxHost, mounts: list[dict[str, Any]]) -> None
         )
 
 
+@dataclass(frozen=True)
+class Unowned:
+    """A vigil-labelled container that no vigild claims: no instance label and an
+    id vigild never recorded (a pre-label leftover, #166). Kill and reap leave it."""
+
+    name: str
+    id: str
+    job: str  # its `dev.vigil.job` label, "" if none
+
+
+def is_unowned(labels: Mapping[str, str], cid: str, recorded: set[str]) -> bool:
+    """The one test for an unowned object: no instance label, id not recorded."""
+    return INSTANCE_LABEL not in labels and cid not in recorded
+
+
+def find_unowned(client: Any, recorded: set[str]) -> list[Unowned]:
+    """Every vigil-labelled container (any state) that `is_unowned`, by name. The one
+    selector for the startup page, `vigil doctor` and a kill's `unowned` list."""
+    out = [
+        Unowned(str(c.name), str(c.id), (c.labels or {}).get(JOB_LABEL, ""))
+        for c in client.containers.list(all=True, filters={"label": LABEL})
+        if is_unowned(c.labels or {}, str(c.id), recorded)
+    ]
+    return sorted(out, key=lambda u: u.name)
+
+
 def _record(on_event: EventSink, kind: str, thing: Any) -> None:
     """Say which Docker object a session made, by its id (globally unique): the runner
     stores it, and a kill removes exactly those first (#162)."""
@@ -815,9 +842,11 @@ class DockerRuntime:
     def _unowned(labels: Mapping[str, str], cid: str, job_id: str, recorded: set[str]) -> bool:
         """A pre-label object that names the job but is not in the recorded set:
         reported as `unowned`, never removed."""
-        return (
-            INSTANCE_LABEL not in labels and labels.get(JOB_LABEL) == job_id and cid not in recorded
-        )
+        return labels.get(JOB_LABEL) == job_id and is_unowned(labels, cid, recorded)
+
+    def unowned(self) -> list[Unowned]:
+        """Vigil-labelled containers on this host that no vigild claims (#166)."""
+        return find_unowned(self.client, set(self.recorded("")))
 
     def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
         """Kill every running container of a job (kill, #52): its sessions' and

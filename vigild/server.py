@@ -230,6 +230,31 @@ def build_executors(cfg: Config, client: Any, store: Any) -> tuple[Any, Any, Any
     return hosts, HostExecutor(hosts), HostTestRunner(hosts)
 
 
+def reap_and_page(runtime: Any, store: Store, pager: Any) -> int:
+    """The startup reap, then one open `unowned_containers` page for what it leaves:
+    names and `dev.vigil.job` labels of vigil-labelled containers no vigild claims
+    (#166). Nothing more is removed; a page already open is not repeated."""
+    n = int(runtime.reap())
+    found = runtime.unowned()
+    log.info("reap: removed %d containers, %d unowned left", n, len(found))
+    if found and not any(
+        i.kind == "page" and i.title == UNOWNED_TITLE for i in store.list_inbox("open")
+    ):
+        pager.page(
+            None,
+            UNOWNED_TITLE,
+            {
+                "kind": "unowned_containers",
+                "containers": [{"name": u.name, "job": u.job} for u in found],
+            },
+            own_job=False,
+        )
+    return n
+
+
+UNOWNED_TITLE = "unowned vigil containers left by the startup reap"
+
+
 def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
@@ -255,6 +280,9 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
     hosts, runtime, tests = build_executors(v.cfg, client, v.store)
     images = DevImages(v.cfg, v.store, DockerImages(client), ws, tests)
+    from vigild.executors.hosts import Placement
+
+    local = hosts.runtime(Placement(v.cfg.sandbox_hosts.local))
     gh = v.cfg.vigild.github
 
     def claude_mods() -> Path:
@@ -273,7 +301,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         v.telemetry,
         images,
         Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
-        reaper=runtime.reap,
+        reaper=lambda: reap_and_page(local, v.store, v.services.jobs),
         session_images=sessions,
         breakers=v.gateway.breakers,
         deps=DepsExecutor(
