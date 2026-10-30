@@ -318,6 +318,26 @@ def test_the_push_carries_a_lease_on_the_checked_tip(
     assert f"--force-with-lease=refs/heads/{BRANCH}:{first}" in calls[1]
 
 
+def test_a_protected_branch_rejection_is_not_branch_moved(
+    setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#198 review: only a stale lease is BranchMoved; a ruleset or hook refusal keeps its cause."""
+    from vigild.workspace import WorkspaceError
+
+    ws, base, head, _bare = setup
+
+    def refuse(*a: object, **k: object) -> None:
+        raise WorkspaceError(
+            "git push failed: ! [remote rejected] HEAD -> vigil/x (protected branch hook declined)"
+        )
+
+    monkeypatch.setattr(ws, "push", refuse)
+    with pytest.raises(PublishError) as raised:
+        _pub(ws, base, head, FakePulls(_bare))
+    assert type(raised.value).__name__ != "BranchMoved"
+    assert "protected branch" in str(raised.value)
+
+
 def test_a_non_fast_forward_is_refused_and_nothing_is_pushed(
     setup: tuple[Workspace, str, str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -213,10 +213,13 @@ def publish(
             try:
                 ws.push(repo, send, branch, token, tip)
             except WorkspaceError as e:
-                if "stale info" in str(e) or "rejected" in str(e):
+                # only a stale lease means the branch moved; a hook, ruleset or auth
+                # refusal keeps its own cause (#198 review)
+                if "stale info" in str(e):
+                    seen = tip[:12] if tip else "no branch"
                     raise BranchMoved(
-                        f"{branch} moved on the remote after tip {(tip or 'none')[:12]} was "
-                        "read: nothing is overwritten"
+                        f"{branch} moved on the remote after vigild read it ({seen}): "
+                        "nothing is overwritten"
                     ) from e
                 raise
         ws.record_published(repo, branch, send)
