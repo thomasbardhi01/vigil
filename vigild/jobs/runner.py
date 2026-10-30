@@ -41,7 +41,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -150,6 +150,12 @@ from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_class
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
+
+
+def live_task_count(tasks: Iterable[Any]) -> int:
+    """A job's tasks that are still its work: a replan's superseded workers and abandoned
+    ones don't count (one live task's PR closes the job's issue)."""
+    return sum(1 for t in tasks if t.state not in ("superseded", "abandoned"))
 
 
 @dataclass(frozen=True)
@@ -3459,9 +3465,16 @@ class JobRunner:
         owner's republish of a verified head."""
         contract = t.contract
         runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests, hidden_on)
+        # The job row's own issue number (an int vigild stored), never text a worker wrote.
+        # One task closes the issue; with more, each PR only refs it, or the first merge
+        # would close it early.
+        issue_line = ""
+        if job.issue is not None:
+            verb = "Closes" if live_task_count(self.store.list_tasks(job.id)) == 1 else "Refs"
+            issue_line = f"{verb} #{int(job.issue)}\n\n"
         body = (
-            f"{report.summary}\n\n{runner_note}Job `{job.id}`, task `{t.id}` (tier `{t.tier}`: "
-            f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
+            f"{report.summary}\n\n{issue_line}{runner_note}Job `{job.id}`, task `{t.id}` "
+            f"(tier `{t.tier}`: {t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
             f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
