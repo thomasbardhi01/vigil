@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -240,3 +241,33 @@ def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
     job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
     assert store.get_job(job.id).batch_id is None  # a job from before is in no batch
+
+
+def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
+    """#29: the step is last in MIGRATIONS; on a database built from the schema of the step
+    before it, it adds `model_calls.call_key` and a unique index, and two more runs change
+    nothing."""
+    assert db.MIGRATIONS[-1].__name__ == "_m18_call_key"
+    path = tmp_path / "ck.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:-1]:
+        step(conn)
+    conn.commit()
+    assert "call_key" not in {r[1] for r in conn.execute("PRAGMA table_info(model_calls)")}
+    assert not [r for r in conn.execute("PRAGMA index_list(model_calls)") if "call_key" in r[1]]
+    conn.close()
+    store = Store.open(path)
+    assert "call_key" in _cols(store, "model_calls")
+    uniq = {r["name"] for r in store.q("PRAGMA index_list(model_calls)") if r["unique"]}
+    assert "calls_call_key" in uniq
+    assert [r["name"] for r in store.q("PRAGMA index_info(calls_call_key)")] == ["call_key"]
+
+    def shape() -> list[Any]:
+        return [tuple(r) for r in store.q("SELECT type, name, sql FROM sqlite_master ORDER BY 2")]
+
+    before = shape()
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert shape() == before
+    assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

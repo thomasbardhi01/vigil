@@ -492,7 +492,7 @@ def test_a_private_repo_is_refused_at_the_session_too(
 
 
 def test_the_replay_kind_step_is_last_and_idempotent(tmp_path: Path) -> None:
-    assert db.MIGRATIONS[-1].__name__ == "_m17_replay_kind"
+    assert db.MIGRATIONS[-2].__name__ == "_m17_replay_kind"  # call_key (#29) comes after
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
