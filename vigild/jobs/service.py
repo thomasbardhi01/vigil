@@ -1562,7 +1562,7 @@ class JobService:
         """Build and validate a repo's failed dev image again (round 2)."""
         with self.store.tx():
             item = self._question(item_id)
-            if item.body.get("kind") != "dev_image" or "rebuild" not in (
+            if item.body.get("kind") not in ("dev_image", "dev_image_flake") or "rebuild" not in (
                 item.body.get("actions") or []
             ):
                 raise Conflict(f"inbox item {item_id} doesn't offer rebuild")
