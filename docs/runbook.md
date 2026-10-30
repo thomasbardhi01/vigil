@@ -819,6 +819,39 @@ GitHub). It logs to `~/vigil-data/logs/vigild.log`. The template is
 - The log isn't rotated; truncate it with `: > ~/vigil-data/logs/vigild.log`
   when it grows.
 
+### Deploy production vigild
+
+Production runs from its own clone, `~/vigil-prod` (`$VIGIL_PROD_DIR`), that
+only `scripts/deploy.sh` writes to. Coord never runs git there. The owner
+points the launchd plist's `WorkingDirectory` at it.
+
+```sh
+scripts/deploy.sh [--prod-dir DIR] [--data-dir DIR] [--no-rebuild] [--dry-run]
+```
+
+In order, stopping at the first failure:
+1. **Idle check.** No job `building` or `in_review`, no session `running` or
+   `starting`, no `dev.vigil.job` container. Otherwise it names them and
+   exits 2 having changed nothing.
+2. **Fetch**, then decide from `git diff HEAD origin/main` before merging;
+   a dirty clone or a non-fast-forward stops it with vigild untouched.
+3. **Restart.** If the range touches `images/`, `prompts/`, `pyproject.toml`
+   or `uv.lock` (and `--no-rebuild` isn't set): `launchctl bootout`, then
+   fast-forward, rebuild each configured repo's dev image (`--rebuild`),
+   `launchctl bootstrap` the plist, then wait up to 60 s for
+   `127.0.0.1:8787`. vigild stays down during the rebuild so no job resumes
+   against stale images. A failed rebuild still starts vigild and exits
+   non-zero naming the repo: at start vigild finds the session image not
+   fresh, holds that repo's dispatch and pages once, "<repo>: image not
+   fresh after deploy" (Rebuild or Dismiss); a validated rebuild releases it. Otherwise: fast-forward and
+   `launchctl kickstart -k`.
+4. **`vigil doctor`.** A fail line makes the exit non-zero; nothing is undone.
+5. (The rebuild is folded into step 3 when image inputs changed.)
+6. **Summary:** `production <old> -> <new>` and the range's log.
+
+`--dry-run` prints the steps and changes nothing. The morning report carries
+a line `production <sha> / main <sha>`; they differ when a deploy is pending.
+
 ### Start vigild
 
 ```sh

@@ -319,6 +319,9 @@ def test_vigild_sweeps_reservations_every_ten_minutes(tmp_path: Any) -> None:
         def page_stranded_drafts_sweep(self) -> list[str]:
             return []
 
+        def release_stale_images(self) -> list[str]:
+            return []
+
     v = server.build(data_dir=tmp_path / "d")
     stop = server.start_pollers(v, None, Runner())  # type: ignore[arg-type]
     try:
