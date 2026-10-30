@@ -2357,6 +2357,13 @@ class JobRunner:
                 return True
         return False
 
+    def _job_labels(self, job_id: str) -> list[str]:
+        """The job's labels from vigild's own intake record (#179): a worker whose plan
+        entry has no `labels` key inherits them; an explicit list, even [], is its own."""
+        intake = self.store.get_artifact(job_id, "intake.json")
+        labels = json.loads(intake.content).get("labels") if intake else None
+        return [str(x) for x in labels] if isinstance(labels, list) else []
+
     def _task(self, job_id: str, repo: str, base: str, source: str, w: WorkerContract) -> Task:
         cap = (
             self.cfg.budgets.bench_task_usd if source == "bench" else self.cfg.budgets.per_task_usd
@@ -2383,7 +2390,7 @@ class JobRunner:
             ),
             limits=Limits(max_cost_usd=min(w.max_cost_usd or cap, cap)),
             depends_on=w.depends_on,
-            labels=w.labels,
+            labels=w.labels if "labels" in w.model_fields_set else self._job_labels(job_id),
             size=w.size,
             has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
             runner_file_change=self._plan_runner_files(job_id, repo, w),
