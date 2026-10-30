@@ -1029,7 +1029,11 @@ def test_a_hosted_sessions_hosted_call_is_unchanged(
 def test_a_request_cannot_override_the_sessions_locality(
     client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
 ) -> None:
-    _, tok = _local_session(cfg, store, budget, gw)
+    # Admit a hosted, priced model in the tower provider's allowlist, so only
+    # _check_locality (not _check_model) can refuse it.
+    cfg.backends.presets["tower-fast"].model = "claude-sonnet-5-5"
+    sid, tok = _local_session(cfg, store, budget, gw)
+    cfg.repos.repos[PA].backends.append("tower-fast")
     r = client.post(
         "/v1/messages",
         json=_msg(locality="hosted", metadata={"locality": "hosted", "user_id": "x"}),
@@ -1042,6 +1046,19 @@ def test_a_request_cannot_override_the_sessions_locality(
     assert r.status_code == 403
     assert upstream.requests == []
     assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    # Without the extra body field, the hosted model is admitted by the allowlist
+    # and only _check_locality refuses it.
+    r = client.post(
+        "/v1/messages",
+        json=_msg(),
+        headers={"x-api-key": tok, "x-vigil-locality": "hosted", "x-vigil-preset": "claude-sonnet"},
+    )
+    assert r.status_code == 403
+    data = _gateway_events(store, sid)[-1].data
+    data = data if isinstance(data, dict) else json.loads(data)
+    assert data["reason"] == "hosted_model_for_local_session"
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
     _, tok2 = _session(store, budget, gw)  # a hosted session claiming local is still hosted
     r = client.post(
         "/v1/messages",
@@ -1049,3 +1066,65 @@ def test_a_request_cannot_override_the_sessions_locality(
         headers={"x-api-key": tok2, "x-vigil-locality": "local"},
     )
     assert r.status_code == 200 and len(upstream.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "model", ["Claude-Sonnet-5-5", "anthropic/claude-sonnet-5-5", "no-such-model-9"]
+)
+@pytest.mark.parametrize(
+    ("path", "extra"),
+    [("/v1/messages", {}), ("/v1/messages", {"stream": True}), ("/v1/messages/count_tokens", {})],
+)
+def test_a_local_session_refuses_odd_or_hosted_model_names_fail_closed(
+    client: TestClient,
+    cfg: Config,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    model: str,
+    path: str,
+    extra: dict[str, Any],
+) -> None:
+    """The backstop is `_check_model`'s per-provider allowlist: a case variant, a
+    prefixed or an unknown name is refused even where _check_locality can't tell."""
+    _, tok = _local_session(cfg, store, budget, gw)
+    before = [tuple(x) for x in store.q("SELECT * FROM reservations")]
+    r = client.post(path, json=_msg(model=model, **extra), headers={"x-api-key": tok})
+    assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    assert [tuple(x) for x in store.q("SELECT * FROM reservations")] == before
+
+
+@pytest.mark.parametrize(
+    ("path", "extra"),
+    [("/v1/messages", {}), ("/v1/messages", {"stream": True}), ("/v1/messages/count_tokens", {})],
+)
+def test_a_local_session_calls_a_hosted_model_on_every_path_and_is_refused(
+    client: TestClient,
+    cfg: Config,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    path: str,
+    extra: dict[str, Any],
+) -> None:
+    _, tok = _local_session(cfg, store, budget, gw)
+    r = client.post(path, json=_msg(**extra), headers={"x-api-key": tok})
+    assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+
+
+def test_a_local_preset_with_no_model_refuses_every_call(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    cfg.backends.presets["tower-qwen"].model = None
+    _, tok = _local_session(cfg, store, budget, gw)
+    for model in ("claude-sonnet-5-5", "qwen3.6-35b-a3b"):
+        r = client.post("/v1/messages", json=_msg(model=model), headers={"x-api-key": tok})
+        assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
