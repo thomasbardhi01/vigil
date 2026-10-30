@@ -3459,8 +3459,15 @@ class JobRunner:
         owner's republish of a verified head."""
         contract = t.contract
         runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests, hidden_on)
+        # The job row's own issue number (an int vigild stored), never text a worker wrote.
+        # One task closes the issue; with more, each PR only refs it, or the first merge
+        # would close it early.
+        issue_line = ""
+        if job.issue is not None:
+            verb = "Closes" if len(self.store.list_tasks(job.id)) == 1 else "Refs"
+            issue_line = f"{verb} #{int(job.issue)}\n\n"
         body = (
-            f"{report.summary}\n\n{runner_note}Job `{job.id}`, task `{t.id}` (tier `{t.tier}`: "
+            f"{report.summary}\n\n{issue_line}{runner_note}Job `{job.id}`, task `{t.id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
             f"{report.test_before.value} → {report.test_after.value} (run by vigild's verifier)."
             f"\n\nSelf-check: would flag: {report.self_check.reviewer_would_flag}; not done: "
