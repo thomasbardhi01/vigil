@@ -205,7 +205,23 @@ def publish(
                     f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
                     "last sent, and nothing is overwritten"
                 )
-            ws.push(repo, send, branch, token)
+            if tip is not None and tip != send and not ws.is_ancestor(repo, tip, send):
+                raise PublishError(
+                    f"{branch} would not fast-forward from the remote tip {tip[:12]}: "
+                    "nothing is forced and nothing is pushed"
+                )
+            try:
+                ws.push(repo, send, branch, token, tip)
+            except WorkspaceError as e:
+                # only a stale lease means the branch moved; a hook, ruleset or auth
+                # refusal keeps its own cause (#198 review)
+                if "stale info" in str(e):
+                    seen = tip[:12] if tip else "no branch"
+                    raise BranchMoved(
+                        f"{branch} moved on the remote after vigild read it ({seen}): "
+                        "nothing is overwritten"
+                    ) from e
+                raise
         ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
