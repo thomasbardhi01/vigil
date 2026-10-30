@@ -335,3 +335,10 @@ async def test_approve_all_carries_the_ruling() -> None:
     r = await _call(seen, "approve_all", {"batch_id": "b-0001", "ruling": "R"})
     assert not r.is_error
     assert json.loads(seen.requests[0].content) == {"ruling": "R"}
+
+
+async def test_replan_carries_the_ruling_with_its_note() -> None:
+    seen = Seen()
+    args = {"item_id": 4, "action": "replan", "note": "n", "ruling": "R"}
+    assert not (await _call(seen, "inbox_act", args)).is_error
+    assert json.loads(seen.requests[0].content) == {"note": "n", "ruling": "R"}

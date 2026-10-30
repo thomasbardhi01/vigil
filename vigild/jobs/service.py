@@ -501,7 +501,11 @@ class JobService:
         return batch_id, ids
 
     def approve_batch(
-        self, batch_id: str, actor: Actor = Actor.OWNER, ruling: str | None = None
+        self,
+        batch_id: str,
+        actor: Actor = Actor.OWNER,
+        ruling: str | None = None,
+        ruling_heading: str | None = None,
     ) -> dict[str, Any]:
         """Approve all of a batch's open specs (owner, 2026-10-28). Each is the ordinary
         approval of that job's spec item (its own transaction, `approval` and state events,
@@ -526,7 +530,10 @@ class JobService:
                 skipped.append({"job_id": job_id, "state": state, "reason": "no open spec"})
                 continue
             try:
-                job = self.approve(item_id, batch_id=batch_id, actor=actor, ruling=ruling)
+                job = self.approve(
+                    item_id, batch_id=batch_id, actor=actor, ruling=ruling,
+                    ruling_heading=ruling_heading,
+                )  # fmt: skip
             except (Conflict, Forbidden) as e:
                 state = self.store.get_job(job_id).state.value
                 skipped.append({"job_id": job_id, "state": state, "reason": str(e)})
@@ -941,6 +948,7 @@ class JobService:
         batch_id: str | None = None,
         actor: Actor = Actor.OWNER,
         ruling: str | None = None,
+        ruling_heading: str | None = None,
     ) -> Job:
         """The owner's approval from the inbox. With `actor=COORD` (the coord token, #146)
         it is recorded as coord over `mcp`, must cite a `ruling`, and is refused (`Forbidden`)
@@ -964,7 +972,9 @@ class JobService:
                     f"the coord token can't approve a spec on ladder_pinned_paths ({hit}); "
                     "the owner approves it"
                 )
-            extra: dict[str, Any] = {"ruling": cited} if cited else {}
+            extra: dict[str, Any] = (
+                {"ruling": cited, "ruling_heading": ruling_heading} if cited else {}
+            )
             try:
                 job = transition(
                     self.store,

@@ -22,7 +22,8 @@ from vigild.jobs.model import JobState
 from vigild.services import Services, Tokens
 
 PA = "thomasbardhi01/parkagent"
-RULING = "owner ruling 2026-10-29: docs-only specs are approved by coord"
+HEADING = "Autonomy (what coord may do between the owner's windows)"
+RULING = f"{HEADING}: docs-only specs are approved by coord"
 
 
 def _job(n: int = 1, **over: Any) -> dict[str, Any]:
@@ -123,7 +124,9 @@ def test_a_ruling_is_redacted_before_it_is_stored(
     jid, item = pending
     leak = "sk-ant-api03-" + "A" * 40
     r = client.post(
-        f"/api/inbox/{item}/approve", headers=auth(tokens.coord), json={"ruling": f"r {leak}"}
+        f"/api/inbox/{item}/approve",
+        headers=auth(tokens.coord),
+        json={"ruling": f"{HEADING} {leak}"},
     )
     assert r.is_success, r.text
     art = store.get_artifact(jid, decisions.NAME)
@@ -442,3 +445,72 @@ def test_the_coord_token_may_reset_a_repo_failures_breaker(
     r = client.post(f"/api/inbox/{item}/reset", headers=auth(tokens.coord))
     assert r.status_code == 200, r.text
     assert store.get_inbox_item(item).resolved_by == "coord"
+
+
+# --- the ruling must name a heading of docs/owner-rulings.md (owner, 2026-10-29) ----------
+
+
+def test_a_ruling_naming_a_heading_passes_and_the_heading_is_recorded(
+    client: TestClient, tokens: Tokens, store: Store, pending: tuple[str, int]
+) -> None:
+    jid, item = pending
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord), json={"ruling": RULING}
+    )
+    assert r.status_code == 200, r.text
+    assert _state_event(store, jid).data["evidence"]["ruling_heading"] == HEADING
+    (ev,) = [e for e in store.events(job_id=jid) if e.type == "approval"]
+    assert ev.data["ruling_heading"] == HEADING and ev.data["ruling"] == RULING
+
+
+def test_a_made_up_ruling_is_refused_and_the_valid_headings_are_listed(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner,
+    pending: tuple[str, int],
+) -> None:  # fmt: skip
+    jid, item = pending
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord),
+        json={"ruling": "owner said yes, trust me"},
+    )  # fmt: skip
+    assert r.status_code == 422 and HEADING in r.text and "Merging and PRs" in r.text
+    assert store.get_job(jid).state is JobState.SPEC_PENDING and runner.approved == []
+
+
+def test_an_unreadable_rulings_file_fails_closed(
+    client: TestClient, tokens: Tokens, store: Store, pending: tuple[str, int],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+) -> None:  # fmt: skip
+    from vigild.jobs import rulings
+
+    monkeypatch.setattr(rulings, "RULINGS_PATH", tmp_path / "absent.md")
+    jid, item = pending
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord), json={"ruling": RULING}
+    )
+    assert r.status_code == 422 and "owner-rulings.md" in r.text
+    assert store.get_job(jid).state is JobState.SPEC_PENDING
+
+
+def test_the_rulings_file_is_pinned_and_a_coord_approval_touching_it_is_refused(
+    client: TestClient, tokens: Tokens, store: Store, cfg: Config
+) -> None:
+    vigil = cfg.repos.repos["thomasbardhi01/vigil"]
+    assert "docs/owner-rulings.md" in vigil.ladder_pinned_paths
+    cfg.repos.repos[PA].ladder_pinned_paths = list(vigil.ladder_pinned_paths)
+    jid = client.post("/api/jobs", json=_job(), headers=auth(tokens.admin)).json()["id"]
+    item = _spec_item(store, jid, ["docs/owner-rulings.md"])
+    r = client.post(
+        f"/api/inbox/{item}/approve", headers=auth(tokens.coord), json={"ruling": RULING}
+    )
+    assert r.status_code == 403 and "ladder_pinned_paths" in r.text
+    assert store.get_job(jid).state is JobState.SPEC_PENDING
+
+
+def test_retry_reset_and_resume_without_a_note_need_no_ruling(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    jid = client.post("/api/jobs", json=_job(), headers=auth(tokens.admin)).json()["id"]
+    item = _page(store, jid)
+    r = client.post(f"/api/inbox/{item}/retry", headers=auth(tokens.coord), json={})
+    assert r.status_code == 200, r.text
+    assert _to(store, jid, "building").data["actor"] == "coord"

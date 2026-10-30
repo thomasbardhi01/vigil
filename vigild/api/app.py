@@ -26,6 +26,7 @@ from vigild.api.auth import (
     require,
 )
 from vigild.db import Store
+from vigild.jobs import rulings
 from vigild.jobs.batch import MAX_JOBS, batch_view
 from vigild.jobs.fsm import KILL_CHANNELS, Actor
 from vigild.jobs.service import (
@@ -59,20 +60,38 @@ def _svc(request: Request) -> Services:
     return services
 
 
-def _approver(request: Request, body: dict[str, Any] | None) -> tuple[Actor, str | None]:
+def _heading(ruling: Any) -> str:
+    """The `docs/owner-rulings.md` heading a coord ruling names; 422 (listing them) if none."""
+    if not isinstance(ruling, str) or not ruling.strip():
+        raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
+    try:
+        return rulings.match(ruling)
+    except rulings.RulingError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+def _coord_note(request: Request, body: dict[str, Any], note: Any) -> Any:
+    """A note made with the coord token is labelled as the coord's, with the heading its
+    `ruling` names, whatever the body says; the owner's note is untouched."""
+    if actor_of(request)[0] != "coord" or not isinstance(note, str) or not note.strip():
+        return note
+    return rulings.label_note(note, _heading(body.get("ruling")))
+
+
+def _approver(
+    request: Request, body: dict[str, Any] | None
+) -> tuple[Actor, str | None, str | None]:
     """Who approves, from the token (`actor_of`), never the body, and the ruling the coord
     token must cite. A missing ruling is a 422: the token may approve, the request is
     incomplete."""
     if actor_of(request)[0] != "coord":
-        return Actor.OWNER, None
+        return Actor.OWNER, None, None
     edits = (body or {}).get("edits")
     if edits not in (None, ""):
         # `edits` reach the worker's packet as the owner's notes, to be followed: not the coord's
         raise HTTPException(403, "the coord token can't approve with `edits`; the owner does")
     ruling = (body or {}).get("ruling")
-    if not isinstance(ruling, str) or not ruling.strip():
-        raise HTTPException(422, "the coord token must cite a ruling (a non-empty `ruling`)")
-    return Actor.COORD, ruling
+    return Actor.COORD, ruling, _heading(ruling)
 
 
 def _who(request: Request) -> Actor:
@@ -276,9 +295,9 @@ def approve_batch(
     approval with its own events (channel `inbox`, evidence naming the batch). A job whose
     spec is not ready is listed under `skipped` and left as it is. With the coord token the
     body must carry a `ruling`, and a spec on `ladder_pinned_paths` is skipped."""
-    actor, ruling = _approver(request, body)
+    actor, ruling, heading = _approver(request, body)
     try:
-        return _svc(request).jobs.approve_batch(batch_id, actor, ruling)
+        return _svc(request).jobs.approve_batch(batch_id, actor, ruling, heading)
     except NotFound as e:
         raise HTTPException(404, "no such batch") from e
 
@@ -319,10 +338,14 @@ def approve(
     request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
     edits = (body or {}).get("edits")
-    actor, ruling = _approver(request, body)
+    actor, ruling, heading = _approver(request, body)
     try:
         job = _svc(request).jobs.approve(
-            item_id, edits if isinstance(edits, str) else None, actor=actor, ruling=ruling
+            item_id,
+            edits if isinstance(edits, str) else None,
+            actor=actor,
+            ruling=ruling,
+            ruling_heading=heading,
         )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
@@ -374,6 +397,7 @@ def replan(
     note = (body or {}).get("note")
     if note is not None and not isinstance(note, str):
         raise HTTPException(422, "note must be text")
+    note = _coord_note(request, body or {}, note)
     jobs = _svc(request).jobs
     try:
         job = jobs.replan(item_id, note, _who(request))
@@ -403,7 +427,11 @@ def fix(
     jobs = _svc(request).jobs
     try:
         job = jobs.fix(
-            item_id, body.get("task_id"), body.get("findings"), body.get("note"), _who(request)
+            item_id,
+            body.get("task_id"),
+            body.get("findings"),
+            _coord_note(request, body, body.get("note")),
+            _who(request),
         )
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e

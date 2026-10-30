@@ -118,8 +118,9 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         ruling: str | None = None,
     ) -> dict[str, Any]:
         """Act on an inbox item: approve (optional `edits`; `ruling` is required with the
-        coord token, naming the owner ruling that allows it), replan (`note` required), retry,
-        abandon (optional `job_id` on a breaker's page) or reset."""
+        coord token, naming the owner ruling that allows it; a replan
+        `note` needs it too), replan (`note` required), retry, abandon (optional `job_id`
+        on a breaker's page) or reset."""
         path = f"/api/inbox/{item_path(item_id)}/{action}"
         body: dict[str, Any] | None = None
         if action == "approve" and (edits is not None or ruling is not None):
@@ -129,7 +130,7 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         elif action == "replan":
             if not note:
                 raise ToolError("replan needs a note")
-            body = {"note": note}
+            body = {"note": note} | ({"ruling": ruling} if ruling is not None else {})
         elif action == "abandon" and job_id:
             job_path(job_id)
             body = {"job_id": job_id}
