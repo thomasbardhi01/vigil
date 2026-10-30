@@ -113,7 +113,6 @@ def worker_kwargs(
             else f"http://{cfg.egress.gateway.host}:{cfg.egress.gateway.port}"
         ),
         "VIGIL_MAX_TURNS": str(spec.max_turns),
-        "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
         "VIGIL_AGENT_UID": str(uid),
         "VIGIL_CHECKPOINT_SECONDS": str(cfg.vigild.scheduler.checkpoint_seconds),
@@ -126,6 +125,8 @@ def worker_kwargs(
         "OTEL_SERVICE_NAME": f"vigil-{spec.role.value}",
         "OTEL_RESOURCE_ATTRIBUTES": ",".join(f"{k}={v}" for k, v in attrs.items()),
     }
+    if spec.max_budget_usd is not None:  # none for a local preset (the gateway is the cap)
+        env["VIGIL_MAX_BUDGET_USD"] = str(spec.max_budget_usd)
     if spec.traceparent:
         env["TRACEPARENT"] = spec.traceparent
     if spec.max_output_tokens:
