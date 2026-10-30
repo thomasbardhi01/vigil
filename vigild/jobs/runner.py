@@ -167,6 +167,9 @@ OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests d
 PR_TITLE_MAX = 200  # GitHub refuses a title over 256 characters (422)
 
 
+_EVIDENCE_MARKS = {"evidence_invalid", "evidence_error"}  # #183: only an invalid one shows them
+
+
 def pr_title(job_id: str, goal: str) -> str:
     """`[vigil <job>] ` and the goal's first line, cut at a word to fit: a replan's goal
     can run to thousands of characters (vi-0008, 2026-10-29)."""
@@ -4867,7 +4870,13 @@ class JobRunner:
             assert isinstance(out, ReviewOutput)
             self.store.finish_replay(
                 rid, "done", verdict=out.verdict, cost_usd=cost,
-                findings=redact([f.model_dump(mode="json") for f in out.findings]),
+                findings=redact([
+                    f.model_dump(
+                        mode="json",
+                        exclude=None if f.evidence_invalid else _EVIDENCE_MARKS,
+                    )
+                    for f in out.findings
+                ]),
             )  # fmt: skip
         return self._replay_result(rid, rnd)
 
