@@ -319,6 +319,12 @@ def test_abandon_records_the_actor_from_the_token(
     ev = _to(store, jid, "abandoned")
     assert (ev.data["actor"], ev.data["channel"]) == (actor, channel)
     assert store.get_inbox_item(item).resolved_by == actor
+    # #162's abandon cleanup records the same actor on its `job_killed`
+    killed = [
+        json.loads(r["data"])
+        for r in store.q("SELECT data FROM events WHERE job_id=? AND type='job_killed'", (jid,))
+    ]
+    assert killed and all((d["actor"], d["channel"]) == (actor, channel) for d in killed)
 
 
 @pytest.mark.parametrize("who", ["admin", "coord"])
