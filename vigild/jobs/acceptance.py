@@ -138,6 +138,13 @@ def live_workers(tasks: Iterable[Any]) -> list[Any]:
     ]
 
 
+def kept_workers(tasks: Iterable[Any], planned: Collection[str]) -> list[Any]:
+    """The live tasks a re-plan keeps: live (see `live_workers`), already built from a
+    plan (not `submitted`/`awaiting_approval`) and not named again in the new plan."""
+    waiting = ("submitted", "awaiting_approval")
+    return [t for t in live_workers(tasks) if t.state not in waiting and t.id not in planned]
+
+
 def contract_text(contract: dict[str, Any]) -> str:
     """What a worker contract says about its ACs: `why` and `done_when`."""
     return f"{contract.get('why') or ''} {(contract.get('spec') or {}).get('done_when') or ''}"

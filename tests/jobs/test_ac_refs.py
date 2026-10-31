@@ -96,3 +96,56 @@ def test_the_spec_gate_refuses_a_plan_where_an_ac_is_named_by_no_worker() -> Non
     assert not [e for e in ok if "named by no worker" in e]
     one = check_job_spec(parse_spec(spec), parse_plan(_plan("nothing")), [])
     assert not [e for e in one if "named by no worker" in e]
+
+
+# --- #143: the gate counts the published tasks a re-plan keeps ------------------------------
+
+
+def test_kept_workers() -> None:
+    from vigild.jobs.acceptance import kept_workers
+
+    tasks = [
+        _task("w1", "merged", "AC1"),
+        _task("w2", "building", "AC2"),
+        _task("w3", "superseded", "AC3"),
+        _task("w4", "awaiting_approval", "AC3"),
+        _task("w5", "deps_pending", "x", shape="deps"),
+    ]
+    assert [t.id for t in kept_workers(tasks, {"w2"})] == ["w1"]
+
+
+def test_gate_and_runtime_agree() -> None:
+    from vigild.intake.spec_gate import check_job_spec
+
+    spec = _spec(2).replace("`docs/a.md`", "`docs/**`")
+    plan = parse_plan(_plan("nothing"))
+    kept = [_task("k", "merged", "AC1")]
+    texts = [
+        __import__("vigild.jobs.acceptance", fromlist=["x"]).contract_text(t.contract) for t in kept
+    ]
+    errors = check_job_spec(parse_spec(spec), plan, [], kept_texts=texts)
+    assert any("AC2 is named by no worker" in e for e in errors)
+    # runtime: the new worker answers for AC2, which nobody names; kept answers AC1
+    from vigild.jobs.acceptance import contract_text
+
+    mine = contract_text({"why": "nothing", "spec": {}})
+    assert worker_acs(["AC1", "AC2"], [*texts, mine], mine) == {"AC2"}
+
+
+def test_service_gate_counts_kept_tasks() -> None:
+    from vigild.config import Config  # noqa: F401
+    from vigild.jobs.service import JobService
+
+    svc = JobService.__new__(JobService)
+    svc.store = SimpleNamespace(list_tasks=lambda job_id: [_task("k", "merged", "AC1")])  # type: ignore[assignment]
+    svc.cfg = SimpleNamespace(routing=SimpleNamespace(money_paths=[]))  # type: ignore[assignment]
+    svc.files = None
+    svc.dirs = None
+    svc._used_task_ids = lambda job_id: []  # type: ignore[method-assign]
+    svc.runner = SimpleNamespace(plan_min_cap=lambda *a: None)  # type: ignore[assignment]  # #79's gate hook
+    import vigild.jobs.service as mod
+
+    mod.missing_tools = lambda cfg, repo, cmd: []  # type: ignore[assignment]
+    spec = _spec(2).replace("`docs/a.md`", "`docs/**`")
+    errors = svc._gate("o/r", spec, _plan("nothing"), "main", "j")
+    assert any("AC2 is named by no worker" in e for e in errors), errors

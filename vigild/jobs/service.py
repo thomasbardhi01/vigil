@@ -33,7 +33,7 @@ from vigild.intake.paths import globs_overlap, in_scope, matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task
 from vigild.jobs import decisions
-from vigild.jobs.acceptance import plan_runner_class
+from vigild.jobs.acceptance import contract_text, kept_workers, plan_runner_class
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
@@ -269,9 +269,15 @@ class JobService:
         read: Callable[[str], str | None] | None = None,
         is_dir: Callable[[str], bool] | None = None,
     ) -> list[str]:
+        plan = parse_plan(plan_text)
+        kept = (
+            kept_workers(self.store.list_tasks(job_id), {w.task_id for w in plan.workers})
+            if job_id
+            else []
+        )
         return check_job_spec(
             parse_spec(spec_text),
-            parse_plan(plan_text),
+            plan,
             self.cfg.routing.money_paths,
             missing_tools=lambda cmd: missing_tools(self.cfg, repo, cmd),
             # the base's files, so the gate resolves package scripts as the
@@ -280,6 +286,7 @@ class JobService:
             is_dir=is_dir or (self.dirs(repo, base) if self.dirs is not None else None),
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
+            kept_texts=[contract_text(t.contract) for t in kept],
             # a task's preset is the router's pick, as at plan time (#79)
             min_cap=lambda w: self.runner.plan_min_cap(repo, base, job_id, w),
         )

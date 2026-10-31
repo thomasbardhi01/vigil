@@ -586,3 +586,20 @@ def test_vigil_forbidden_matches_the_path(text: str) -> None:
 )
 def test_vigil_forbidden_ignores_near_misses(text: str) -> None:
     assert not VIGIL_FORBIDDEN.search(text)
+
+
+def test_kept_task_makes_replan_multi_worker() -> None:
+    spec = parse_spec(SPEC)
+    plan = parse_plan(PLAN)
+    plan.workers.pop()  # one new worker, which names AC1 only
+    assert len(plan.workers) == 1
+    assert not [e for e in check_job_spec(spec, plan, MONEY) if "named by no worker" in e]
+    errors = check_job_spec(spec, plan, MONEY, kept_texts=["AC9 only"])
+    assert any("AC2 is named by no worker" in e for e in errors), errors
+
+
+def test_kept_task_covers_its_acs() -> None:
+    spec = parse_spec(SPEC)
+    p = parse_plan(PLAN)
+    errors = check_job_spec(spec, p, MONEY, kept_texts=["AC1 and AC2 hold"])
+    assert not [e for e in errors if "named by no worker" in e], errors
