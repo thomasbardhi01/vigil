@@ -142,6 +142,7 @@ def test_service_gate_counts_kept_tasks() -> None:
     svc.files = None
     svc.dirs = None
     svc._used_task_ids = lambda job_id: []  # type: ignore[method-assign]
+    svc.runner = SimpleNamespace(plan_min_cap=lambda *a: None)  # type: ignore[assignment]  # #79's gate hook
     import vigild.jobs.service as mod
 
     mod.missing_tools = lambda cfg, repo, cmd: []  # type: ignore[assignment]
