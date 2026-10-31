@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tests.security.test_subject_broker_start_rule import intervals_overlap
 from vigild.config import Config
 from vigild.executors.runtime import DockerTestRunner
 from vigild.verifier import helper_file
@@ -125,13 +126,20 @@ except ImportError:
 out["unreadable"] = unreadable
 # four parallel calls all get served, each timed from when it starts
 import threading
-codes = []
-t0 = time.time()
-ts = [threading.Thread(target=lambda: codes.append(run_subject(["sleep", "1"], timeout=3)["returncode"])) for _ in range(4)]
+event_list: list[dict[str, Any]] = []
+for _ in range(4):
+    evt: dict[str, Any] = {"start": int(time.time() * 1000)}
+    event_list.append(evt)
+    def worker(e=evt):
+        e["end"] = int(time.time() * 1000)
+        e["returncode"] = run_subject(["sleep", "1"], timeout=3)["returncode"]
+    ts.append(threading.Thread(target=worker))
 [t.start() for t in ts]
 [t.join() for t in ts]
-out["parallel"] = codes
-out["parallel_secs"] = round(time.time() - t0, 1)
+out["parallel_events"] = [
+    {"code": e["returncode"], "start": e["start"], "end": e["end"]}
+    for e in event_list
+]
 
 # the broker refuses what is not a well-formed run spec
 refused = {}
@@ -251,8 +259,10 @@ def test_the_test_process_cannot_read_the_subject_by_any_route(probe: dict[str, 
 
 
 def test_parallel_calls_are_all_served_and_timed_from_their_start(probe: dict[str, Any]) -> None:
-    assert probe["parallel"] == [0, 0, 0, 0]
-    assert probe["parallel_secs"] >= 3.5  # served one at a time, none timed out waiting
+    assert [e["code"] for e in probe["parallel_events"]] == [0, 0, 0, 0]
+    assert not intervals_overlap(
+        [(e["start"], e["end"]) for e in probe["parallel_events"]]
+    )  # no overlap
 
 
 # --- the real JS path, in ParkAgent's dev image ------------------------------------------------
