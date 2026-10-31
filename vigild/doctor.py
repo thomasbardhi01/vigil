@@ -139,21 +139,30 @@ def prod_checkout_check(prod: Path, plist: Path, data_dir: Path) -> Check:
         return Check(name, False, f"vigild plist not installed; {switch}")
     except Exception as e:  # the kind only, never the content
         return Check(name, False, f"vigild plist unreadable ({type(e).__name__})")
-    if not isinstance(wd, str) or Path(wd).expanduser() != prod:
+    try:  # `~nosuchuser/x` raises; a trailing slash or a symlink must still compare equal
+        same = isinstance(wd, str) and Path(wd).expanduser().resolve() == prod.resolve()
+    except OSError, RuntimeError:
+        same = False
+    if not same:
         return Check(name, False, f"production runs from {wd}, not {prod}; {switch}")
     if not prod.is_dir():
         return Check(name, False, f"{prod} does not exist; {switch}")
     if not (prod / ".git").exists():
         return Check(name, False, f"{prod} is not a git checkout; {switch}")
     try:
-        if git(prod, "status", "--porcelain", "--untracked-files=all"):
+        # read-only: no index refresh writes into production's .git
+        status = git(
+            prod, "status", "--porcelain", "--untracked-files=all",
+            env={"GIT_OPTIONAL_LOCKS": "0"},
+        )  # fmt: skip
+        if status:
             return Check(name, False, f"{prod} has uncommitted or untracked changes")
         head = git(prod, "rev-parse", "HEAD")
     except Exception as e:  # GitError, timeout: the kind only
         return Check(name, False, f"git failed in {prod} ({type(e).__name__})")
     try:
         deployed = (data_dir / "deployed_sha").read_text().strip()
-    except OSError:
+    except OSError, ValueError:  # missing, unreadable or not UTF-8
         return Check(name, False, "no deployed_sha recorded; the deploy script writes it")
     if head != deployed:
         return Check(

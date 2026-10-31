@@ -109,3 +109,38 @@ def test_fails_without_crashing_when_the_plist_is_missing_or_broken(tmp_path: Pa
     s.plist.unlink()
     c = s.check()
     assert c.ok is False and "plist" in c.note
+
+
+def test_a_bad_working_directory_fails_without_crashing(tmp_path: Path) -> None:
+    """Review of #233: `~nosuchuser/x` raises in expanduser(); the check must fail, not crash."""
+    s = Setup(tmp_path)
+    s.point("~nosuchuser-vigil-test/x")
+    c = s.check()
+    assert c.ok is False and "production runs from" in c.note
+
+
+def test_a_trailing_slash_or_symlink_still_matches(tmp_path: Path) -> None:
+    s = Setup(tmp_path)
+    s.point(str(s.prod) + "/")
+    assert s.check().ok is True
+    link = tmp_path / "prod-link"
+    link.symlink_to(s.prod)
+    s.point(str(link))
+    assert s.check().ok is True
+
+
+def test_a_non_utf8_deployed_sha_fails_without_crashing(tmp_path: Path) -> None:
+    s = Setup(tmp_path)
+    (s.data / "deployed_sha").write_bytes(b"\xff\xfe\x00bad")
+    c = s.check()
+    assert c.ok is False and "deployed_sha" in c.note
+
+
+def test_the_check_does_not_write_the_prod_index(tmp_path: Path) -> None:
+    """GIT_OPTIONAL_LOCKS=0: `git status` must not refresh .git/index in production."""
+    s = Setup(tmp_path)
+    index = s.prod / ".git" / "index"
+    (s.prod / "f.txt").touch()  # stale stat info, which a refreshing status would rewrite
+    before = index.stat().st_mtime_ns
+    s.check()
+    assert index.stat().st_mtime_ns == before
