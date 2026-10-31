@@ -69,7 +69,7 @@ flowchart LR
   JOB -- "docker run, /work mount" --> W1
   CK -. "bind mount" .- W1
   W1 -- "HTTP(S)_PROXY" --> PX
-  PX -- "host.docker.internal:8788" --> GW
+  PX -- "host.docker.internal:8788 (VIGIL_GATEWAY_PORT)" --> GW
   PX -- "package registries (workers)" --> REG[("PyPI · npm")]
   GW -- "provider key injected" --> ANT[("Anthropic API")]
   GW -. "phase 5" .-> LS
@@ -852,6 +852,13 @@ The outer loop (weekly replay) is part of phase 7 (ruling 3).
   `/etc/vigil/llama.env` (runbook).
 - **Where tokens live outside the env file:** nowhere. The CLI reads the
   env file; the UI holds a cookie, not a token.
+
+The gateway port has one source: `VIGIL_GATEWAY_PORT` (default 8788), read in
+`config.load`, or `config.apply_gateway_port` on a loaded `Config`. It sets the
+gateway's listen port, the one `192.168.65.254:<port>` smokescreen allowlist entry
+(never more than one), the containers' `VIGIL_GATEWAY_URL` and the local sandbox
+host's `gateway_url`. The docker-live tests use it with an ephemeral port so they
+run beside production vigild. A port outside 1..65535 is refused at load.
 
 ## Where this departs from the design, and why
 

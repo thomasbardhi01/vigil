@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import REPO, BarePublisher
+from vigild import config
 from vigild.api.app import create_app
 from vigild.config import CoordRule, RepoPolicy
 from vigild.contract.models import WorkerReport
@@ -44,12 +45,14 @@ pytestmark = [pytest.mark.docker, pytest.mark.live]
 def live(
     tmp_path: Path, fixture_repo: dict[str, Path], tokens: Tokens
 ) -> Iterator[tuple[Vigild, JobRunner, BarePublisher, TestClient]]:
-    with socket.socket() as s:
-        if s.connect_ex(("127.0.0.1", 8788)) == 0:
-            pytest.skip("port 8788 is in use")
     import docker
 
     v = build(data_dir=tmp_path / "vdata")
+    # an ephemeral port, so production vigild keeps 8788; egress and containers follow it
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    config.apply_gateway_port(v.cfg, port)
     if "anthropic" in v.services.degraded:
         pytest.skip("ANTHROPIC_API_KEY is not set")
     cfg = v.cfg
@@ -115,7 +118,7 @@ def live(
     v.services.tokens = tokens
     server = uvicorn.Server(
         uvicorn.Config(
-            create_gateway_app(v.gateway), host="127.0.0.1", port=8788, log_level="warning"
+            create_gateway_app(v.gateway), host="127.0.0.1", port=port, log_level="warning"
         )
     )
     t = threading.Thread(target=server.run, daemon=True)
