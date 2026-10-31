@@ -247,11 +247,11 @@ def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
     """#29: the step is last in MIGRATIONS; on a database built from the schema of the step
     before it, it adds `model_calls.call_key` and a unique index, and two more runs change
     nothing."""
-    assert db.MIGRATIONS[-1].__name__ == "_m18_call_key"
+    assert db.MIGRATIONS[-2].__name__ == "_m18_call_key"  # the calls index follows
     path = tmp_path / "ck.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
-    for step in db.MIGRATIONS[:-1]:
+    for step in db.MIGRATIONS[:-2]:
         step(conn)
     conn.commit()
     assert "call_key" not in {r[1] for r in conn.execute("PRAGMA table_info(model_calls)")}
