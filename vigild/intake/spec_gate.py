@@ -188,6 +188,7 @@ def check_job_spec(
     read: ReadFile | None = None,
     is_dir: Callable[[str], bool] | None = None,
     existing_task_ids: Collection[str] = (),
+    kept_texts: Sequence[str] = (),
 ) -> list[str]:
     def entry_error(entry: str) -> str | None:
         if err := scope_entry_error(entry):
@@ -285,8 +286,11 @@ def check_job_spec(
 
     # #136: with several workers each AC's test runs in the after run of the worker(s)
     # that name it, so an AC no worker names has nobody answering for it.
-    if len(plan.workers) > 1:
+    # A re-plan's kept tasks (published, still live) count as workers, as at runtime.
+    if len(plan.workers) + len(kept_texts) > 1:
         named: set[str] = set()
+        for t in kept_texts:
+            named |= ac_refs(t)
         for w in plan.workers:
             named |= ac_refs(f"{w.why} {w.done_when}")
         for c in spec.criteria:
