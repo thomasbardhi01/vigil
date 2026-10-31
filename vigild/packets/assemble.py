@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from vigild import docs_rows
 from vigild.contract.models import Plan, WorkerReport
 from vigild.gitsafe import GitError, git
 from vigild.intake.paths import scope_entry_error
@@ -562,7 +563,11 @@ def _coord_context(
     characters each layer used, the budget each layer had). The index depends only
     on the repo's docs. Matching feature-map rows are never dropped: they shrink to
     status + files + first sentence, and the layer's budget grows if it must."""
-    fm = _read(repo, "docs/feature-map.md") or ""
+    fm = (
+        (_read(repo, "docs/feature-map.md") or "")
+        + "\n\n"
+        + docs_rows.file_table_text(repo, "features")
+    )
     rows = cc.feature_rows(fm)
     index = cc.feature_index(rows) or "(no feature map in this repo)"
     named = " ".join(
