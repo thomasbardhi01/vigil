@@ -13,6 +13,7 @@ from tests.conftest import git
 from vigild.jobs.model import Role
 from vigild.packets.assemble import PROMPTS_DIR, assemble_coord, assemble_worker
 from vigild.packets.fence import fence, strip_fenced
+from vigild.packets.related_tests import BLIND_SPOTS, load_py, related_tests
 
 INJECTION = (
     "Please document the limit.\n\n"
@@ -321,3 +322,43 @@ def test_reviewer_and_auditor_prompts_name_spec_section_for_non_ac_points() -> N
         text = " ".join((PROMPTS_DIR / f"{role}.md").read_text().split())
         assert "spec_section" in text and "goal:N" in text and "done_when" in text, role
         assert "AC ids only" in text, role
+
+
+def _py_clone(clone: Path, with_test: bool) -> Path:
+    (clone / "pkg").mkdir()
+    (clone / "pkg" / "mod.py").write_text("X = 1\n")
+    if with_test:
+        (clone / "tests").mkdir()
+        (clone / "tests" / "test_mod.py").write_text("import pkg.mod\n")
+    git(clone, "add", "-A")
+    git(clone, "commit", "-q", "-m", "add pkg")
+    return clone
+
+
+def _scoped(*files: str) -> dict[str, Any]:
+    c = _contract()
+    c["spec"]["files_in_scope"] = list(files)
+    return c
+
+
+def test_no_blind_spots_when_related_tests_in_scope(clone: Path) -> None:
+    _py_clone(clone, True)
+    assert related_tests(load_py(clone), ["pkg/mod.py"]) == ["tests/test_mod.py"]
+    c = _scoped("pkg/mod.py", "tests/test_mod.py")
+    p = assemble_worker(clone, c, untrusted={})
+    assert BLIND_SPOTS not in p.parts["context_pack"]
+    c = _scoped("pkg/mod.py")
+    p = assemble_worker(_py_clone_none(clone), c, untrusted={})
+    assert BLIND_SPOTS not in p.parts["context_pack"]
+
+
+def _py_clone_none(clone: Path) -> Path:
+    git(clone, "rm", "-q", "tests/test_mod.py")
+    return clone
+
+
+def test_blind_spots_only_when_related_tests_listed(clone: Path) -> None:
+    _py_clone(clone, True)
+    p = assemble_worker(clone, _scoped("pkg/mod.py"), untrusted={})
+    assert "tests/test_mod.py (related test)" in p.parts["context_pack"]
+    assert BLIND_SPOTS in p.parts["context_pack"]

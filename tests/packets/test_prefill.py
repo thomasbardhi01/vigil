@@ -15,6 +15,7 @@ from vigild.jobs.artifacts import SpecDoc, parse_plan, parse_spec
 from vigild.packets.assemble import assemble_coord_classic, assemble_coord_lean
 from vigild.packets.fence import FENCE_RE
 from vigild.packets.prefill import TODO, compute_prefill
+from vigild.packets.related_tests import BLIND_SPOTS, load_py, related_tests
 
 MONEY = ["**/budget.py"]
 FILES = {
@@ -205,3 +206,22 @@ def test_no_other_files_does_not_exclude_the_named_ones(repo: Path) -> None:
     pre = compute_prefill(repo, req, policy=policy(), money_globs=MONEY)
     assert pre.candidates == ["vigild/budget.py", "vigild/other.py"]
     assert pre.out_of_scope == []
+
+
+def test_no_blind_spots_when_graph_finds_nothing(repo: Path) -> None:
+    assert related_tests(load_py(repo), ["vigild/other.py"]) == []
+    pre = compute_prefill(
+        repo, request("Change `vigild/other.py`."), policy=policy(), money_globs=MONEY
+    )
+    assert pre.candidates == ["vigild/other.py"]
+    assert not pre.related
+    assert BLIND_SPOTS not in pre.body()
+
+
+def test_blind_spots_when_graph_finds_tests(repo: Path) -> None:
+    assert related_tests(load_py(repo), ["vigild/budget.py"])
+    pre = compute_prefill(
+        repo, request("Change `vigild/budget.py`."), policy=policy(), money_globs=MONEY
+    )
+    assert pre.related
+    assert BLIND_SPOTS in pre.body()

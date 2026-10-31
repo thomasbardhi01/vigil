@@ -236,8 +236,9 @@ def compute_prefill(
         if is_test_file(name):
             tests.append(c)
         elif c.endswith(".py"):  # the import graph (#107)
-            tests += related_tests(py, [c])[:MAX_TESTS_PER_STEM]
-            pre.related = True
+            found_tests = related_tests(py, [c])[:MAX_TESTS_PER_STEM]
+            tests += found_tests
+            pre.related = pre.related or bool(found_tests)
         elif (stem := name.split(".")[0]) != "__init__":  # non-Python: the name heuristic
             found = [
                 f
