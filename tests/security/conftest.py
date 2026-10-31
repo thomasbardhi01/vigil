@@ -47,7 +47,7 @@ SESSION_LABEL = "dev.vigil.session"
 LAYERED = ("parkagent", "vigil")
 
 
-def _latest_session_image(name: str) -> str:
+def _latest_session_image(name: str, prefix: str = "vigil-session") -> str:
     """The `vigil-session/<name>` image built from the executor layer as it is
     now (round 4, item 11): its layer label is today's `layer_digest()`."""
     from vigild.devimage import LAYER_LABEL, layer_digest
@@ -56,13 +56,13 @@ def _latest_session_image(name: str) -> str:
     want = layer_digest()
     tags = [
         t
-        for img in client.images.list(name=f"vigil-session/{name}")  # type: ignore[attr-defined]
+        for img in client.images.list(name=f"{prefix}/{name}")  # type: ignore[attr-defined]
         if (img.labels or {}).get(LAYER_LABEL) == want
         for t in img.tags
     ]
     if not tags:
         pytest.fail(
-            f"no vigil-session/{name} image from the current executor layer: run "
+            f"no {prefix}/{name} image from the current executor layer: run "
             f"`vigil dev-image --repo .../{name}`"
         )
     return sorted(tags)[-1]
@@ -74,7 +74,9 @@ def executor_image(request: pytest.FixtureRequest, cfg: Config) -> str:
     executor image and against the layered ParkAgent and vigil session images."""
     if request.param == "generic":
         return cfg.vigild.images.claude_executor
-    return _latest_session_image(request.param)
+    from vigild.devimage import image_prefix
+
+    return _latest_session_image(request.param, image_prefix(cfg.vigild.data_path, "session"))
 
 
 @pytest.fixture
