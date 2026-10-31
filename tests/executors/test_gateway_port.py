@@ -56,14 +56,16 @@ def test_remote_host_gateway_url_is_left_alone(monkeypatch: pytest.MonkeyPatch) 
     assert all(h.gateway_url.endswith(":49999") for h in c.sandbox_hosts.hosts if not h.remote)
 
 
-@pytest.mark.parametrize("bad", ["abc", "0", "65536", "-1", "80.5"])
+@pytest.mark.parametrize(
+    "bad", ["abc", "0", "65536", "-1", "80.5", " 1_000 ", "+8080", "٨٠٨٠", " 8080"]
+)
 def test_invalid_override_is_refused(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     monkeypatch.setenv("VIGIL_GATEWAY_PORT", bad)
     with pytest.raises(ConfigError):
         config.load()
 
 
-@pytest.mark.parametrize("bad", [0, 65536, -5])
+@pytest.mark.parametrize("bad", [0, 65536, -5, True, 80.5, "8080"])
 def test_apply_refuses_an_invalid_port(bad: int) -> None:
     with pytest.raises(ConfigError):
         config.apply_gateway_port(config.load(), bad)
