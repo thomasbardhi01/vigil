@@ -126,22 +126,24 @@ except ImportError:
 out["unreadable"] = unreadable
 # four parallel calls all get served, each timed from when it starts
 import threading
-ts: list[threading.Thread] = []
-event_list: list[dict[str, Any]] = []
+ts = []
+event_list = []
+# the subject stamps its own start and end, so the interval is when it ran, not when it queued
+STAMP = "import time;s=time.time_ns();time.sleep(1);print(s,time.time_ns())"
+def worker(e):
+    r = run_subject(["python3", "-c", STAMP], timeout=3)
+    e["code"] = r["returncode"]
+    try:
+        e["start"], e["end"] = (int(x) for x in r["stdout"].split()[:2])
+    except ValueError:
+        e["start"] = e["end"] = None
 for _ in range(4):
-    evt: dict[str, Any] = {}
+    evt = {}
     event_list.append(evt)
-    def worker(e=evt):
-        e["start"] = int(time.time() * 1000)
-        e["returncode"] = run_subject(["sleep", "1"], timeout=3)["returncode"]
-        e["end"] = int(time.time() * 1000)
-    ts.append(threading.Thread(target=worker))
+    ts.append(threading.Thread(target=worker, args=(evt,)))
 [t.start() for t in ts]
 [t.join() for t in ts]
-out["parallel_events"] = [
-    {"code": e["returncode"], "start": e["start"], "end": e["end"]}
-    for e in event_list
-]
+out["parallel_events"] = event_list
 
 # the broker refuses what is not a well-formed run spec
 refused = {}
@@ -262,9 +264,9 @@ def test_the_test_process_cannot_read_the_subject_by_any_route(probe: dict[str, 
 
 def test_parallel_calls_are_all_served_and_timed_from_their_start(probe: dict[str, Any]) -> None:
     assert [e["code"] for e in probe["parallel_events"]] == [0, 0, 0, 0]
-    assert not intervals_overlap(
-        [(e["start"], e["end"]) for e in probe["parallel_events"]]
-    )  # no overlap
+    # served one at a time: the subject's own start/end stamps never overlap
+    assert all(e["start"] is not None for e in probe["parallel_events"])
+    assert not intervals_overlap([(e["start"], e["end"]) for e in probe["parallel_events"]])
 
 
 # --- the real JS path, in ParkAgent's dev image ------------------------------------------------

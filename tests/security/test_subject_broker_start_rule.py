@@ -25,17 +25,28 @@ def intervals_overlap(intervals: list[tuple[int, int]]) -> bool:
     return False
 
 
-def timeout_from_start(current_time: int, start: int, timeout: int) -> bool:
-    """Return **True** if a call that started at *start* has timed out at *current_time*.
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0
 
-    A call has timed out when the time since it started strictly exceeds *timeout*.
+    def advance(self, secs: int) -> None:
+        self.now += secs
 
-    This is the fake-clock model used by the parallel-calls test: each
-    call's timeout counts from when it starts running, not from when it
-    was queued.  The ``start`` parameter is the real start time; the
-    elapsed time is derived from it.
+
+def serve_serially(clock: FakeClock, calls: list[tuple[int, int]]) -> list[tuple[int, int, bool]]:
+    """Model a broker serving calls one at a time, all queued at clock.now.
+
+    Each call is ``(duration, timeout)``. Its timeout counts from when it
+    starts running, not from when it was queued. Returns
+    ``(start, end, timed_out)`` per call.
     """
-    return (current_time - start) > timeout
+    results: list[tuple[int, int, bool]] = []
+    for duration, timeout in calls:
+        start = clock.now
+        timed_out = duration > timeout
+        clock.advance(min(duration, timeout))
+        results.append((start, clock.now, timed_out))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -74,37 +85,19 @@ class TestIntervalsOverlap:
         assert intervals_overlap(intervals) is False
 
 
-class TestTimeoutFromStart:
-    def test_not_timed_out(self) -> None:
-        assert timeout_from_start(current_time=5, start=4, timeout=5) is False
-
-    def test_timed_out(self) -> None:
-        assert timeout_from_start(current_time=11, start=5, timeout=5) is True
-
-    def test_exactly_at_timeout(self) -> None:
-        assert timeout_from_start(current_time=10, start=5, timeout=5) is False
-
-
-class TestTimeoutFromStartFakeClock:
-    """AC2: a call's timeout counts from when it starts running, not when it was queued."""
-
+class TestServeSerially:
     def test_queued_longer_than_timeout_still_succeeds(self) -> None:
-        """Call 2 is queued for 9 s (behind 3 calls of 3 s each) but its own
-        timeout of 3 s is measured from when it starts; it runs for 3 s, so it
-        has *not* timed out (3 > 3 is False)."""
-        call_start = 9  # call starts after 3 earlier calls * 3 s each
-        current = 12  # 3 s of execution have elapsed since the call started
-        timeout = 3
-        assert timeout_from_start(current_time=current, start=call_start, timeout=timeout) is False
+        """Four calls, duration 1, timeout 3: the last waits 3 s queued, the
+        total is 4 s, yet none times out because timeouts count from start."""
+        res = serve_serially(FakeClock(), [(1, 3)] * 4)
+        assert [t for _, _, t in res] == [False] * 4
+        assert res[-1][0] >= 3  # queued for at least its own timeout
+        assert not intervals_overlap([(s, e) for s, e, _ in res])
 
-    def test_call_times_out_during_execution(self) -> None:
-        """Call starts at t=0, runs for 4 s with timeout=3 → timed out."""
-        assert timeout_from_start(current_time=4, start=0, timeout=3) is True
+    def test_call_slower_than_its_timeout_times_out(self) -> None:
+        res = serve_serially(FakeClock(), [(4, 3)])
+        assert res == [(0, 3, True)]
 
-    def test_call_with_zero_wait(self) -> None:
-        """Call runs immediately from t=0 for 2 s with timeout=5 → not timed out."""
-        assert timeout_from_start(current_time=2, start=0, timeout=5) is False
-
-    def test_call_with_zero_elapsed(self) -> None:
-        """Call has just started; elapsed is 0, so never timed out."""
-        assert timeout_from_start(current_time=5, start=5, timeout=3) is False
+    def test_timed_out_call_does_not_delay_past_its_timeout(self) -> None:
+        res = serve_serially(FakeClock(), [(9, 2), (1, 3)])
+        assert res[1] == (2, 3, False)
