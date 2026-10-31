@@ -702,6 +702,51 @@ fail.
 Run by hand: `VIGIL_BACKUP_DIR=/path/to/dest uv run python cli/vigil backup`
 (`--keep-days N`, `--data-dir DIR`).
 
+**The off-machine copy to the tower (nightly).** Local sets keep going to
+`VIGIL_BACKUP_DIR=/Users/thomasbardhi/vigil-backups` (from the `dev.vigil.backup`
+plist, daily at 03:15 local; not under `~/vigil-data`) and stay as they are, plus a
+`vigil-<stamp>.coord/` of `<data>/coord/` (no `*.pid`, `__pycache__`, `*.tmp`). With
+`--remote`/`VIGIL_BACKUP_REMOTE` set, the run also checks the copy (`integrity_check`,
+`git fsck --no-dangling` on each vault repo; a failure ships nothing), ships it with
+`rsync -a` to the tower as `<stamp>/` (`vigil.db`, `vault/`, `coord/`, `vigil.marker`),
+checks the remote copy with `rsync --dry-run --checksum --itemize-changes` (must be
+empty), keeps 14 days there (only stamp-named directories holding our marker), and
+records an event `type: backup`. `/api/health` lists `backup` in `degraded` when the
+last `ok: true` event is over 36 h old or missing. **The owner's manual 14:51 backup is
+not recorded, so health shows `backup` degraded until the first nightly run records
+its event.**
+
+One-time setup (the owner does it; a build session never connects to the tower):
+
+1. On the Mac: `ssh-keygen -t ed25519 -f ~/.ssh/vigil-backup -N ''`.
+2. On the tower: `mkdir -p ~/vigil-backups`, and add the public key
+   (`~/.ssh/vigil-backup.pub`) to `~/.ssh/authorized_keys` as one line:
+   `command="rrsync ~/vigil-backups",restrict ssh-ed25519 AAAA... vigil-backup`.
+   `rrsync` ships with the rsync package (`command -v rrsync`; use its full path if
+   it is not on the default PATH). The key can then run only rsync inside that
+   directory: no shell, no `ls`, no `rm`.
+3. In `~/Library/LaunchAgents/dev.vigil.backup.plist`, add to `EnvironmentVariables`:
+   `VIGIL_BACKUP_REMOTE` = `tower:` and `VIGIL_BACKUP_SSH_KEY` =
+   `/Users/<you>/.ssh/vigil-backup` (an absolute path; vigil only names the key and
+   never reads it). Keep `VIGIL_BACKUP_DIR` as it is, then unload and load the agent
+   again (`bootout` then `bootstrap`, as in the install steps above).
+4. First run by hand: `VIGIL_BACKUP_DIR=/Users/thomasbardhi/vigil-backups
+   VIGIL_BACKUP_REMOTE=tower: VIGIL_BACKUP_SSH_KEY=$HOME/.ssh/vigil-backup
+   uv run python cli/vigil backup`. It prints `backed up <stamp> and shipped it to
+   tower:`; `/api/health` should then no longer list `backup`.
+
+The `--remote` value is `host:` or `host:sub/dir/`; the path is relative to the
+rrsync root (`~/vigil-backups`), so `tower:` means that root itself. Nothing in the
+repo names the tower.
+
+**Restore from the tower:** stop vigild; move the live `vigil.db*`, `vault/` and
+`coord/` aside; then fetch a set with the same key:
+`rsync -a -e "ssh -i ~/.ssh/vigil-backup -o IdentitiesOnly=yes" tower:<stamp>/ /path/to/restore/`
+(`rsync --list-only -e "..." tower:` shows the stamps). Check it with
+`uv run python cli/vigil restore /path/to/restore/vigil.db`, copy `vigil.db` to
+`<data>/vigil.db` (mode 600), `vault/` to `<data>/vault` and `coord/` to
+`<data>/coord`, and start vigild.
+
 **Check a backup** (verify only, writes nothing):
 `uv run python cli/vigil restore /path/to/dest/vigil-<stamp>.db`. It opens
 the file read-only, runs `PRAGMA integrity_check` and compares
