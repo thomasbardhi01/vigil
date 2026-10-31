@@ -2970,6 +2970,23 @@ class JobRunner:
             "diff": fence("worker manifest and lockfile diff", diff[:20000] or "(no changes)"),
         }
 
+    def _answer(self, job_id: str, task_id: str) -> dict[str, str]:
+        """The latest answer to the task's question (an `owner_answer` or `coord_answer`
+        event), fenced by the packet next to the question, labelled by who gave it."""
+        for e in reversed(self.store.events(job_id=job_id)):
+            if e.task_id != task_id or e.type not in ("owner_answer", "coord_answer"):
+                continue
+            owner = e.type == "owner_answer"
+            label = "owner answer" if owner else f"coord answer (ruling: {e.data.get('ruling')})"
+            # the fence's own label is a slug of the key; the full label leads the content
+            return {
+                "your question": str(e.data.get("question") or ""),
+                "owner answer" if owner else "coord answer": (
+                    f"{label}\n\n{e.data.get('answer') or ''}"
+                ),
+            }
+        return {}
+
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
         left), re-plan, or abandon. It counts toward the repo's failures. A task
@@ -3029,7 +3046,11 @@ class JobRunner:
             )
             return
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
-        if len(broke) < len(task_ids):  # all out of cap: a budget outcome, not a repo failure
+        asked = [tid for tid, t in tasks.items() if t.get("asked")]
+        only_questions = len(asked) == len(task_ids)
+        # all out of cap: a budget outcome, not a repo failure; a wave of only questions is
+        # the owner's to answer: it neither counts nor resets the consecutive count
+        if len(broke) < len(task_ids) and not only_questions:
             self.job_failed(self.store.get_job(job_id))
         moved = {tid: t["branch_moved"] for tid, t in tasks.items() if t.get("branch_moved")}
         if moved:  # someone pushed to the branch: a retry would loop or overwrite them
@@ -3045,12 +3066,21 @@ class JobRunner:
         # resolves its page, as abandoning does (2a round 9)
         self.breakers.unhold(job_id, by=Actor.VIGILD.value)
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
+        title = f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300]
+        if only_questions:
+            title = f"{', '.join(asked)} {'is' if len(asked) == 1 else 'are'} waiting on you"[:300]
         self._page(
             job_id,
-            f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300],
+            title,
             {
                 "kind": (
-                    "branch_moved" if moved else "escalated" if escalated else "worker_failed"
+                    "branch_moved"
+                    if moved
+                    else "escalated"
+                    if escalated
+                    else "ask_coord"
+                    if only_questions
+                    else "worker_failed"
                 ),
                 "tasks": tasks,
                 "actions": actions,
@@ -3344,7 +3374,8 @@ class JobRunner:
             if escalated or attempt >= self.cfg.routing.escalate_attempt:
                 fresh_fix["history"] = self._findings_history(t, fix_round)
         packet = assemble_worker(
-            clone, contract, untrusted=decisions.section(self.store, job_id),
+            clone, contract,
+            untrusted=decisions.section(self.store, job_id) | self._answer(job_id, task_id),
             approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
         )  # fmt: skip
         resume = self._resume_from(prev.id) if prev and forks else None
@@ -3497,14 +3528,14 @@ class JobRunner:
         ask = self.workspace.read_blob(job.repo, head, f"{art_dir}/ask_coord.json", 16 << 10)
         if ask is not None:
             try:
-                question = str(json.loads(ask).get("question", ""))[:4000]
+                question = str(json.loads(ask).get("question", ""))
             except json.JSONDecodeError, AttributeError:
                 question = "(unreadable ask_coord.json)"
             self.store.create_inbox_item(
                 "questions",
                 "ask_coord",
                 job_id,
-                f"{task_id} asks its coord",
+                f"{task_id} is waiting on you",
                 {
                     "question": question,
                     "task_id": task_id,
@@ -3518,8 +3549,8 @@ class JobRunner:
                 job_id,
                 s,
                 task_id,
-                f"{task_id} asks its coord",
-                {"question": question},
+                f"{task_id} is waiting on you",
+                {"question": question, "asked": True},
                 state="waiting",
             )
         raw = self.workspace.read_blob(job.repo, head, f"{art_dir}/worker_report.json", 256 << 10)
