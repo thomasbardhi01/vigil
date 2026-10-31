@@ -586,7 +586,12 @@ your Max plan and aren't counted.
   - the spec gate (per task, and per job: tests per criterion,
     disjoint parallel writers, pinned interfaces, verify levels, money
     paths; a task whose scope names a runner file is flagged and needs
-    hidden tests, decision `hidden-tests-runner-files`);
+    hidden tests, decision `hidden-tests-runner-files`; a task whose
+    `max_cost_usd` is under its preset's `min_task_usd` is refused, the
+    preset being `route()`'s pick, #79). Dispatch checks the same rule
+    (`router.rules.min_cap_problem`) for jobs approved before it: a
+    task under its minimum is not started and the job pages once
+    (`min_task_cap`, resumable: replan or abandon);
   - intake scoring;
   - the job model and tree with lineage;
   - the FSM with a test per transition;

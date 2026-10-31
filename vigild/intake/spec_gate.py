@@ -200,6 +200,7 @@ def check_job_spec(
     read: ReadFile | None = None,
     is_dir: Callable[[str], bool] | None = None,
     existing_task_ids: Collection[str] = (),
+    min_cap: Callable[[WorkerContract], str | None] | None = None,
 ) -> list[str]:
     def entry_error(entry: str) -> str | None:
         if err := scope_entry_error(entry):
@@ -249,6 +250,8 @@ def check_job_spec(
             errors.append(f"worker {w.task_id}: {why}")
         if not w.must_fail_first and not (w.must_fail_first_reason or "").strip():
             errors.append(f"worker {w.task_id}: {MFF_REASON_RULE}")
+        if min_cap is not None and (why := min_cap(w)):
+            errors.append(f"worker {why}")  # #79: the preset's minimum task cap
         for dep in w.depends_on:
             if dep not in ids and dep not in taken:
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")

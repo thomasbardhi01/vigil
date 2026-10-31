@@ -277,6 +277,8 @@ class JobService:
             is_dir=is_dir or (self.dirs(repo, base) if self.dirs is not None else None),
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
+            # a task's preset is the router's pick, as at plan time (#79)
+            min_cap=lambda w: self.runner.plan_min_cap(repo, base, job_id, w),
         )
 
     def gate_drafts(
