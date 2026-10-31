@@ -603,3 +603,38 @@ def test_kept_task_covers_its_acs() -> None:
     p = parse_plan(PLAN)
     errors = check_job_spec(spec, p, MONEY, kept_texts=["AC1 and AC2 hold"])
     assert not [e for e in errors if "named by no worker" in e], errors
+
+
+# --- vi-0029: an AC command is never a bare full-suite run ----------------------------------
+
+
+def _ac2(cmd: str) -> list[str]:
+    spec = SPEC.replace("test: `pytest -q tests/test_runbook.py`", f"test: `{cmd}`")
+    return check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "uv run pytest -q",
+        "uv run --offline pytest -q -p no:cacheprovider -n auto",
+        "pnpm exec vitest run",
+    ],
+)
+def test_full_suite_ac_command_is_refused(cmd: str) -> None:
+    errors = _ac2(cmd)
+    assert any("AC2" in e and "full suite" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "uv run pytest -q tests/jobs/test_acceptance.py",
+        "uv run pytest -q tests/x.py::test_y",
+        "uv run pytest -q -k timed_out",
+        "uv run pytest -q -m docker",
+    ],
+)
+def test_targeted_ac_command_gets_no_full_suite_error(cmd: str) -> None:
+    errors = _ac2(cmd)
+    assert not any("full suite" in e for e in errors), errors
