@@ -133,12 +133,14 @@ class Live:
     docker: Any
 
 
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 @pytest.fixture
 def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
-    for port in (8787, 8788):
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1", port)) == 0:
-                pytest.skip(f"port {port} is in use (stop vigild first)")
     import docker
 
     repo = _seed(tmp_path)
@@ -146,6 +148,11 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     if "anthropic" in v.services.degraded:
         pytest.skip("ANTHROPIC_API_KEY is not set")
     cfg = v.cfg
+    # ephemeral ports, so production vigild keeps 8787 and 8788: the gateway through the one
+    # override (listen, egress allowlist, container URL), the API for the in-test server
+    gw_port, api_port = free_port(), free_port()
+    config_mod.apply_gateway_port(cfg, gw_port)
+    cfg.vigild.api.port = api_port
     # workers on Haiku (the plan allows it); reviews Sonnet, audits Opus (review.yaml)
     for tier in cfg.routing.tiers:
         cfg.routing.tiers[tier] = "claude-haiku"
@@ -186,6 +193,9 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
                 t.extractall(mods, filter="data")
         return mods
 
+    sessions = SessionImages(images, claude_mods)
+    # build it under this data dir's tag prefix; resolve never builds
+    sessions.ensure_fresh(REPO, ws.head_sha(REPO, "main"))
     publisher = BarePublisher(ws)
     runtime = DockerRuntime(cfg, client)
 
@@ -199,7 +209,7 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
 
     runner = JobRunner(
         cfg, v.store, v.budget, v.gateway, runtime, ws, publisher, v.telemetry, images,
-        Verifier(ws, tests), session_images=SessionImages(images, claude_mods),
+        Verifier(ws, tests), session_images=sessions,
         background=True, breakers=v.gateway.breakers,
         deps=DepsExecutor(ws, runtime.run_deps, HttpRegistry(httpx2.Client(timeout=30)),
                           utcnow, tmp_path / "deps"),
@@ -216,8 +226,8 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     runner.jobs = v.services.jobs
     servers = [
         uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-        for app, port in ((create_gateway_app(v.gateway), 8788),
-                          (create_app(api), cfg.vigild.api.port))
+        for app, port in ((create_gateway_app(v.gateway), gw_port),
+                          (create_app(api), api_port))
     ]  # fmt: skip
     threads = [threading.Thread(target=s.run, daemon=True) for s in servers]
     for t in threads:
@@ -547,6 +557,8 @@ def test_phase_2a_done_when(live: Live) -> None:
     from vigild.doctor import render, run_checks
 
     dcfg = config_mod.load()
+    config_mod.apply_gateway_port(dcfg, lv.v.cfg.vigild.gateway.port)
+    dcfg.vigild.api.port = lv.v.cfg.vigild.api.port
     data = os.environ.get("VIGIL_DOCTOR_DATA_DIR")
     if data:
         dcfg.vigild.data_dir = data

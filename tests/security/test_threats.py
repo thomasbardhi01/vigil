@@ -5,13 +5,14 @@ test_guard_in_container.py because it needs a live model turn."""
 
 from __future__ import annotations
 
-import socket
 import threading
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from vigild import config
+from vigild.config import Config
 from vigild.executors.base import SessionSpec
 from vigild.executors.runtime import DockerRuntime
 from vigild.jobs.model import Role
@@ -101,24 +102,26 @@ class _Hello(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def fake_gateway() -> Iterator[None]:
-    with socket.socket() as s:
-        if s.connect_ex(("127.0.0.1", 8788)) == 0:
-            pytest.skip("port 8788 is in use (vigild running?)")
-    srv = HTTPServer(("127.0.0.1", 8788), _Hello)
+def fake_gateway(cfg: Config) -> Iterator[int]:
+    # an ephemeral port, so production vigild keeps 8788; the egress allowlist and the
+    # container URL follow it (still exactly one address:port)
+    srv = HTTPServer(("127.0.0.1", 0), _Hello)
+    port = int(srv.server_address[1])
+    config.apply_gateway_port(cfg, port)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
-    yield
+    yield port
     srv.shutdown()
+    srv.server_close()
 
 
 def test_gateway_port_is_reachable_but_no_other_host_port(
-    runtime: DockerRuntime, make_spec: Callable[..., SessionSpec], fake_gateway: None
+    runtime: DockerRuntime, make_spec: Callable[..., SessionSpec], fake_gateway: int
 ) -> None:
     _, out = runtime.probe(
         make_spec(),
         FETCH
-        + "http://host.docker.internal:8788/ ; "
+        + f"http://host.docker.internal:{fake_gateway}/ ; "
         + FETCH
         + "http://host.docker.internal:8787/",
     )
