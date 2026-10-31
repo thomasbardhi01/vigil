@@ -98,17 +98,25 @@ def test_a_stop_hook_block_shows_up_in_the_transcript(
     runtime: DockerRuntime, make_spec: Callable[..., SessionSpec], vigild: Vigild
 ) -> None:
     """Plan 2a, item 6: a worker that tries to stop without its report is sent
-    back, with the hook's message in its transcript; the cap lets it go."""
+    back, with the hook's message in its transcript; the cap lets it go.
+
+    A blocked worker obeys the block (it writes and commits its report), which takes
+    real turns (#242: 6 tool calls, 8 turns), so the budget covers that; the hook
+    bounds blocks, not the turns spent working between them."""
     spec = make_spec(Role.WORKER)
-    spec.max_turns = 8
+    spec.max_turns = 20
     spec.packet = (
         "This is a test of a stop check. Do not use any tool. Reply with the single word DONE "
         "and stop. If you are told you can't stop yet, reply DONE again and stop."
     )
     out, events = _run(vigild, runtime, spec)
-    assert out.status == "done", out
+    # 1. a block happens (the harness saw and counted it)
     hooks = [e["data"] for e in events if e["type"] == "stop_hook"]
     assert any(h["blocked"] for h in hooks), events
+    assert out.result.get("stop_hook_blocks", 0) >= 1
+    # 2. its message is in the transcript
     entries = [x for e in events if e["type"] == "transcript" for x in e["data"]["entries"]]
     assert "vigil stop hook" in json.dumps(entries)
-    assert out.result.get("stop_hook_blocks", 0) >= 1
+    # 3. the session ends in success before the cap
+    assert out.status == "done" and out.result.get("subtype") == "success", out
+    assert out.result.get("num_turns", spec.max_turns) < spec.max_turns, out.result
