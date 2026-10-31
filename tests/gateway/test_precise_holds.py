@@ -14,8 +14,11 @@ Every expected dollar below is computed from the price table.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import threading
+import time
 from typing import Any
 
 import httpx2
@@ -47,6 +50,10 @@ class Upstream:
         self.count_raises: Exception | None = None
         self.tokens = 1000  # /tokenize's answer: this many tokens
         self.usage_out = 50
+        self.count_delay = 0.0  # seconds the counter takes
+        self.msg_status = 200
+        self.msg_raises: Exception | None = None
+        self.stream = False
 
     def paths(self) -> list[str]:
         return [r.url.path for r in self.requests]
@@ -54,6 +61,8 @@ class Upstream:
     def __call__(self, req: httpx2.Request) -> httpx2.Response:
         self.requests.append(req)
         if req.url.path.endswith("/count_tokens"):
+            if self.count_delay:
+                time.sleep(self.count_delay)
             if self.count_raises is not None:
                 raise self.count_raises
             if self.count_status != 200:
@@ -61,6 +70,22 @@ class Upstream:
             return httpx2.Response(200, json={"input_tokens": self.count})
         if req.url.path.endswith("/tokenize"):
             return httpx2.Response(200, json={"tokens": list(range(self.tokens))})
+        if self.msg_raises is not None:
+            raise self.msg_raises
+        if self.msg_status != 200:
+            return httpx2.Response(self.msg_status, json={"type": "error"})
+        if self.stream:
+            events = [
+                {"type": "message_start", "message": {"model": MODEL, "usage": self.usage}},
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                 "usage": {"output_tokens": self.usage_out}},
+                {"type": "message_stop"},
+            ]  # fmt: skip
+            data = b"".join(
+                f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events
+            )
+            return httpx2.Response(200, content=data, headers={"content-type": "text/event-stream"})
         return httpx2.Response(
             200,
             json={
@@ -173,7 +198,7 @@ def test_a1s_refused_call_is_admitted_and_its_input_hold_is_a_cent_or_two(
     upstream.count = 77_000  # the first call's exact count
     _sid, tok = _sess(store, budget, gw, first_cost + 0.328)
     assert _post(client, tok, _first(n_first)).status_code == 200
-    clock[0] += 3 * MIN
+    clock[0] += 2 * MIN
     second = _second(n_first, 4_500)
     tail = _tail_tokens(_first(n_first), second)
     expect_in = _usd(gw, tokens_cache_read=76_059, tokens_cache_write_5m=2 + 1_126 + tail)
@@ -206,7 +231,7 @@ def _miss_setup(
     )
     sid, tok = _sess(store, budget, gw, first_cost + hold + 0.001)
     assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 10 * MIN
+    clock[0] += 4 * MIN
     # the provider did not have the prefix: it wrote all of it again
     up.usage = {
         "input_tokens": 5,
@@ -260,7 +285,7 @@ def _two_sessions_on_hits(
         _sid, tok = _sess(store, budget, gw, 1.0)
         assert _post(client, tok, _first()).status_code == 200
         toks.append(tok)
-    clock[0] += 5 * MIN
+    clock[0] += 4 * MIN
     tail = _tail_tokens(_first(), _second())
     all_miss = _usd(gw, tokens_cache_write_5m=reads + 5 + tail, tokens_out=OUT)
     return toks[0], toks[1], all_miss
@@ -423,17 +448,30 @@ def test_a_cache_write_never_earns_the_read_rate(
     assert h.premium == 0
 
 
-def test_a_prefix_older_than_fifty_minutes_is_counted_again(
+def test_a_1h_prefix_is_valid_for_fifty_minutes_and_a_5m_one_for_five(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
 ) -> None:  # fmt: skip
+    """The record's validity follows the TTL the request asks for (5m: 5 minutes, 1h: 60
+    minutes, capped by the 50-minute ceiling)."""
     _reads(upstream, 20_000)
     _sid, tok = _sess(store, budget, gw, 1.0)
-    assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 51 * MIN
     upstream.count = 9_999
+    miss = _usd(gw, tokens_cache_write_5m=9_999, tokens_out=OUT)
+    miss_1h = _usd(gw, tokens_cache_write_1h=9_999, tokens_out=OUT)
+    assert _post(client, tok, _first()).status_code == 200
+    clock[0] += 4 * MIN
+    assert _pre(gw, tok, _second()).premium > 0  # a hit after 4 minutes on a 5m request
+    clock[0] += 2 * MIN  # 6 minutes
     h = _pre(gw, tok, _second())
-    assert h.amount == pytest.approx(_usd(gw, tokens_cache_write_5m=9_999, tokens_out=OUT))
+    assert h.amount == pytest.approx(miss) and h.premium == 0
+    one_h = _with_ttl(_second(), "1h")
+    assert _pre(gw, tok, one_h).premium > 0  # still a hit at 6 minutes on a 1h request
+    clock[0] += 43 * MIN  # 49 minutes
+    assert _pre(gw, tok, one_h).premium > 0
+    clock[0] += 2 * MIN  # 51 minutes
+    h = _pre(gw, tok, one_h)
+    assert h.amount == pytest.approx(miss_1h) and h.premium == 0
 
 
 def test_a_changed_model_or_thinking_is_counted_again(
@@ -574,3 +612,218 @@ def test_a_low_count_that_overshoots_its_hold_pages_and_holds_the_task_as_a_miss
     assert h.amount == pytest.approx(
         _usd(gw, tokens_cache_write_5m=60_005 + tail, tokens_out=OUT), rel=1e-6
     )
+
+
+# --- fix round (review of #251) -----------------------------------------------------------
+
+
+def _primed(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, up: Upstream,
+    clock: list[float], reads: int = 20_000,
+) -> tuple[str, str]:  # fmt: skip
+    """A session whose next call is held as a hit (so it carries a premium)."""
+    _reads(up, reads)
+    sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, _first()).status_code == 200
+    clock[0] += MIN
+    return sid, tok
+
+
+def test_a_cancelled_request_releases_its_hold_and_its_premium(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float], monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    gate = threading.Event()
+    placed = threading.Event()
+    real = gw._backend_gate
+
+    def slow_gate(preset_name: str, session_id: str | None = None) -> str | None:
+        placed.set()  # the hold and the premium are placed by now
+        gate.wait(5)
+        return real(preset_name, session_id)
+
+    monkeypatch.setattr(gw, "_backend_gate", slow_gate)
+
+    async def run() -> None:
+        gs = gw.authorize(tok)
+        raw = json.dumps(_second()).encode()
+        task = asyncio.create_task(gw.forward(gs, "/v1/messages", {}, raw))
+        while not placed.is_set():
+            await asyncio.sleep(0.01)
+        assert budget.premium_total() > 0 and sid in gw._inflight
+        task.cancel()  # the client went away
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.set()
+        for _ in range(100):
+            if sid not in gw._inflight and budget.premium_total() == 0:
+                break
+            await asyncio.sleep(0.02)
+
+    asyncio.run(run())
+    assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+def test_a_cjk_or_base64_tail_is_held_at_its_bytes_over_three(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The tail is estimated in UTF-8 bytes, not characters: three-byte CJK and four-byte
+    emoji are about a token each, and both the task hold and the day/month figure see it."""
+    reads = 20_000
+    for tail_text in ("漢" * 3_000, "😀" * 2_000, "QUJD" * 2_500):
+        _sid, tok = _primed(client, store, budget, gw, upstream, clock, reads)
+        body = _second()
+        body["messages"][-1]["content"][-1]["text"] = tail_text
+        nbytes = len(tail_text.encode())
+        h = _pre(gw, tok, body)
+        floor = math.ceil(nbytes / CHARS_PER_TOKEN)
+        assert (
+            h.amount
+            >= _usd(gw, tokens_cache_read=reads, tokens_cache_write_5m=5 + floor, tokens_out=OUT)
+            - 1e-9
+        )
+        assert h.plain >= _usd(gw, tokens_cache_write_5m=reads + 5 + floor, tokens_out=OUT) - 1e-9
+
+
+def test_an_overshoot_reserves_its_excess_at_once_so_the_day_never_drops(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    sid, tok = _sess(store, budget, gw, 1.0)[0], None
+    _reads(upstream, 60_000)
+    tok = gw.issue_token(sid, PA, "claude-sonnet")
+    assert _post(client, tok, _first()).status_code == 200
+    clock[0] += MIN
+    upstream.usage = {"input_tokens": 5, "cache_creation": {"ephemeral_5m_input_tokens": 61_500}}
+    spent_before = budget.spent_today()
+    assert _post(client, tok, _second()).status_code == 200
+    (ev,) = [e for e in store.events() if e.type == "settle_excess"]
+    excess = ev.data["excess_usd"]
+    assert excess > 0
+    # at once, in _learn: the day already holds the excess, no premium and no owed amount
+    assert budget.premium_total() == 0 and sid not in gw._rereserve
+    (extra,) = store.q(
+        "SELECT amount_usd FROM reservations WHERE session_id=? AND purpose='cache_miss_rereserve'",
+        (sid,),
+    )
+    assert float(extra["amount_usd"]) == pytest.approx(excess, abs=1e-5)
+    assert budget.spent_today() == spent_before  # nothing settled yet
+    # a second session cannot reserve into the excess
+    budget.cfg.daily_usd = budget.spent_today() + budget.open_today() + excess * 0.5
+    from vigild.budget import BudgetExceeded
+
+    with pytest.raises(BudgetExceeded):
+        budget.reserve(session_id=None, task_id=None, amount=excess * 0.9, purpose="other")
+
+
+def test_two_calls_in_flight_at_once_cannot_both_take_the_last_of_the_day(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    a, b, all_miss = _two_sessions_on_hits(client, gw, store, budget, upstream, clock)
+    budget.cfg.daily_usd = budget.spent_today() + budget.open_today() + all_miss * 1.01
+    barrier = threading.Barrier(2)
+    results: list[Any] = []
+
+    def go(tok: str) -> None:
+        barrier.wait()
+        try:
+            results.append(_pre(gw, tok, _second(), keep=True))
+        except GatewayError as e:
+            results.append(e)
+
+    threads = [threading.Thread(target=go, args=(t,)) for t in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    admitted = [r for r in results if not isinstance(r, GatewayError)]
+    assert len(admitted) == 1 and len(results) == 2
+    assert budget.premium_total() == pytest.approx(admitted[0].premium)
+    for h in admitted:
+        gw.release(h)
+    assert budget.premium_total() == 0
+
+
+def test_an_upstream_error_releases_the_hold_and_the_premium(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.msg_status = 529
+    assert _post(client, tok, _second()).status_code == 529
+    assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+def test_an_exception_on_the_wire_releases_the_hold_and_the_premium(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.msg_raises = httpx2.ConnectError("down")
+
+    async def run() -> None:
+        with pytest.raises(httpx2.ConnectError):
+            await gw.forward(gw.authorize(tok), "/v1/messages", {}, json.dumps(_second()).encode())
+
+    asyncio.run(run())
+    assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+def test_a_stream_aborted_midway_releases_the_hold_and_the_premium(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.stream = True
+
+    async def run() -> None:
+        body = {**_second(), "stream": True}
+        _status, _h, gen = await gw.forward(
+            gw.authorize(tok), "/v1/messages", {}, json.dumps(body).encode()
+        )
+        assert budget.premium_total() > 0
+        it = gen.__aiter__()  # type: ignore[union-attr]
+        await it.__anext__()
+        await it.aclose()  # type: ignore[attr-defined]  # the client went away
+
+    asyncio.run(run())
+    assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+def test_a_session_with_no_room_for_any_output_is_refused_before_it_is_counted(
+    gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+) -> None:  # fmt: skip
+    _sid, tok = _sess(store, budget, gw, 0.001)
+    with pytest.raises(GatewayError):
+        _pre(gw, tok, _first())
+    assert not [p for p in upstream.paths() if p.endswith("count_tokens")]
+
+
+def test_tool_choice_is_counted_with_the_request(
+    gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+) -> None:  # fmt: skip
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    tool = {"name": "t", "description": "d", "input_schema": {"type": "object"}}
+    body = {**_first(3_000), "tools": [tool], "tool_choice": {"type": "tool", "name": "t"}}
+    gw.release(_pre(gw, tok, body))
+    (req,) = [r for r in upstream.requests if r.url.path.endswith("/count_tokens")]
+    assert json.loads(req.content)["tool_choice"] == {"type": "tool", "name": "t"}
+
+
+def test_the_count_has_one_total_deadline(
+    gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    from vigild.gateway import service
+
+    monkeypatch.setattr(service, "COUNT_TIMEOUT_S", 0.2)
+    upstream.count_delay = 1.5  # a counter that drips: no single phase times out
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    t0 = time.monotonic()
+    gw.release(_pre(gw, tok, _first(3_000)))
+    assert time.monotonic() - t0 < 1.0
+    (ev,) = [e for e in store.events() if e.type == "hold_estimate_fallback"]
+    assert ev.data["reason"] == "timeout"

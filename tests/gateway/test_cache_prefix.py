@@ -144,10 +144,20 @@ def _plain(gw: Gateway, raw_len: int) -> float:
 def _miss(client: TestClient, gw: Gateway, tok: str, up: Upstream, clock: list[float]) -> None:
     _read(up)
     assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 10 * MIN
+    clock[0] += 4 * MIN
     # the provider did not have the prefix: it wrote everything again
     up.usage = {"input_tokens": 5, "cache_creation": {"ephemeral_1h_input_tokens": 14_000}}
     assert _post(client, tok, _second()).status_code == 200
+
+
+def _no_room_at_the_miss(budget: Budget, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The caps refuse the excess's immediate reservation (`_learn`): the session owes it."""
+
+    def refused(sid: str, premium: float, **kw: Any) -> bool:
+        budget.release_premium(sid, premium)
+        return False
+
+    monkeypatch.setattr(budget, "swap_premium", refused)
 
 
 def test_a_cache_miss_settles_its_real_cost_and_the_next_call_re_reserves(
@@ -175,7 +185,9 @@ def test_a_cache_miss_settles_its_real_cost_and_the_next_call_re_reserves(
 def test_after_a_miss_the_next_call_is_refused_until_it_re_reserves(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     (ev,) = [e for e in store.events() if e.type == "settle_excess"]
@@ -218,7 +230,9 @@ def _plain_hold(gw: Gateway, raw_len: int, out: int = 4096) -> float:
 def test_revoking_a_session_drops_what_a_miss_owes(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     assert gw._rereserve.get(sid, 0) > 0
@@ -248,7 +262,9 @@ def test_a_re_reservation_the_task_cap_cannot_take_is_refused(
 def test_a_re_reservation_the_month_cannot_take_is_refused(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     _sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     budget.cfg.monthly_usd = budget.spent_month() + budget.open_month()

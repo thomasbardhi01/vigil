@@ -18,6 +18,7 @@ under the same checks plus a per-call reservation.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -182,6 +183,7 @@ def worst_case_usd(
 # never a request field); its input (tools, system, messages) is a hash-equal prefix of
 # this one's; it finished within the TTL below.
 PREFIX_TTL_S = 50 * 60
+PREFIX_TTL_5M_S = 5 * 60  # a 5m request's cache entry lives five minutes
 EPS = 1e-9
 
 
@@ -196,7 +198,8 @@ def _strip_cache_control(x: Any) -> Any:
 
 
 def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
-    """Hash and length (characters) of the request's input up to its first `n`
+    """Hash and length (UTF-8 bytes, which `chars / 3` estimates tokens from) of the
+    request's input up to its first `n`
     messages: the model and `thinking` setting (a change of either misses the
     provider's cache), tools, then system, then those messages, as compact sorted JSON without
     cache markers. This is the prefix the provider can cache, in its own order."""
@@ -211,7 +214,8 @@ def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
     text = json.dumps(
         _strip_cache_control(part), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    return hashlib.sha256(text.encode()).hexdigest(), len(text)
+    data = text.encode()
+    return hashlib.sha256(data).hexdigest(), len(data)
 
 
 @dataclass(frozen=True)
@@ -372,6 +376,9 @@ class Gateway:
         self._now: Callable[[], float] = time.monotonic
         self._prefix: dict[str, PrefixRecord] = {}  # session -> its last call's cached input
         self._rereserve: dict[str, float] = {}  # session -> excess a cache miss still owes
+        self._count_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="vigil-count"
+        )
         self._task_miss: set[str] = set()  # tasks (or sessions) held as full misses (R23)
         self._miss_checked: set[str] = set()  # tasks whose overshoot events were read
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
@@ -563,7 +570,8 @@ class Gateway:
         thinking, tools, system, messages) is by hash the start of this one's. Nothing the
         request claims about caching is read. Takes no lock."""
         rec = self._prefix.get(session_id)
-        if rec is None or rec.prompt_tokens <= 0 or self._now() - rec.at > PREFIX_TTL_S:
+        valid = PREFIX_TTL_5M_S if write_ttl(body) == "5m" else PREFIX_TTL_S  # 1h: 60 min, capped
+        if rec is None or rec.prompt_tokens <= 0 or self._now() - rec.at > valid:
             return None
         msgs = body.get("messages")
         if not isinstance(msgs, list) or len(msgs) < rec.messages:
@@ -609,6 +617,20 @@ class Gateway:
         read = min(rec.cached_tokens, rec.prompt_tokens)
         return read, rec.prompt_tokens - read + tail
 
+    def _may_afford(self, session_id: str, model: str, want: int) -> bool:
+        """The cheap pre-check before an exact count (which spends the shared key's
+        `count_tokens` rate): the session has room for at least the output floor with no
+        input at all, or is a reviewer or auditor whose reservation may grow. A session
+        that fails it is refused by `_hold_clamped` anyway, counted or not."""
+        if self._over_cap_role(session_id):
+            return True
+        with self._inflight_lock:
+            headroom = self.budget.session_headroom(session_id) - self._inflight.get(
+                session_id, 0.0
+            )
+        floor = self.prices.cost(model, CallUsage(tokens_out=min(want, MIN_OUTPUT_TOKENS)))
+        return headroom >= floor
+
     def _fallback(self, gs: GatewaySession, preset_name: str, reason: str) -> None:
         try:  # the record never breaks the call
             self.store.add_event(
@@ -636,7 +658,7 @@ class Gateway:
             path = "/v1/messages/count_tokens"
             payload: dict[str, Any] = {
                 k: body[k]
-                for k in ("model", "system", "messages", "tools", "thinking")
+                for k in ("model", "system", "messages", "tools", "tool_choice", "thinking")
                 if k in body
             }
         elif kind == "openai_compatible":
@@ -647,16 +669,19 @@ class Gateway:
             self._fallback(gs, gs.preset, "no_count_endpoint")
             return None
         try:
-            r = self.sync_client.post(
-                self._upstream_url(preset, path),
-                headers=self._headers(headers, self._key(preset), preset),
-                content=json.dumps(payload).encode(),
-                timeout=COUNT_TIMEOUT_S,
+            url = self._upstream_url(preset, path)
+            hdrs = self._headers(headers, self._key(preset), preset)
+            content = json.dumps(payload).encode()
+            # one total deadline, not httpx's per-phase timeouts: a slow-dripping counter
+            # is abandoned (its thread ends on the per-phase limits) and the hold falls back
+            fut = self._count_pool.submit(
+                self.sync_client.post, url, headers=hdrs, content=content, timeout=COUNT_TIMEOUT_S
             )
+            r = fut.result(timeout=COUNT_TIMEOUT_S)
         except GatewayError:
             self._fallback(gs, gs.preset, "no_key")
             return None
-        except httpx2.TimeoutException:
+        except TimeoutError, httpx2.TimeoutException:
             self._fallback(gs, gs.preset, "timeout")
             return None
         except httpx2.HTTPError as e:
@@ -698,8 +723,19 @@ class Gateway:
         excess = cost - hold.amount
         if excess > EPS:  # any call over its task hold, however it was priced (R23, rule 5)
             reason = "cache_miss" if hold.premium > EPS else "estimate_low"
+            # reserve the excess at once, in the same step that gives the premium back, so
+            # open_today / open_month never drop below the true spend; if the caps refuse
+            # it, the session owes it and its next call must re-reserve first (#79)
+            reserved = self.budget.swap_premium(
+                gs.session_id, hold.premium, task_id=gs.task_id, excess=excess,
+                purpose="cache_miss_rereserve",
+            )  # fmt: skip
+            hold.premium = 0.0
             with self._inflight_lock:
-                self._rereserve[gs.session_id] = self._rereserve.get(gs.session_id, 0.0) + excess
+                if not reserved:
+                    self._rereserve[gs.session_id] = (
+                        self._rereserve.get(gs.session_id, 0.0) + excess
+                    )
                 self._task_miss.add(gs.task_id or gs.session_id)
             self.store.add_event(
                 "settle_excess",
@@ -780,7 +816,12 @@ class Gateway:
         chars = fp[2] if fp else 0
         rec = self._match(session_id, body)
         counted = None
-        if rec is None and gs is not None and preset is not None:
+        if (
+            rec is None
+            and gs is not None
+            and preset is not None
+            and self._may_afford(session_id, model, want)
+        ):
             counted = self._count_input(gs, preset, body, headers or {})  # not under the lock
         with self._inflight_lock:
             # A kill revokes, then drains, then settles; a call that passed `authorize`
@@ -880,11 +921,8 @@ class Gateway:
                 return self._seen.get(session_id, 0.0) > stale
         return False
 
-    def _over_cap_ok(self, session_id: str, shortfall: float) -> bool:
-        """A reviewer or auditor call past its session cap goes on (owner,
-        2026-10-23): its reservation grows by the shortfall, against the day
-        and the month, which stay hard stops. Any other session's cap is its
-        cap. Raises GatewayError when the day or month can't take it."""
+    def _over_cap_role(self, session_id: str) -> bool:
+        """Whether the session may go past its cap (a reviewer or auditor, not a replay)."""
         from vigild.jobs.model import Role
 
         if self.store.is_replay(session_id):
@@ -893,7 +931,14 @@ class Gateway:
             role = self.store.get_session(session_id).role
         except KeyError:
             return False
-        if role not in (Role.REVIEWER, Role.AUDITOR):
+        return role in (Role.REVIEWER, Role.AUDITOR)
+
+    def _over_cap_ok(self, session_id: str, shortfall: float) -> bool:
+        """A reviewer or auditor call past its session cap goes on (owner,
+        2026-10-23): its reservation grows by the shortfall, against the day
+        and the month, which stay hard stops. Any other session's cap is its
+        cap. Raises GatewayError when the day or month can't take it."""
+        if not self._over_cap_role(session_id):
             return False
         try:
             self.budget.reserve(
@@ -902,6 +947,12 @@ class Gateway:
         except BudgetExceeded as e:
             raise GatewayError(403, "permission_error", f"budget: {e}") from e
         return True
+
+    def _release_late(self, fut: asyncio.Future[Hold]) -> None:
+        """A preflight finished after its request was cancelled: nobody will use its hold."""
+        if fut.cancelled() or fut.exception() is not None:
+            return  # a refusal placed nothing (and its exception is now retrieved)
+        self.release(fut.result())
 
     def release(self, hold: Hold) -> None:
         if hold.released:
@@ -1198,7 +1249,15 @@ class Gateway:
     async def forward(
         self, gs: GatewaySession, path: str, headers: dict[str, str], raw: bytes
     ) -> tuple[int, dict[str, str], AsyncIterator[bytes] | bytes]:
-        hold = await asyncio.to_thread(self.preflight, gs, path, raw, headers)
+        # The thread places the hold (and the miss premium). If this request is cancelled
+        # while it runs, the result must still be released: the thread is shielded and a
+        # done-callback gives back whatever it placed.
+        pre = asyncio.ensure_future(asyncio.to_thread(self.preflight, gs, path, raw, headers))
+        try:
+            hold = await asyncio.shield(pre)
+        except asyncio.CancelledError:
+            pre.add_done_callback(self._release_late)
+            raise
         preset, body, raw = hold.preset, hold.body, hold.raw
         try:
             key = self._key(preset)

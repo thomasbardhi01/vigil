@@ -219,6 +219,22 @@ class Budget:
             self._check_pool(self.pool_of(session_id=session_id), amount)
             self._premiums[session_id] = self._premiums.get(session_id, 0.0) + amount
 
+    def swap_premium(
+        self, session_id: str, premium: float, *, task_id: str | None, excess: float,
+        purpose: str,
+    ) -> bool:  # fmt: skip
+        """Give back a call's premium and reserve its overshoot in one step (under the
+        store lock, so no other reservation sees the day between the two). False if the
+        caps refuse the reservation: the premium is still given back, and the caller owes
+        the excess."""
+        with self.store.lock:
+            self.release_premium(session_id, premium)
+            try:
+                self.reserve(session_id=session_id, task_id=task_id, amount=excess, purpose=purpose)
+            except BudgetExceeded:
+                return False
+            return True
+
     def release_premium(self, session_id: str, amount: float) -> None:
         if amount <= EPS:
             return
