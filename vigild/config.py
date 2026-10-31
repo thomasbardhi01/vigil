@@ -475,8 +475,28 @@ def load(config_dir: Path = CONFIG_DIR, overrides: Mapping[str, object] | None =
         raw[key] = yaml.safe_load((config_dir / fname).read_text())
     raw.update(overrides or {})
     cfg = Config.model_validate(raw)
+    if (port := env_override("VIGIL_GATEWAY_PORT")) is not None:
+        try:
+            apply_gateway_port(cfg, int(port))
+        except ValueError as e:  # ConfigError is a ValueError
+            raise ConfigError(f"VIGIL_GATEWAY_PORT={port!r}: {e}") from e
     validate(cfg)
     return cfg
+
+
+def apply_gateway_port(cfg: Config, port: int) -> None:
+    """The one place the gateway port is chosen. The listen port, the egress
+    allowlist entry (still exactly one address:port), the containers' gateway
+    URL and the local sandbox host's `gateway_url` all follow it. Remote hosts
+    name their own gateway_url and are left alone. Default: the YAML's 8788."""
+    if not 1 <= port <= 65535:
+        raise ConfigError(f"gateway port {port} is not in 1..65535")
+    cfg.vigild.gateway.port = port
+    eg = cfg.egress.gateway
+    eg.port = port
+    eg.allow_address = f"{eg.allow_address.rsplit(':', 1)[0]}:{port}"
+    host = cfg.sandbox_hosts.local
+    host.gateway_url = f"{host.gateway_url.rsplit(':', 1)[0]}:{port}"
 
 
 def validate(cfg: Config) -> None:
