@@ -533,3 +533,32 @@ def test_a_failed_sessions_peak_counts(world: World, monkeypatch: pytest.MonkeyP
     name = _gate(world, 0, monkeypatch)
     _call(world, "dead", name, 50 * 1024, ended=False, status="failed")
     assert world.runner.capacity.expected_peak(name) == 50 * 1024  # type: ignore[union-attr]
+
+
+def test_a_private_repo_with_tower_only_backends_too_big_blocks_and_pages(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = world
+    name, repo = _too_big(w, monkeypatch)  # a 60k expected peak on a 64k pool
+    cfg = w.runner.cfg
+    w.runner.capacity.start()  # type: ignore[union-attr]
+    cfg.repos.repos[repo].backends = [name]  # tower only
+    cfg.backends.presets[cfg.routing.fallback].locality = "hosted"
+    private = [False]  # public while the coord drafts, private when the plan is routed
+    monkeypatch.setattr("vigild.router.rules.live_private", lambda r: private[0])
+    monkeypatch.setattr("vigild.repos.live_private", lambda r: private[0])
+    calls_before = len(w.store.q("SELECT 1 FROM model_calls"))
+    w.standin.coord_drafts = [lambda j: (spec_n(1), plan_n(j, 1))]
+    job = _request(w)
+    (item,) = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+    private[0] = True
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.store.q("SELECT body FROM inbox_items WHERE kind='page'")
+    assert len(pages) == 1 and "private" in pages[0]["body"]
+    assert not [c for c in w.standin.calls if c[0] == "worker"]
+    hosted = {n for n, p in cfg.backends.presets.items() if p.locality == "hosted"}
+    assert not [
+        r for r in w.store.q("SELECT backend_preset FROM sessions") if r["backend_preset"] in hosted
+    ]
+    assert len(w.store.q("SELECT 1 FROM model_calls")) == calls_before
