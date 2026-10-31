@@ -154,6 +154,75 @@ def test_remote_difference_fails_the_run(
     assert not res.ok
     [ev] = _events(data)
     assert ev["ok"] is False and ev["remote_verified"] is False
+    # nothing is deleted: the failed copy stays, whole, under its .partial name, and the
+    # real set name is never taken by an unverified copy
+    kept = tmp_path / "remote" / f"{STAMP}.partial"
+    assert kept.is_dir() and not (tmp_path / "remote" / STAMP).exists()
+    assert (kept / "vigil.db").read_bytes() == b"tampered"
+    assert (kept / "vault" / "o" / "r.git" / "HEAD").is_file()
+    assert (kept / "coord" / "notes.md").is_file() and backup._ours(kept / backup.REMOTE_MARKER)
+    assert (tmp_path / "local" / f"vigil-{STAMP}.db").is_file()  # the local set is kept too
+
+
+def test_clean_run_leaves_only_the_final_set(data: Path, tmp_path: Path) -> None:
+    res = _run(data, tmp_path, LocalRemote(tmp_path / "remote"))
+    assert res.ok
+    assert sorted(p.name for p in (tmp_path / "remote").iterdir()) == [STAMP]
+
+
+def _ok_event(data: Path, stamp: str) -> None:
+    s = Store.open(data / "vigil.db")
+    s.add_event("backup", {"ok": True, "stamp": stamp, "remote": "r"}, "human")
+    s.conn.close()
+
+
+def _stamp(days: float) -> str:
+    return (NOW - timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
+
+
+def test_retention_keeps_the_last_good_set_however_old(tmp_path: Path) -> None:
+    remote = LocalRemote(tmp_path / "remote")
+    old = _fake_set(remote, NOW - timedelta(days=20), marked=True)
+    assert backup._remote_retention(remote, NOW, 14, {old}) == []
+    assert old in _names(remote)
+
+
+def test_retention_deletes_an_old_good_set_once_a_newer_good_one_exists(tmp_path: Path) -> None:
+    remote = LocalRemote(tmp_path / "remote")
+    old = _fake_set(remote, NOW - timedelta(days=20), marked=True)
+    newer = _fake_set(remote, NOW - timedelta(days=16), marked=True)
+    # newer is itself past 14 days but has no newer good set: it stays
+    assert backup._remote_retention(remote, NOW, 14, {old, newer}) == [old]
+    assert _names(remote) == [newer]
+
+
+def test_a_bad_set_never_counts_as_a_newer_good_one(tmp_path: Path) -> None:
+    remote = LocalRemote(tmp_path / "remote")
+    old = _fake_set(remote, NOW - timedelta(days=20), marked=True)
+    newer = _stamp(2)
+    for suffix in (".bad", ".partial"):
+        d = remote.root_path / f"{newer}{suffix}"
+        d.mkdir()
+        (d / backup.REMOTE_MARKER).write_text("0123456789abcdef")
+    # an ok event exists for `newer`, but only a .bad/.partial copy is on the remote
+    assert backup._remote_retention(remote, NOW, 14, {old, newer}) == []
+    assert old in _names(remote)
+    # an unmarked plain copy does not count either
+    (remote.root_path / newer).mkdir()
+    assert backup._remote_retention(remote, NOW, 14, {old, newer}) == []
+
+
+def test_old_bad_sets_follow_the_14_day_rule(tmp_path: Path) -> None:
+    remote = LocalRemote(tmp_path / "remote")
+    good_old = _fake_set(remote, NOW - timedelta(days=30), marked=True)
+    good_new = _fake_set(remote, NOW - timedelta(days=1), marked=True)
+    bad = f"{_stamp(20)}.bad"
+    (remote.root_path / bad).mkdir()
+    (remote.root_path / bad / backup.REMOTE_MARKER).write_text("0123456789abcdef")
+    assert sorted(backup._remote_retention(remote, NOW, 14, {good_old, good_new})) == sorted(
+        [good_old, bad]
+    )
+    assert _names(remote) == [good_new]
 
 
 def test_verify_ignores_directory_mtime_but_sees_content(tmp_path: Path) -> None:

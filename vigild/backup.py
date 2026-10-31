@@ -49,6 +49,8 @@ RSYNC_FLAGS = ["-a", "--safe-links", "--no-specials", "--no-devices"]
 COORD_EXCLUDES = ["--exclude=*.pid", "--exclude=__pycache__", "--exclude=*.tmp"]
 REMOTE_MARKER = "vigil.marker"
 _STAMP_NAME = re.compile(rf"^{_STAMP}$")
+# a set, or a copy that failed its verify or was never promoted: kept, never counted as good
+_SET_NAME = re.compile(rf"^({_STAMP})(\.partial|\.bad)?$")
 
 
 class BackupError(Exception):
@@ -372,7 +374,7 @@ class RsyncRemote:
 
     @staticmethod
     def _check_name(name: str) -> None:
-        if not _STAMP_NAME.match(name):
+        if not _SET_NAME.match(name):
             raise BackupError(f"not a backup set name: {name!r}")
 
     def _rsync(self, *args: str, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
@@ -524,7 +526,9 @@ def run_nightly(
         ev["local_pruned"] = len(made.pruned)
         ev.update(checks)
         ev["remote_verified"] = _ship(made, remote)
-        ev["retention_removed"] = _remote_retention(remote, now, keep_days)
+        ev["retention_removed"] = _remote_retention(
+            remote, now, keep_days, good_stamps(data) | {stamp}
+        )
         ev["ok"] = True
     except (BackupError, OSError, subprocess.TimeoutExpired) as e:
         ev.update(checks)
@@ -538,48 +542,92 @@ def run_nightly(
     return NightlyResult(bool(ev["ok"]), stamp, ev)
 
 
-def _ship(made: BackupSet, remote: Any) -> bool:
+def _ship_to(made: BackupSet, remote: Any, name: str) -> list[str]:
+    """Ship the local set to `<remote><name>/` (marker last) and return what the checksum
+    dry run says differs (empty: identical)."""
     assert made.coord is not None and made.marker is not None
-    remote.mkdir(made.stamp)
+    remote.mkdir(name)
     # Files go under the name they have on the remote (rsync's itemized dry-run compares
     # by name), so stage links or copies of the db and marker under those names.
     with tempfile.TemporaryDirectory(prefix=f".vigil-{made.stamp}.ship-", dir=made.db.parent) as t:
         stage = Path(t)
-        for src, name in ((made.db, "vigil.db"), (made.marker, REMOTE_MARKER)):
+        for src, fname in ((made.db, "vigil.db"), (made.marker, REMOTE_MARKER)):
             try:
-                os.link(src, stage / name)
+                os.link(src, stage / fname)
             except OSError:  # no hard links (exFAT/FAT)
-                shutil.copy2(src, stage / name)
+                shutil.copy2(src, stage / fname)
         pieces = [
-            (stage / "vigil.db", f"{made.stamp}/vigil.db", False),
-            (made.vault, f"{made.stamp}/vault", True),
-            (made.coord, f"{made.stamp}/coord", True),
+            (stage / "vigil.db", f"{name}/vigil.db", False),
+            (made.vault, f"{name}/vault", True),
+            (made.coord, f"{name}/coord", True),
             # last: marks the set complete
-            (stage / REMOTE_MARKER, f"{made.stamp}/{REMOTE_MARKER}", False),
+            (stage / REMOTE_MARKER, f"{name}/{REMOTE_MARKER}", False),
         ]
-        for src, name, is_dir in pieces:
-            _ship_piece(src, remote.target(name), is_dir=is_dir, ssh_e=remote.ssh_e)
+        for src, rname, is_dir in pieces:
+            _ship_piece(src, remote.target(rname), is_dir=is_dir, ssh_e=remote.ssh_e)
         diffs: list[str] = []
-        for src, name, is_dir in pieces:
-            diffs += _rsync_diff(src, remote.target(name), is_dir=is_dir, ssh_e=remote.ssh_e)
+        for src, rname, is_dir in pieces:
+            diffs += _rsync_diff(src, remote.target(rname), is_dir=is_dir, ssh_e=remote.ssh_e)
+    return diffs
+
+
+def _ship(made: BackupSet, remote: Any) -> bool:
+    """Ship to `<stamp>.partial/` and verify it; only on a clean verify ship again to
+    `<stamp>/` (rsync cannot rename), verify that, and then drop the `.partial` copy. A
+    failed verify deletes nothing: the failed copy stays where it is (named `.partial`),
+    the real `<stamp>/` name is never held by an unverified copy, and a verified-good set
+    is never touched. The `.partial` is removed only after `<stamp>/` verified clean."""
+    partial = f"{made.stamp}.partial"
+    diffs = _ship_to(made, remote, partial)
     if diffs:
-        remote.remove_if_ours(made.stamp)
-        raise BackupError("remote copy differs from the local set: " + "; ".join(diffs[:3]))
+        raise BackupError(
+            f"remote copy differs from the local set (kept as {partial}): " + "; ".join(diffs[:3])
+        )
+    diffs = _ship_to(made, remote, made.stamp)
+    if diffs:
+        raise BackupError(
+            f"final remote copy differs from the local set (kept; {partial} also kept): "
+            + "; ".join(diffs[:3])
+        )
+    remote.remove_if_ours(partial)
     return True
 
 
-def _remote_retention(remote: Any, now: datetime, keep_days: int) -> list[str]:
-    """Remove only directories named like a stamp, older than `keep_days`, that hold this
-    tool's marker (the same guard as the local prune)."""
+def _remote_retention(remote: Any, now: datetime, keep_days: int, good: set[str]) -> list[str]:
+    """Remove only stamp-named sets (and their `.partial`/`.bad` copies) older than
+    `keep_days` that hold this tool's marker, and only when a NEWER verified-good set
+    exists: a stamp in `good` (a recorded `ok: true` event, or this run), present on the
+    remote under its plain name with our marker. A `.bad` or `.partial` copy never counts
+    as good, so the newest good copy is kept however old."""
     cutoff = now - timedelta(days=keep_days)
+    names = remote.names()
+    present_good = sorted(
+        g for g in good if g in names and _STAMP_NAME.match(g) and remote._marker_is_ours(g)
+    )
     removed: list[str] = []
-    for name in remote.names():
-        if not _STAMP_NAME.match(name):
+    for name in names:
+        m = _SET_NAME.match(name)
+        if not m:
             continue
-        when = datetime.strptime(name, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-        if when < cutoff and remote.remove_if_ours(name):
+        when = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        if when >= cutoff or not any(g > m.group(1) for g in present_good):
+            continue
+        if remote.remove_if_ours(name):
             removed.append(name)
     return removed
+
+
+def good_stamps(data: Path) -> set[str]:
+    """Stamps of recorded `ok: true` backup events."""
+    store = Store.open(data / "vigil.db")
+    try:
+        rows = store.q(
+            "SELECT json_extract(data,'$.stamp') AS s FROM events"
+            " WHERE type='backup' AND json_extract(data,'$.ok')=1"
+        )
+    finally:
+        store.conn.close()
+    return {r["s"] for r in rows if isinstance(r["s"], str)}
 
 
 def backup_degraded(store: Store, *, now: datetime | None = None) -> bool:

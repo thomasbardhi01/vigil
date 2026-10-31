@@ -710,7 +710,7 @@ plist, daily at 03:15 local; not under `~/vigil-data`) and stay as they are, plu
 `git fsck --no-dangling` on each vault repo; a failure ships nothing), ships it with
 `rsync -a` to the tower as `<stamp>/` (`vigil.db`, `vault/`, `coord/`, `vigil.marker`),
 checks the remote copy with `rsync --dry-run --checksum --itemize-changes` (must be
-empty), keeps 14 days there (only stamp-named directories holding our marker), and
+empty), keeps 14 days there (only stamp-named directories holding our marker, and only when a newer verified-good set exists, so the newest good set is never deleted; a set that fails its verify stays as `<stamp>.partial/` for you to inspect, is never deleted early, and the run is recorded failed), and
 records an event `type: backup`. `/api/health` lists `backup` in `degraded` when the
 last `ok: true` event is over 36 h old or missing. **The owner's manual 14:51 backup is
 not recorded, so health shows `backup` degraded until the first nightly run records

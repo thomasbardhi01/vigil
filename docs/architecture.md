@@ -470,7 +470,15 @@ value, never in the repo) the same run goes on: the local set also holds
 the set and ships nothing. Then `run_nightly` ships it by `rsync -a` to
 `<remote><stamp>/` (`vigil.db`, `vault/`, `coord/`, and `vigil.marker` last),
 verifies the remote with a second `rsync --dry-run --checksum --itemize-changes`
-that must print nothing, and applies 14-day retention. The tower side is a
+that must print nothing, and applies 14-day retention. rsync cannot rename, so the
+set goes first to `<stamp>.partial/`; only after that verifies clean is it shipped
+again to `<stamp>/`, verified, and the `.partial` dropped. A failed verify deletes
+nothing: the failed copy stays as `<stamp>.partial/`, the run records `ok: false`
+and health stays degraded. Retention removes a set (or its `.partial`/`.bad` copy)
+only when it is over 14 days old and a newer verified-good set exists (a recorded
+`ok: true` event for a newer stamp, present on the remote under its plain name with
+our marker); `.partial`/`.bad` copies never count as good, so the newest good set is
+kept however old. The tower side is a
 dedicated key restricted there to `command="rrsync ~/vigil-backups",restrict`,
 so the remote accepts only rsync and every remote step is an rsync (the key is
 given by path, `VIGIL_BACKUP_SSH_KEY`, and never read). Remote retention
