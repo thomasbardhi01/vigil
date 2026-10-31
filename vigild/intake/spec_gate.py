@@ -99,6 +99,64 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
     return None
 
 
+LAUNCHERS = {"uv", "uvx", "python", "python3", "pytest", "vitest", "pnpm", "npx", "npm", "yarn",
+             "poetry", "pipenv", "bunx"}  # fmt: skip
+VALUE_OPTS = {
+    "-n", "-p", "-c", "-o", "-W", "--maxfail", "--rootdir", "--tb", "--config",
+    "--root", "--reporter", "--junitxml", "--junit-xml", "--ignore", "--ignore-glob",
+    "--deselect", "--durations", "--numprocesses", "--dist", "--basetemp", "--log-level",
+    "--outputFile", "--shard", "--color", "--import-mode", "--confcutdir", "--override-ini",
+    "--cov", "--timeout", "--workers", "--pool",
+}  # fmt: skip
+SELECT_OPTS = ("-k", "-m", "-t", "--testNamePattern")
+
+
+def _selects(cmd: Command) -> bool | None:
+    """Whether a pytest/vitest command names what to run; None if it isn't one."""
+    words = cmd._run()
+    if not words or words[0].rsplit("/", 1)[-1] not in LAUNCHERS:
+        return None
+    for i, w in enumerate(words):
+        if w.rsplit("/", 1)[-1] in ("pytest", "vitest"):
+            runner, rest = w.rsplit("/", 1)[-1], words[i + 1 :]
+            break
+    else:
+        return None
+    skip = False
+    for j, a in enumerate(rest):
+        if skip:
+            skip = False
+        elif a == "--":
+            return bool(rest[j + 1 :])
+        elif a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if name in SELECT_OPTS:
+                return True
+            skip = "=" not in a and name in VALUE_OPTS
+        elif a.startswith("-") and len(a) > 1:
+            if a.startswith(SELECT_OPTS):
+                return True
+            skip = a in VALUE_OPTS
+        elif runner == "vitest" and a in ("run", "watch", "dev", "bench"):
+            continue
+        else:
+            return True
+    return False
+
+
+def full_suite_problem(cmd: str | None) -> str | None:
+    """Why an AC command is a bare full-suite run, or None. When unsure, None."""
+    if not (cmd or "").strip():
+        return None
+    for c in parse(str(cmd)).commands:
+        if _selects(c) is False:
+            return (
+                f"`{str(cmd).strip()}` runs the full suite; name a test file, a `::` node id, "
+                "`-k` or `-m` so the AC says which test it is about"
+            )
+    return None
+
+
 MFF_REASON_RULE = (
     "must_fail_first is false, so must_fail_first_reason is required: "
     'say why, for example "tests only, code unchanged"'
@@ -226,7 +284,7 @@ def check_job_spec(
     for c in spec.criteria:
         if not c.test_cmd:
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
-        elif why := test_cmd_problem(c.test_cmd, read):
+        elif (why := test_cmd_problem(c.test_cmd, read)) or (why := full_suite_problem(c.test_cmd)):
             errors.append(f"spec.md {c.ident}: {why}")
 
     errors.extend(plan.errors)
