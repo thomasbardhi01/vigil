@@ -100,11 +100,12 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
 
 
 RUNNERS = {"pytest", "vitest"}
-VALUE_OPTS = {
-    "-p", "-c", "-n", "-o", "--maxfail", "--tb", "--rootdir", "--timeout", "-W", "--durations",
-    "--reporter", "--config", "-r",
-}  # fmt: skip
+SELECT_SUFFIXES = (".py", ".ts", ".js", ".tsx")
 SELECTORS = ("-k", "-m")
+
+
+def _selects(arg: str) -> bool:
+    return "/" in arg or "::" in arg or arg.endswith(SELECT_SUFFIXES)
 
 
 def full_suite_run(cmd: str) -> bool:
@@ -117,15 +118,7 @@ def full_suite_run(cmd: str) -> bool:
             rest = words[i + 1 :]
             if any(a in SELECTORS or a.startswith(("-k=", "-m=", "-k", "-m")) for a in rest):
                 continue
-            positional: list[str] = []
-            skip = False
-            for a in rest:
-                if skip:
-                    skip = False
-                elif a in VALUE_OPTS:
-                    skip = True
-                elif not a.startswith("-") and a != "run":
-                    positional.append(a)
+            positional = [a for a in rest if not a.startswith("-") and _selects(a)]
             if not positional:
                 return True
     return False

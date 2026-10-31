@@ -606,7 +606,13 @@ def test_kept_task_covers_its_acs() -> None:
 
 
 @pytest.mark.parametrize(
-    "cmd", ["pytest -q", "uv run pytest", "vitest run", "pnpm exec vitest run"]
+    "cmd",
+    [
+        "uv run pytest -q",
+        "uv run --offline pytest -q -p no:cacheprovider -n auto",
+        "pnpm exec vitest run",
+        "pytest -q tests",
+    ],
 )
 def test_full_suite_ac_is_refused(cmd: str) -> None:
     spec = SPEC.replace("`pytest -q tests/test_runbook.py`", f"`{cmd}`")
@@ -617,10 +623,10 @@ def test_full_suite_ac_is_refused(cmd: str) -> None:
 @pytest.mark.parametrize(
     "cmd",
     [
-        "pytest -q tests/test_runbook.py",
-        "pytest -q tests/test_a.py::test_b",
-        "pytest -q -k runbook",
-        "pytest -m unit",
+        "uv run pytest -q tests/jobs/test_acceptance.py",
+        "uv run pytest -q tests/x.py::test_y",
+        "uv run pytest -q -k timed_out",
+        "uv run pytest -q -m docker",
         "vitest run test/a.test.ts",
         "uv run pytest -q -p no:cacheprovider tests/x.py",
     ],
