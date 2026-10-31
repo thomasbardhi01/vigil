@@ -19,6 +19,7 @@ slot; a task whose expected peak alone is over the budget is routed away
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -146,13 +147,13 @@ class Capacity:
         capped here: `route` compares it to the budget; `reserve` caps it."""
         server = self.server(preset_name)
         names = [n for n in self.cfg.backends.presets if self.server(n) == server]
-        marks = ",".join("?" for _ in names)
         rows = self.store.q(
             "SELECT MAX(c.tokens_in + c.tokens_cache_read + c.tokens_out) AS peak"
             " FROM model_calls c JOIN sessions s ON s.id = c.session_id"
-            f" WHERE s.ended_at IS NOT NULL AND c.backend_preset IN ({marks})"
+            " WHERE s.ended_at IS NOT NULL"
+            " AND c.backend_preset IN (SELECT value FROM json_each(?))"
             " GROUP BY c.session_id ORDER BY MAX(c.id) DESC LIMIT ?",
-            (*names, PEAK_HISTORY),
+            (json.dumps(names), PEAK_HISTORY),
         )
         return max([MIN_PEAK_TOKENS, *(int(r["peak"] or 0) for r in rows)])
 
