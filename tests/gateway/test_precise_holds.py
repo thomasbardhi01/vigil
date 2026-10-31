@@ -548,3 +548,29 @@ def test_a_failed_metering_books_the_all_miss_price(
     assert float(row["amount_usd"]) == pytest.approx(
         _usd(gw, tokens_cache_write_5m=reads + 5 + tail, tokens_out=OUT)
     )
+
+
+def test_a_low_count_that_overshoots_its_hold_pages_and_holds_the_task_as_a_miss(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Rule 5 is for any call that costs more than its task hold, not only a cache-priced one."""
+    upstream.count = 1_000  # the provider's count under-reports
+    upstream.usage = {
+        "input_tokens": 5,
+        "cache_read_input_tokens": 20_000,
+        "cache_creation": {"ephemeral_5m_input_tokens": 40_000},
+    }
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, _first()).status_code == 200
+    (ev,) = [e for e in store.events() if e.type == "settle_excess"]
+    assert ev.data["reason"] == "estimate_low" and ev.data["excess_usd"] > 0
+    (page,) = [i for i in store.list_inbox() if i.kind == "page"]
+    assert "overshoot" in page.title
+    clock[0] += MIN
+    tail = _tail_tokens(_first(), _second())
+    h = _pre(gw, tok, _second())
+    assert h.premium == 0 and h.cached_tokens == 0
+    assert h.amount == pytest.approx(
+        _usd(gw, tokens_cache_write_5m=60_005 + tail, tokens_out=OUT), rel=1e-6
+    )

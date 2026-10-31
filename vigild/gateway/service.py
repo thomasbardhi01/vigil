@@ -583,7 +583,7 @@ class Gateway:
             self._miss_checked.add(task_id)
             if self.store.q(
                 "SELECT 1 FROM events WHERE task_id=? AND type='settle_excess'"
-                " AND json_extract(data,'$.reason')='cache_miss' LIMIT 1",
+                " AND json_extract(data,'$.reason') IN ('cache_miss','estimate_low') LIMIT 1",
                 (task_id,),
             ):
                 self._task_miss.add(key)
@@ -696,13 +696,14 @@ class Gateway:
         else:
             self._prefix.pop(gs.session_id, None)
         excess = cost - hold.amount
-        if hold.premium > EPS and excess > EPS:
+        if excess > EPS:  # any call over its task hold, however it was priced (R23, rule 5)
+            reason = "cache_miss" if hold.premium > EPS else "estimate_low"
             with self._inflight_lock:
                 self._rereserve[gs.session_id] = self._rereserve.get(gs.session_id, 0.0) + excess
                 self._task_miss.add(gs.task_id or gs.session_id)
             self.store.add_event(
                 "settle_excess",
-                {"reason": "cache_miss", "session_id": gs.session_id, "task_id": gs.task_id,
+                {"reason": reason, "session_id": gs.session_id, "task_id": gs.task_id,
                  "reserved_usd": round(hold.amount, 6), "reported_usd": round(cost, 6),
                  "hold_usd": round(hold.amount, 6), "actual_usd": round(cost, 6),
                  "excess_usd": round(excess, 6), "priced_as_read_tokens": hold.cached_tokens,
@@ -722,9 +723,10 @@ class Gateway:
                     {"job_id": gs.job_id, "task_id": gs.task_id, "session_id": gs.session_id,
                      "hold_usd": round(hold.amount, 6), "actual_usd": round(cost, 6),
                      "excess_usd": round(excess, 6),
-                     "note": "a cache miss: the call was held at its precise price and cost "
-                     "more. Every later call on this task is held as a full miss (owner ruling "
-                     "R23, 2026-10-31 (#1))", "resumable": False},
+                     "note": f"{reason}: the call cost more than its task hold. Every later "
+                     "call on this task is held as a full miss (owner ruling R23, "
+                     "2026-10-31 (#1))",
+                     "resumable": False},
                 )  # fmt: skip
 
     def _rereserve_miss(self, session_id: str, task_id: str | None) -> None:
