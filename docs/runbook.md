@@ -718,7 +718,10 @@ its event.**
 
 One-time setup (the owner does it; a build session never connects to the tower):
 
-1. On the Mac: `ssh-keygen -t ed25519 -f ~/.ssh/vigil-backup -N ''`.
+1. On the Mac: `brew install rsync` (GNU rsync into `/opt/homebrew/bin`; macOS's
+   `/usr/bin/rsync` is openrsync and the tower's rrsync rejects it, so the backup
+   refuses it). Check: `/opt/homebrew/bin/rsync --version` prints
+   `rsync  version 3.x.y`. Then `ssh-keygen -t ed25519 -f ~/.ssh/vigil-backup -N ''`.
 2. On the tower: `mkdir -p ~/vigil-backups`, and add the public key
    (`~/.ssh/vigil-backup.pub`) to `~/.ssh/authorized_keys` as one line:
    `command="rrsync ~/vigil-backups",restrict ssh-ed25519 AAAA... vigil-backup`.
@@ -728,7 +731,8 @@ One-time setup (the owner does it; a build session never connects to the tower):
 3. In `~/Library/LaunchAgents/dev.vigil.backup.plist`, add to `EnvironmentVariables`:
    `VIGIL_BACKUP_REMOTE` = `tower:` and `VIGIL_BACKUP_SSH_KEY` =
    `/Users/<you>/.ssh/vigil-backup` (an absolute path; vigil only names the key and
-   never reads it). Keep `VIGIL_BACKUP_DIR` as it is, then unload and load the agent
+   never reads it). `VIGIL_RSYNC` (path of the GNU rsync) is optional while Homebrew's is
+   at `/opt/homebrew/bin/rsync`. Keep `VIGIL_BACKUP_DIR` as it is, then unload and load the agent
    again (`bootout` then `bootstrap`, as in the install steps above).
 4. First run by hand: `VIGIL_BACKUP_DIR=/Users/thomasbardhi/vigil-backups
    VIGIL_BACKUP_REMOTE=tower: VIGIL_BACKUP_SSH_KEY=$HOME/.ssh/vigil-backup

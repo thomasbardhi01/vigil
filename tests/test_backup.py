@@ -24,6 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cli"))
 NOW = datetime(2026, 10, 27, 3, 0, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _local_rsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test-only: this Mac's rsync is openrsync; skip the production GNU check."""
+    monkeypatch.setattr(backup, "_TEST_SKIP_RSYNC_CHECK", True)
+
+
 @pytest.fixture
 def data(tmp_path: Path) -> Path:
     root = tmp_path / "data"

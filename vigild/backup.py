@@ -203,12 +203,82 @@ def _copy_db(src: Path, out: Path, checks: dict[str, object] | None = None) -> N
     os.chmod(out, 0o600)
 
 
+# --- which rsync ------------------------------------------------------------------
+# macOS's /usr/bin/rsync is openrsync, which the tower's rrsync (GNU rsync) rejects. Every
+# rsync call here runs one binary, resolved once per run: --rsync, else VIGIL_RSYNC, else
+# Homebrew's GNU rsync, else `rsync` on PATH.
+
+HOMEBREW_RSYNC = "/opt/homebrew/bin/rsync"
+_RSYNC: str | None = None
+_TEST_SKIP_RSYNC_CHECK = False  # tests only: the suite runs on this Mac's openrsync
+_GNU_VERSION = re.compile(r"^rsync\s+version\s+(\d+)\.(\d+)")
+
+
+class RsyncRefused(BackupError):
+    """The binary is not GNU rsync >= 3.1."""
+
+    def __init__(self, path: str, version: str) -> None:
+        super().__init__(
+            f"rsync is openrsync (or not GNU rsync >= 3.1) at {path}; "
+            "install GNU rsync (brew install rsync) or set VIGIL_RSYNC"
+        )
+        self.path = path
+        self.version = version
+
+
+def _is_executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def resolve_rsync(explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    if env := os.environ.get("VIGIL_RSYNC"):
+        return env
+    if _is_executable(HOMEBREW_RSYNC):
+        return HOMEBREW_RSYNC
+    return "rsync"
+
+
+def rsync_bin() -> str:
+    return _RSYNC or resolve_rsync()
+
+
+def rsync_version(path: str) -> str:
+    """First line of `<rsync> --version` ("" when it cannot run)."""
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except OSError, subprocess.TimeoutExpired:
+        return ""
+    lines = r.stdout.strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def check_gnu_rsync(path: str) -> str:
+    """Return the version line of a GNU rsync >= 3.1, else raise `RsyncRefused`."""
+    version = rsync_version(path)
+    m = _GNU_VERSION.match(version)
+    if not m or (int(m.group(1)), int(m.group(2))) < (3, 1):
+        raise RsyncRefused(path, version)
+    return version
+
+
+@contextlib.contextmanager
+def using_rsync(path: str) -> Iterator[None]:
+    global _RSYNC
+    prev, _RSYNC = _RSYNC, path
+    try:
+        yield
+    finally:
+        _RSYNC = prev
+
+
 def _copy_tree(src: Path, out: Path, excludes: list[str] | None = None) -> list[str]:
     out.mkdir()
     if not src.is_dir():
         return []
     r = subprocess.run(
-        ["rsync", *RSYNC_FLAGS, *(excludes or []), "--", f"{src}/", f"{out}/"],
+        [rsync_bin(), *RSYNC_FLAGS, *(excludes or []), "--", f"{src}/", f"{out}/"],
         capture_output=True,
         text=True,
     )
@@ -379,7 +449,7 @@ class RsyncRemote:
 
     def _rsync(self, *args: str, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["rsync", "-e", self.ssh_e, *args],
+            [rsync_bin(), "-e", self.ssh_e, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -444,7 +514,7 @@ def _rsync_diff(src: Path, dst: str, *, is_dir: bool, ssh_e: str = "ssh") -> lis
         filt = [f"--include=/{src.name}", "--exclude=*"]
     r = subprocess.run(
         [
-            "rsync", *RSYNC_FLAGS, "--dry-run", "--checksum", "--itemize-changes",
+            rsync_bin(), *RSYNC_FLAGS, "--dry-run", "--checksum", "--itemize-changes",
             *filt, "-e", ssh_e, "--", a, b,
         ],
         capture_output=True,
@@ -466,7 +536,7 @@ def _rsync_diff(src: Path, dst: str, *, is_dir: bool, ssh_e: str = "ssh") -> lis
 def _ship_piece(src: Path, dst: str, *, is_dir: bool, ssh_e: str = "ssh") -> None:
     a, b = (f"{src}/", f"{dst}/") if is_dir else (str(src), dst)
     r = subprocess.run(
-        ["rsync", *RSYNC_FLAGS, "-e", ssh_e, "--", a, b],
+        [rsync_bin(), *RSYNC_FLAGS, "-e", ssh_e, "--", a, b],
         capture_output=True,
         text=True,
         timeout=3600,
@@ -496,6 +566,7 @@ def run_nightly(
     *,
     now: datetime | None = None,
     keep_days: int = 14,
+    rsync: str | None = None,
 ) -> NightlyResult:
     """Build the local set, verify it, ship it to `remote` (a `SshRemote`, or a test
     double with `label`, `target`, `mkdir`, `names`, `remove_if_ours`), verify the remote
@@ -516,6 +587,33 @@ def run_nightly(
         "retention_removed": [],
         "local_pruned": 0,
     }
+    path = resolve_rsync(rsync)
+    ev["rsync"] = {"path": path, "version": ""}
+    try:
+        if _TEST_SKIP_RSYNC_CHECK:
+            ev["rsync"] = {"path": path, "version": "test override"}
+        else:
+            ev["rsync"] = {"path": path, "version": rsync_version(path)}
+            check_gnu_rsync(path)
+    except RsyncRefused as e:
+        ev["error"] = str(e)[:300]
+        ev["rsync_refused"] = True
+        return _record_nightly(data, ev, started, stamp)
+    with using_rsync(path):
+        return _nightly(data, dest, remote, now, keep_days, stamp, checks, ev, started)
+
+
+def _nightly(
+    data: Path,
+    dest: Path,
+    remote: Any,
+    now: datetime,
+    keep_days: int,
+    stamp: str,
+    checks: dict[str, object],
+    ev: dict[str, object],
+    started: float,
+) -> NightlyResult:
     try:
         made = run_backup(data, dest, now=now, keep_days=keep_days, checks=checks)
         ev["sizes"] = {
@@ -533,6 +631,10 @@ def run_nightly(
     except (BackupError, OSError, subprocess.TimeoutExpired) as e:
         ev.update(checks)
         ev["error"] = str(e)[:300]
+    return _record_nightly(data, ev, started, stamp)
+
+
+def _record_nightly(data: Path, ev: dict[str, object], started: float, stamp: str) -> NightlyResult:
     ev["duration_s"] = round(time.monotonic() - started, 2)
     store = Store.open(data / "vigil.db")
     try:
@@ -641,3 +743,12 @@ def backup_degraded(store: Store, *, now: datetime | None = None) -> bool:
     if not rows:
         return True
     return now - datetime.fromisoformat(rows[0]["ts"]) > MAX_AGE
+
+
+def backup_rsync_refused(store: Store) -> bool:
+    """True when the latest backup event failed because the rsync binary was refused."""
+    rows = store.q(
+        "SELECT json_extract(data,'$.rsync_refused') AS r FROM events WHERE type='backup'"
+        " ORDER BY ts DESC, id DESC LIMIT 1"
+    )
+    return bool(rows and rows[0]["r"])

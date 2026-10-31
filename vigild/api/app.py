@@ -25,7 +25,7 @@ from vigild.api.auth import (
     identify,
     require,
 )
-from vigild.backup import backup_degraded
+from vigild.backup import backup_degraded, backup_rsync_refused
 from vigild.db import Store
 from vigild.jobs import rulings
 from vigild.jobs.batch import MAX_JOBS, batch_view
@@ -126,6 +126,8 @@ def health(request: Request) -> dict[str, Any]:
     try:
         if backup_degraded(svc.store):
             degraded.add("backup")
+        if backup_rsync_refused(svc.store):
+            degraded.add("backup-rsync")
     except Exception:  # an unreadable store is as bad as no backup
         degraded.add("backup")
     return {"ok": db == "ok", "db": db, "degraded": sorted(degraded), "version": "0.1.0"}
