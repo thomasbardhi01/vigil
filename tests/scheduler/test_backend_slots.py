@@ -22,7 +22,7 @@ from vigild.scheduler.capacity import Capacity
 
 
 class Props:
-    def __init__(self, slots: int | None, n_ctx: int = 32768, fail: bool = False) -> None:
+    def __init__(self, slots: int | None, n_ctx: int = 262144, fail: bool = False) -> None:
         self.slots, self.n_ctx, self.fail = slots, n_ctx, fail
         self.calls: list[tuple[str, dict[str, str]]] = []
 
@@ -208,6 +208,15 @@ def test_the_gate_wait_ends_when_cancelled() -> None:
         def server(self, preset: str) -> str:
             return preset
 
+        def budget(self, preset: str) -> int | None:
+            return None  # n_ctx unknown: slots only
+
+        def reserve(self, preset: str) -> int:
+            return 0
+
+        def live_context(self, session_id: str) -> int:
+            return 0
+
     gate = cap.SlotGate(Fixed())  # type: ignore[arg-type]
     assert gate.acquire("p", cancelled=lambda: False, on_wait=lambda: None)
     stop = threading.Event()
@@ -217,3 +226,111 @@ def test_the_gate_wait_ends_when_cancelled() -> None:
     assert waits == [1] and gate.live("p") == 1
     gate.release("p")
     assert gate.live("p") == 0
+
+
+# ---- the context budget (owner, 2026-10-31, branch a): the KV pool is shared ----
+
+
+def _call(w: World, sid: str, preset: str, tokens: int, *, ended: bool = True) -> None:
+    w.store.x(
+        "INSERT OR IGNORE INTO sessions (id, role, status, created_at, ended_at, provenance)"
+        " VALUES (?, 'worker', 'done', 'now', ?, 'local')",
+        (sid, "now" if ended else None),
+    )
+    w.store.x(
+        "INSERT INTO model_calls (session_id, purpose, provider, backend_preset, model,"
+        " tokens_in, tokens_out, tokens_cache_read, tokens_cache_write_5m,"
+        " tokens_cache_write_1h, cost_usd, ts, provenance)"
+        " VALUES (?, 'session', 'local', ?, 'm', ?, 0, 0, 0, 0, 0, 'now', 'local')",
+        (sid, preset, tokens),
+    )
+
+
+def _gate(w: World, peak: int, monkeypatch: pytest.MonkeyPatch, n_ctx: int = 65536) -> str:
+    _local(w, Props(4, n_ctx), monkeypatch)
+    name = next(iter(w.runner.cfg.backends.presets))
+    if peak:
+        _call(w, "hist", name, peak)
+    return name
+
+
+def _take(w: World, name: str, sid: str) -> bool:
+    gate = w.runner.slot_gate
+    assert gate is not None
+    return gate.acquire(
+        name, cancelled=lambda: True, on_wait=lambda: None, poll=0.01, session_id=sid
+    )  # False means it had to wait
+
+
+def test_no_history_expects_32768(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    name = _gate(world, 0, monkeypatch)
+    assert world.runner.capacity.expected_peak(name) == 32768  # type: ignore[union-attr]
+
+
+def test_the_second_session_waits_until_the_first_ends(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = _gate(world, 36 * 1024, monkeypatch)  # 36k + 36k > 64k - 8k
+    gate = world.runner.slot_gate
+    assert gate is not None
+    assert _take(world, name, "a")
+    assert not _take(world, name, "b")  # queued: no failure, no page
+    assert gate.live(name) == 1
+    gate.release(name, "a")
+    assert _take(world, name, "b")
+    assert [e for e in _events(world, "context_budget") if e["outcome"] == "queued"]
+    assert not world.store.q("SELECT 1 FROM inbox_items")
+
+
+def test_two_sessions_run_together_under_the_budget(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 20k of history is floored to 32k, so two fit only in a pool of 72k or more
+    name = _gate(world, 20 * 1024, monkeypatch, n_ctx=81920)  # budget 72k >= 2 x 32k
+    assert _take(world, name, "a") and _take(world, name, "b")
+    assert not _take(world, name, "c")  # a third (96k) does not
+
+
+def test_live_growth_raises_a_reservation(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    name = _gate(world, 0, monkeypatch, n_ctx=98304)  # budget 90k, expected 32k
+    gate = world.runner.slot_gate
+    assert gate is not None
+    assert _take(world, name, "a") and gate.reserved(name) == 32768
+    _call(world, "a", name, 70000, ended=False)  # the running session grew
+    assert gate.reserved(name) == 70000
+    assert not _take(world, name, "b")  # 70k + 32k > 90k: not admitted on the stale 32k
+
+
+def test_a_task_bigger_than_the_server_routes_to_the_fallback(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vigild.contract.models import Spec, Task
+    from vigild.router.rules import route
+
+    cfg = world.runner.cfg
+    name = next(n for n in cfg.backends.presets if n != cfg.routing.fallback)
+    _gate(world, 0, monkeypatch)
+    _call(world, "hist", name, 60 * 1024)
+    cfg.backends.presets[name].live = True
+    cap_ = world.runner.capacity
+    assert cap_ is not None
+    cap_.get(name)
+    repo = next(iter(cfg.repos.repos))
+    cfg.repos.repos[repo].backends = [name, cfg.routing.fallback]
+    cfg.routing.tiers["claude-sonnet"] = name
+    task = Task(
+        task_id="pending-w1", repo=repo, base="main", why="w", value=1, risk=1,
+        spec=Spec(goal="g", test_cmd="t", done_when="d", files_in_scope=["a.py"]),
+    )  # fmt: skip
+    r = route(task, cfg, context=cap_.route_context)
+    assert r.preset == cfg.routing.fallback
+    assert "tower context: estimated 60k > 56k budget (n_ctx 64k - 8k)" in r.tier_reason
+    world.store.x("DELETE FROM model_calls")  # no history: 32k fits
+    assert route(task, cfg, context=cap_.route_context).preset == name
+
+
+def test_hosted_presets_ignore_the_budget(world: World) -> None:
+    cap_ = Capacity(world.runner.cfg, Secrets({}), world.store, fetch=Props(1))
+    name = next(iter(world.runner.cfg.backends.presets))
+    world.runner.cfg.backends.presets[name].locality = "hosted"
+    assert cap_.route_context(name) is None

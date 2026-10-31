@@ -6,7 +6,7 @@ scheduler only ever see the preset name.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,7 +58,21 @@ def _rule(task: Task, cfg: Config) -> tuple[str, str]:
     return "claude-sonnet", "rule9:default"
 
 
-def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route:
+# preset -> (expected peak, budget, n_ctx) of its local server, or None when unknown
+ContextOf = Callable[[str], tuple[int, int, int] | None]
+
+
+def _k(tokens: int) -> str:
+    return f"{round(tokens / 1024)}k"
+
+
+def route(
+    task: Task,
+    cfg: Config,
+    *,
+    override_tier: str | None = None,
+    context: ContextOf | None = None,
+) -> Route:
     tier, reason = _rule(task, cfg)
     if tier == "claude-opus" and reason.startswith("rule2"):
         if override_tier and override_tier != "claude-opus":
@@ -74,6 +88,17 @@ def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route
         tier = override_tier
 
     preset, reason = _resolve(cfg, task.repo, cfg.routing.tiers[tier], reason)
+    fallback = cfg.routing.fallback
+    ctx = context(preset) if context is not None and preset != fallback else None
+    if ctx is not None and ctx[0] > ctx[1]:
+        # the server's expected session alone is bigger than its KV budget: take the
+        # same fallback a preset that is not live takes, never an endless queue
+        peak, budget, n_ctx = ctx
+        reason = (
+            f"{reason}; tower context: estimated {_k(peak)} > {_k(budget)} budget "
+            f"(n_ctx {_k(n_ctx)} - {_k(n_ctx - budget)}), fallback {fallback}"
+        )
+        preset, reason = _resolve(cfg, task.repo, fallback, reason)
     return Route(tier=tier, tier_reason=reason, preset=preset)
 
 

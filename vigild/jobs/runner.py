@@ -152,6 +152,7 @@ from vigild.review.replay import (
 )
 from vigild.router.rules import (
     CoordShape,
+    Route,
     RoutingError,
     min_cap_problem,
     request_paths,
@@ -1457,7 +1458,9 @@ class JobRunner:
         """A session on a `locality: local` preset takes one of its server's slots
         first, waiting while they are all live across every job. The wait is a
         queue, not a failure: no page, no attempt used, a `queued` event (for
-        `backend_slot`) and a `dequeued` one when it starts. False: its job was
+        `backend_slot`) and a `dequeued` one when it starts. It also waits while the
+        live sessions' reserved context plus its expected peak would pass the
+        server's `n_ctx - 8192` (the same queue). False: its job was
         killed while it waited, so it never starts. Hosted presets pass straight."""
         gate = self.slot_gate
         preset = spec.preset
@@ -1483,7 +1486,7 @@ class JobRunner:
         def cancelled() -> bool:
             return bool(job_id) and self._abandoned(str(job_id))
 
-        got = gate.acquire(preset, cancelled=cancelled, on_wait=waiting)
+        got = gate.acquire(preset, cancelled=cancelled, on_wait=waiting, session_id=s.id)
         if queued and job_id:
             self._queue_event(
                 "dequeued", job_id, "backend_slot", spec.task_id,
@@ -1493,7 +1496,7 @@ class JobRunner:
             yield got
         finally:
             if got:
-                gate.release(preset)
+                gate.release(preset, s.id)
 
     def _settle_checked(
         self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None
@@ -2497,6 +2500,11 @@ class JobRunner:
             runner_file_change=self._plan_runner_files(job_id, repo, w),
         )
 
+    def route(self, task: Task) -> Route:
+        """`router.route` with the tower's context budget (cached capacity, no I/O)."""
+        ctx = self.capacity.route_context if self.capacity is not None else None
+        return route(task, self.cfg, context=ctx)
+
     def plan_min_cap(
         self, repo: str, base: str, job_id: str | None, w: WorkerContract
     ) -> str | None:
@@ -2516,7 +2524,7 @@ class JobRunner:
             has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
         )  # fmt: skip
         try:
-            preset = route(task, self.cfg).preset
+            preset = self.route(task).preset
         except RoutingError:
             return None  # plan time reports it
         return min_cap_problem(self.cfg, w.task_id, preset, cap)
@@ -2560,7 +2568,7 @@ class JobRunner:
             try:
                 if lacking:
                     raise RoutingError(f"the dev image lacks {lacking}")
-                r = route(task, self.cfg)
+                r = self.route(task)
             except RoutingError as e:
                 self._block(job_id, f"routing: {e}")
                 self._page(
@@ -4377,7 +4385,7 @@ class JobRunner:
         and move the task to a pricier backend, else None."""
         t = self.store.get_task(task_id)
         rnd = int(t.contract.get("review_rounds") or 0) + 1
-        r = route(Task.model_validate({**t.contract, "review_rounds": rnd}), self.cfg)
+        r = self.route(Task.model_validate({**t.contract, "review_rounds": rnd}))
         if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
             return f"this round runs on {r.preset} (escalated)"
         return None
@@ -4954,7 +4962,7 @@ class JobRunner:
         round, another attempt). Crossing into rule 5 is an escalation."""
         t = self.store.get_task(task_id)
         contract = {**t.contract, **changes}
-        r = route(Task.model_validate(contract), self.cfg)
+        r = self.route(Task.model_validate(contract))
         contract.update(tier=r.tier, tier_reason=r.tier_reason, backend=r.preset)
         self.store.update_task(task_id, contract=contract)
         self.store.route_task(
