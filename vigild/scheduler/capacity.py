@@ -72,6 +72,7 @@ MIN_PEAK_TOKENS = 32768  # a session's expected peak is never reckoned lower
 PEAK_HISTORY = 20  # finished sessions on a server the expected peak looks at
 
 MAX_SLOTS = 64  # a ceiling on whatever a server claims
+REFRESH_SECONDS = 60.0  # a waiting task re-reads /props at most this often
 FAILURE_TTL_SECONDS = 30.0  # a failed read is remembered this long (as 1 slot)
 
 
@@ -91,6 +92,7 @@ class Capacity:
         self._fetch = fetch or _fetch
         self._clock = clock
         self._cache: dict[str, Slots] = {}
+        self._read_at: dict[str, float] = {}  # server -> when its cached answer was read
         self._failed: dict[str, float] = {}  # server -> when its failed read stops counting
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()  # guards the dicts only, never held over I/O
@@ -127,8 +129,19 @@ class Capacity:
                     self._failed[server] = self._clock() + FAILURE_TTL_SECONDS
                     return Slots(1, None)
                 self._cache[server] = got
+                self._read_at[server] = self._clock()
                 self._failed.pop(server, None)
                 return got
+
+    def refresh_if_stale(self, preset_name: str) -> None:
+        """Re-read /props if the cached answer is 60 s old, so a pool the owner
+        resized is picked up by a task already waiting. A failed read keeps its own
+        30 s cache (as 1 slot)."""
+        server = self.server(preset_name)
+        with self._lock:
+            at = self._read_at.get(server)
+        if at is not None and self._clock() - at >= REFRESH_SECONDS:
+            self.refresh(preset_name)
 
     def known(self, preset_name: str) -> Slots | None:
         """The cached capacity, never read: routing must not do I/O."""
@@ -264,8 +277,6 @@ class SlotGate:
         wait begins. False when `cancelled()` ended the wait."""
         poll = SLOT_POLL_SECONDS if poll is None else poll
         waited = False
-        limit = self.capacity.limits(preset)  # outside the condition: it may do I/O
-        budget = self.capacity.budget(preset)
         name = preset
         preset = self.capacity.server(preset)  # presets on one server share its slots
         if session_id is None:
@@ -273,6 +284,10 @@ class SlotGate:
                 self._anon += 1
                 session_id = f"anon-{self._anon}"
         while True:
+            if waited:
+                self.capacity.refresh_if_stale(name)  # I/O, outside the condition
+            limit = self.capacity.limits(name)
+            budget = self.capacity.budget(name)
             need = self.capacity.reserve(name)
             used = self.reserved(name)
             with self._cond:

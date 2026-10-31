@@ -208,6 +208,9 @@ def test_the_gate_wait_ends_when_cancelled() -> None:
         def server(self, preset: str) -> str:
             return preset
 
+        def refresh_if_stale(self, preset: str) -> None:
+            pass
+
         def budget(self, preset: str) -> int | None:
             return None  # n_ctx unknown: slots only
 
@@ -334,3 +337,32 @@ def test_hosted_presets_ignore_the_budget(world: World) -> None:
     name = next(iter(world.runner.cfg.backends.presets))
     world.runner.cfg.backends.presets[name].locality = "hosted"
     assert cap_.route_context(name) is None
+
+
+def test_a_pool_change_is_picked_up_mid_queue(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = world
+    props = Props(4, 65536)
+    now = [1000.0]
+    _local(w, props, monkeypatch)
+    w.runner.capacity = Capacity(
+        w.runner.cfg, Secrets({}), w.store, fetch=props, clock=lambda: now[0]
+    )
+    w.runner.slot_gate = cap.SlotGate(w.runner.capacity)
+    name = next(iter(w.runner.cfg.backends.presets))
+    _call(w, "hist", name, 36 * 1024)
+    gate = w.runner.slot_gate
+    assert _take(w, name, "a")  # running
+    waits = [0]
+
+    def cancelled() -> bool:
+        waits[0] += 1
+        if waits[0] == 2:  # the owner enlarges the pool while "b" waits
+            props.n_ctx = 131072
+            now[0] += 61
+        return waits[0] > 50
+
+    assert gate.acquire(name, cancelled=cancelled, on_wait=lambda: None, poll=0.01, session_id="b")
+    assert gate.live(name) == 2  # admitted while "a" still runs
+    assert w.runner.capacity.get(name).n_ctx == 131072
