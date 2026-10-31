@@ -126,13 +126,15 @@ except ImportError:
 out["unreadable"] = unreadable
 # four parallel calls all get served, each timed from when it starts
 import threading
+ts: list[threading.Thread] = []
 event_list: list[dict[str, Any]] = []
 for _ in range(4):
-    evt: dict[str, Any] = {"start": int(time.time() * 1000)}
+    evt: dict[str, Any] = {}
     event_list.append(evt)
     def worker(e=evt):
-        e["end"] = int(time.time() * 1000)
+        e["start"] = int(time.time() * 1000)
         e["returncode"] = run_subject(["sleep", "1"], timeout=3)["returncode"]
+        e["end"] = int(time.time() * 1000)
     ts.append(threading.Thread(target=worker))
 [t.start() for t in ts]
 [t.join() for t in ts]

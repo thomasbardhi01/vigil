@@ -25,16 +25,17 @@ def intervals_overlap(intervals: list[tuple[int, int]]) -> bool:
     return False
 
 
-def timeout_from_start(start: int, elapsed: int, timeout: int) -> bool:
-    """Return **True** if a call that started *start* seconds ago has timed out.
+def timeout_from_start(current_time: int, start: int, timeout: int) -> bool:
+    """Return **True** if a call that started at *start* has timed out at *current_time*.
 
-    A call has timed out when *elapsed* strictly exceeds *timeout*.
+    A call has timed out when the time since it started strictly exceeds *timeout*.
 
     This is the fake-clock model used by the parallel-calls test: each
-    call records its real start time, and the elapsed time is computed
-    from the wall-clock difference at check-out.
+    call's timeout counts from when it starts running, not from when it
+    was queued.  The ``start`` parameter is the real start time; the
+    elapsed time is derived from it.
     """
-    return elapsed > timeout
+    return (current_time - start) > timeout
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +76,35 @@ class TestIntervalsOverlap:
 
 class TestTimeoutFromStart:
     def test_not_timed_out(self) -> None:
-        assert timeout_from_start(0, 1, 5) is False
+        assert timeout_from_start(current_time=5, start=4, timeout=5) is False
 
     def test_timed_out(self) -> None:
-        assert timeout_from_start(0, 6, 5) is True
+        assert timeout_from_start(current_time=11, start=5, timeout=5) is True
 
     def test_exactly_at_timeout(self) -> None:
-        assert timeout_from_start(0, 5, 5) is False
+        assert timeout_from_start(current_time=10, start=5, timeout=5) is False
+
+
+class TestTimeoutFromStartFakeClock:
+    """AC2: a call's timeout counts from when it starts running, not when it was queued."""
+
+    def test_queued_longer_than_timeout_still_succeeds(self) -> None:
+        """Call 2 is queued for 9 s (behind 3 calls of 3 s each) but its own
+        timeout of 3 s is measured from when it starts; it runs for 3 s, so it
+        has *not* timed out (3 > 3 is False)."""
+        call_start = 9  # call starts after 3 earlier calls * 3 s each
+        current = 12  # 3 s of execution have elapsed since the call started
+        timeout = 3
+        assert timeout_from_start(current_time=current, start=call_start, timeout=timeout) is False
+
+    def test_call_times_out_during_execution(self) -> None:
+        """Call starts at t=0, runs for 4 s with timeout=3 → timed out."""
+        assert timeout_from_start(current_time=4, start=0, timeout=3) is True
+
+    def test_call_with_zero_wait(self) -> None:
+        """Call runs immediately from t=0 for 2 s with timeout=5 → not timed out."""
+        assert timeout_from_start(current_time=2, start=0, timeout=5) is False
+
+    def test_call_with_zero_elapsed(self) -> None:
+        """Call has just started; elapsed is 0, so never timed out."""
+        assert timeout_from_start(current_time=5, start=5, timeout=3) is False
