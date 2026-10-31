@@ -7,7 +7,7 @@ import json
 import pytest
 
 from vigild.contract.models import Task
-from vigild.intake.spec_gate import bad_test_cmd, check_job_spec, check_task
+from vigild.intake.spec_gate import VIGIL_FORBIDDEN, bad_test_cmd, check_job_spec, check_task
 from vigild.jobs.artifacts import parse_plan, parse_spec
 
 MONEY = ["src/billing/**", "src/auth/**", "**/payments/**", "**/consent/**"]
@@ -564,7 +564,28 @@ def test_a_dir_glob_file_new_path_or_glob_passes_the_bare_dir_rule(entry: str) -
     assert not any(BARE_DIR in e for e in errors), errors
 
 
-# --- #143: a re-plan's kept tasks count as workers ------------------------------------------
+@pytest.mark.parametrize(
+    "text",
+    ["no .vigil/ files committed", "do not commit .vigil artifacts", "never touches .vigil."],
+)
+def test_vigil_forbidden_matches_the_path(text: str) -> None:
+    assert VIGIL_FORBIDDEN.search(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "updates .vigil.py",
+        "the .vigilrc file",
+        "no .vigilx files",
+        "no change to .vigil.py",
+        "never edit the .vigilrc file",
+        "does not change X; updates docs",
+        "writes the report under .vigil/ as usual",
+    ],
+)
+def test_vigil_forbidden_ignores_near_misses(text: str) -> None:
+    assert not VIGIL_FORBIDDEN.search(text)
 
 
 def test_kept_task_makes_replan_multi_worker() -> None:

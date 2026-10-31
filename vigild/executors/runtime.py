@@ -22,6 +22,7 @@ import tarfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +128,10 @@ def worker_kwargs(
     }
     if spec.max_budget_usd is not None:  # none for a local preset (the gateway is the cap)
         env["VIGIL_MAX_BUDGET_USD"] = str(spec.max_budget_usd)
+    preset = cfg.backends.presets.get(spec.preset)  # a test spec may name none
+    if spec.model and preset is not None and preset.locality == "local":
+        # the CLI's small/background model is the local one, so it tries no hosted call (#197)
+        env["VIGIL_SMALL_FAST_MODEL"] = spec.model
     if spec.traceparent:
         env["TRACEPARENT"] = spec.traceparent
     if spec.max_output_tokens:
@@ -647,6 +652,38 @@ def require_local_files(host: SandboxHost, mounts: list[dict[str, Any]]) -> None
         )
 
 
+@dataclass(frozen=True)
+class Unowned:
+    """A vigil-labelled container or network that no vigild claims: no instance label
+    and an id vigild never recorded (a pre-label leftover, #166). Kill and reap leave it."""
+
+    kind: str  # "container" or "network"
+    id: str
+    name: str
+    job: str  # its `dev.vigil.job` label, "" if none
+
+
+def is_unowned(labels: Mapping[str, str], cid: str, recorded: set[str]) -> bool:
+    """The one test for an unowned object: a session label, no instance label, id not
+    recorded."""
+    return LABEL in labels and INSTANCE_LABEL not in labels and cid not in recorded
+
+
+def find_unowned(client: Any, recorded: set[str]) -> list[Unowned]:
+    """Every vigil-labelled container (any state) and network that `is_unowned`. The
+    one selector for the startup page and `vigil doctor`."""
+    out: list[Unowned] = []
+    for c in client.containers.list(all=True, filters={"label": LABEL}):
+        labels = c.labels or {}
+        if is_unowned(labels, str(c.id), recorded):
+            out.append(Unowned("container", str(c.id), str(c.name), labels.get(JOB_LABEL, "")))
+    for net in client.networks.list(filters={"label": LABEL}):
+        labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
+        if is_unowned(labels, str(net.id), recorded):
+            out.append(Unowned("network", str(net.id), str(net.name), labels.get(JOB_LABEL, "")))
+    return sorted(out, key=lambda u: (u.name, u.kind))
+
+
 def _record(on_event: EventSink, kind: str, thing: Any) -> None:
     """Say which Docker object a session made, by its id (globally unique): the runner
     stores it, and a kill removes exactly those first (#162)."""
@@ -815,9 +852,11 @@ class DockerRuntime:
     def _unowned(labels: Mapping[str, str], cid: str, job_id: str, recorded: set[str]) -> bool:
         """A pre-label object that names the job but is not in the recorded set:
         reported as `unowned`, never removed."""
-        return (
-            INSTANCE_LABEL not in labels and labels.get(JOB_LABEL) == job_id and cid not in recorded
-        )
+        return labels.get(JOB_LABEL) == job_id and is_unowned(labels, cid, recorded)
+
+    def unowned(self) -> list[Unowned]:
+        """Vigil-labelled containers on this host that no vigild claims (#166)."""
+        return find_unowned(self.client, set(self.recorded("")))
 
     def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
         """Kill every running container of a job (kill, #52): its sessions' and
