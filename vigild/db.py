@@ -492,6 +492,11 @@ def _m18_call_key(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_call_key ON model_calls(call_key)")
 
 
+def _m19_calls_backend_index(conn: sqlite3.Connection) -> None:
+    """The tower's expected-peak history looks calls up by preset."""
+    conn.execute("CREATE INDEX IF NOT EXISTS calls_backend_preset ON model_calls(backend_preset)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -511,6 +516,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m16_batches,
     _m17_replay_kind,
     _m18_call_key,
+    _m19_calls_backend_index,
 ]
 
 
