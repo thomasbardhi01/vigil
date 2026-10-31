@@ -131,11 +131,17 @@ def test_a_cited_decision_may_be_a_row_file(tmp_path: Path) -> None:
     assert fm.check(root, code_dirs=[]) == []
 
 
-def test_docs_same_pr_accepts_a_decision_or_feature_row_as_the_architecture_update() -> None:
+def test_docs_same_pr_accepts_a_decision_row_as_the_architecture_update() -> None:
     changed = ["vigild/gateway/service.py"]
     assert ds.check(changed) != []
     assert ds.check([*changed, "docs/decisions/arch/x.md"]) == []
-    assert ds.check([*changed, "docs/features/x.md"]) == []
+
+
+def test_a_feature_row_alone_is_not_an_architecture_update() -> None:
+    """Owner review of #211: a feature-map row says what a feature does, not how a
+    flow works; only docs/architecture.md or a decision row counts."""
+    assert ds.check(["vigild/jobs/fsm.py", "docs/features/x.md"]) != []
+    assert ds.check(["vigild/jobs/fsm.py", "docs/features/x.md", "docs/architecture.md"]) == []
 
 
 def _git(cwd: Path, *args: str) -> str:

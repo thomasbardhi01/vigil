@@ -16,9 +16,10 @@ sys.path.insert(0, str(ROOT))
 from vigild.intake.paths import matches  # noqa: E402
 
 ARCH = "docs/architecture.md"
-# A per-row file counts as an architecture update (docs/decisions/arch/ rows
-# are the decision table; docs/features/ rows are the feature map).
-ARCH_ROW_DIRS = ("docs/decisions/arch/", "docs/features/")
+# A decision row file counts as an architecture update (docs/decisions/arch/
+# rows are the decision table). A docs/features/ row does not: it says what a
+# feature does, not how a flow works (owner review of #211).
+ARCH_ROW_DIRS = ("docs/decisions/arch/",)
 # The flows docs/architecture.md draws, and the files that implement them.
 FLOWS: dict[str, list[str]] = {
     "job state machine": ["vigild/jobs/fsm.py", "vigild/jobs/model.py"],
