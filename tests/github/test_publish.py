@@ -424,3 +424,26 @@ def test_the_public_commit_message_is_redacted_and_deterministic(
     shown = git(ws.vault(REPO), "log", "-1", "--format=%B", a)
     assert "[redacted]" in shown and "A1b2C3d4E5f6" not in shown and "MIIEvQ" not in shown
     assert shown.rstrip().endswith("end")
+
+
+def test_an_earlier_commit_message_with_a_secret_is_never_published(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """Review of #249: a branch whose head message is clean but an EARLIER commit's
+    message holds a key must not be passed through with its history; every message
+    sent to GitHub is redacted."""
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    who = ("-c", "user.name=w", "-c", "user.email=w@x")
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nfirst\n")
+    git(clone, "add", "-A")
+    git(clone, *who, "commit", "-q", "-m", f"wip {SECRETS['sk']}")
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nsecond\n")
+    git(clone, "add", "-A")
+    git(clone, *who, "commit", "-q", "-m", "clean message")
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    sent = ws.public_commit(REPO, head, base, BRANCH)
+    history = git(ws.vault(REPO), "log", "--format=%B", f"{base}..{sent}")
+    assert "A1b2C3d4E5f6" not in history

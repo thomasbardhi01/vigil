@@ -741,6 +741,15 @@ class Workspace:
             raise WorkspaceError("bad sha")
         self._git(self.vault(repo), "update-ref", self._pub_ref(branch), sha)
 
+    def _history_is_clean(self, vault: Path, base_sha: str, head: str) -> bool:
+        """Whether every commit message from the base to `head` is unchanged by `redact`:
+        a head passed through as-is publishes its whole history (review of #249)."""
+        try:
+            messages = git(vault, "log", "-z", "--format=%B", f"{base_sha}..{head}", raw=True)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        return all(redact(m) == m for m in messages.split("\0"))
+
     def public_commit(self, repo: str, head: str, base_sha: str, branch: str) -> str:
         """The commit to send for the vault's `head`: `head` itself when its
         top-level `.vigil` is the base's and nothing went to `branch` before;
@@ -759,8 +768,13 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
         message = redact(raw_message)  # the one redactor; deterministic, so a retry is the same
-        if prev is None and message == raw_message and not self.has_vigil(repo, head, base_sha):
-            return head
+        if (
+            prev is None
+            and message == raw_message
+            and self._history_is_clean(vault, base_sha, head)
+            and not self.has_vigil(repo, head, base_sha)
+        ):
+            return head  # passed through with its history, so every message in it must be clean
         entries = [
             e
             for e in self._git(vault, "ls-tree", "-z", head).split("\0")
