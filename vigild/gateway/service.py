@@ -163,10 +163,17 @@ def _strip_cache_control(x: Any) -> Any:
 
 def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
     """Hash and length (characters) of the request's input up to its first `n`
-    messages: tools, then system, then those messages, as compact sorted JSON without
+    messages: the model and `thinking` setting (a change of either misses the
+    provider's cache), tools, then system, then those messages, as compact sorted JSON without
     cache markers. This is the prefix the provider can cache, in its own order."""
     msgs = body.get("messages")
-    part = [body.get("tools"), body.get("system"), msgs[:n] if isinstance(msgs, list) else []]
+    part = [
+        body.get("model"),
+        body.get("thinking"),
+        body.get("tools"),
+        body.get("system"),
+        msgs[:n] if isinstance(msgs, list) else [],
+    ]
     text = json.dumps(
         _strip_cache_control(part), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
@@ -177,7 +184,7 @@ def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
 class PrefixRecord:
     """What a session's last finished call left in the provider's cache, as far as
     vigild knows: the hash of its whole input, how many messages that was, its
-    length, the tokens its usage reported cached (read or written), and when."""
+    length, the tokens its usage reported as cache reads (never writes, G1), and when."""
 
     digest: str
     messages: int
@@ -287,6 +294,7 @@ class Hold:
     released: bool = False
     probe: str | None = None  # the backend breaker's half-open probe this call claimed
     cached_tokens: int = 0  # the input tokens the hold priced at the cache-read rate (#79)
+    plain: float | None = None  # the same hold with no prefix at the read rate (metering failure)
     fingerprint: tuple[str, int, int] | None = None  # this input: digest, messages, chars
 
 
@@ -492,10 +500,14 @@ class Gateway:
     def _cached_prefix(self, session_id: str, body: dict[str, Any]) -> int:
         """Input tokens of this call that the session's previous call left in the
         cache: 0 unless that call finished within `PREFIX_TTL_S`, reported cached
-        tokens, and its whole input is, by hash, the start of this one's. At most
-        the tokens it reported, and at most its length estimated as for any input,
-        so the cache-read price is only ever given to tokens the provider said it
-        held. Nothing the request claims about caching is read."""
+        tokens (reads only), and its whole input is, by hash, the start of this
+        one's. At most the tokens it reported, and at most its length estimated as
+        for any input, so the cache-read price is only ever given to tokens the
+        provider said it read. Nothing the request claims about caching is read.
+        Called under `_inflight_lock`: with another call of the session in flight
+        (parallel, or a stream not yet booked) the answer is 0."""
+        if session_id in self._inflight:
+            return 0
         rec = self._prefix.get(session_id)
         if rec is None or self._now() - rec.at > PREFIX_TTL_S:
             return 0
@@ -513,7 +525,7 @@ class Gateway:
         the session's (settle books the metered sum, uncapped); it is recorded as
         `settle_excess` with reason `cache_miss`, trips no breaker, and the session's
         next call must first re-reserve the excess (`_hold_clamped`)."""
-        cached = usage.tokens_cache_read + usage.tokens_cache_write_5m + usage.tokens_cache_write_1h
+        cached = usage.tokens_cache_read  # writes never earn the read rate (G1)
         fp = hold.fingerprint
         if fp is not None and cached > 0:
             self._prefix[gs.session_id] = PrefixRecord(fp[0], fp[1], fp[2], cached, self._now())
@@ -561,8 +573,8 @@ class Gateway:
         body: dict[str, Any],
         raw: bytes,
         *,
-        cached_tokens: int = 0,
         task_id: str | None = None,
+        info: dict[str, Any] | None = None,
     ) -> tuple[float, dict[str, Any], bytes]:
         """Hold the call's worst case, clamping max_tokens (and a thinking
         budget) to the session cap and to what the reservation affords. Refuses
@@ -583,6 +595,7 @@ class Gateway:
             ):
                 raise GatewayError(401, "authentication_error", "invalid or revoked session token")
             self._rereserve_miss(session_id, task_id)  # a cache miss owes a reservation (#79)
+            cached_tokens = self._cached_prefix(session_id, body)
             held = self._inflight.get(session_id, 0.0)
             headroom = self.budget.session_headroom(session_id) - held
             need = self.worst_case(model, {"max_tokens": want}, len(raw), cached_tokens)
@@ -614,6 +627,9 @@ class Gateway:
                     f"{out} (session cap {cap})",
                 )
             amount = self.worst_case(model, {"max_tokens": out}, len(raw), cached_tokens)
+            if info is not None:
+                info["cached_tokens"] = cached_tokens
+                info["plain"] = self.worst_case(model, {"max_tokens": out}, len(raw))
             self._inflight[session_id] = held + amount
             self._seen[session_id] = self._now()
         changed = out != body.get("max_tokens")
@@ -737,9 +753,10 @@ class Gateway:
         call_id = f"{gs.session_id}:{secrets.token_hex(4)}"
         reason = redact(f"{type(err).__name__}: {err}")
         replay = self.store.is_replay(gs.session_id)  # a replay files no inbox item (#47)
+        booked = hold.plain if hold.plain is not None else hold.amount  # never the cheaper hold
         steps: list[Callable[[], Any]] = [
             lambda: self.revoke(gs.session_id),  # no further call is forwarded
-            lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, hold.amount),
+            lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, booked),
             lambda: self.store.update_session(gs.session_id, status="failed"),
             lambda: self.store.add_event(
                 "metering_failed",
@@ -765,7 +782,7 @@ class Gateway:
                         "tokens_cache_read": usage.tokens_cache_read,
                         "tokens_cache_write_5m": usage.tokens_cache_write_5m,
                         "tokens_cache_write_1h": usage.tokens_cache_write_1h,
-                        "booked_usd": hold.amount,
+                        "booked_usd": booked,
                         "note": "the call's worst-case reservation was booked as spent; "
                         "reconcile with the provider's usage",
                         "resumable": False,
@@ -874,15 +891,15 @@ class Gateway:
             self._check_body(body, headers or {})
             self._check_locality(gs, preset, body.get("model"))
             model = self._check_model(gs.repo, preset, body.get("model"), gs.model or None)
-            amount, cached, fp = 0.0, 0, None
+            amount, fp = 0.0, None
+            info: dict[str, Any] = {}
             if path in METERED_PATHS:
                 msgs = body.get("messages")
                 if isinstance(msgs, list):
                     digest, chars = prefix_digest(body, len(msgs))
                     fp = (digest, len(msgs), chars)
-                    cached = self._cached_prefix(gs.session_id, body)
                 amount, body, raw = self._hold_clamped(
-                    gs.session_id, model, body, raw, cached_tokens=cached, task_id=gs.task_id
+                    gs.session_id, model, body, raw, task_id=gs.task_id, info=info
                 )
             try:
                 probe = self._backend_gate(
@@ -895,8 +912,8 @@ class Gateway:
         except GatewayError as e:
             raise self._refuse(gs, e) from None
         return Hold(
-            gs.session_id, amount, preset, body, raw, probe=probe, cached_tokens=cached,
-            fingerprint=fp,
+            gs.session_id, amount, preset, body, raw, probe=probe,
+            cached_tokens=info.get("cached_tokens", 0), plain=info.get("plain"), fingerprint=fp,
         )  # fmt: skip
 
     # --- forwarding ------------------------------------------------------------------
