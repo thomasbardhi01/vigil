@@ -77,6 +77,20 @@ def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route
     return Route(tier=tier, tier_reason=reason, preset=preset)
 
 
+def min_cap_problem(cfg: Config, task_id: str, preset: str, cap: float) -> str | None:
+    """The one check of a preset's minimum task cap (#79), for the spec gate and for
+    dispatch: why a task on `preset` capped at `cap` can't run, or None."""
+    found = cfg.backends.presets.get(preset)  # a deps task is routed to no preset
+    floor = found.min_task_usd if found else None
+    if floor is None or cap >= floor:
+        return None
+    return (
+        f"{task_id} is capped at ${cap:.2f}, under the minimum ${floor:.2f} for its preset "
+        f"{preset} (the gateway reserves a worst case per call); "
+        f"raise max_cost_usd to ${floor:.2f} or more"
+    )
+
+
 def _resolve(cfg: Config, repo: str, preset: str, reason: str) -> tuple[str, str]:
     """The preset a repo may use: a preset that isn't live, or isn't one this repo
     lists, falls back (the reason says so); then the private-repo rule."""

@@ -53,6 +53,9 @@ def degraded(secrets: Secrets) -> set[str]:
 
 
 class NullRunner:
+    def plan_min_cap(self, repo: str, base: str, job_id: str | None, w: Any) -> str | None:
+        return None
+
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         log.info("job %s created (needs_spec=%s); no runner attached", job_id, needs_spec)
 
