@@ -902,3 +902,150 @@ def test_a_fully_read_stream_releases_exactly_once(
     assert len([c for c in calls if c > 0]) == 1  # the premium goes back once
     assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == rows_before + 1  # booked once
     assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+# --- round 2 of the review: probes, cancelled reads, a send that fails -----------------------
+
+
+def _half_open_ready(gw: Gateway, store: Store, cfg: Config) -> Any:
+    """A backend breaker for the session's preset, open and past its cool-down, so the next
+    call's gate claims the half-open probe."""
+    from datetime import timedelta
+
+    from vigild.breakers import Breakers, Kind
+    from vigild.db import utcnow
+
+    now = [utcnow()]
+    gw.breakers = Breakers(store, cfg, clock=lambda: now[0])
+    gw.breakers.trip(Kind.BACKEND, "backend:claude-sonnet", {})
+    now[0] += timedelta(seconds=cfg.vigild.breakers.backend_cooldown_seconds + 1)
+    return gw.breakers
+
+
+def _probe_state(gw: Gateway) -> str:
+    from vigild.breakers import Kind
+
+    b = gw.breakers._row(Kind.BACKEND, "backend:claude-sonnet")
+    assert b is not None
+    return str(b.state)
+
+
+def test_a_preflight_cancelled_on_a_half_open_backend_releases_the_probe(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float], cfg: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    _half_open_ready(gw, store, cfg)
+    gate, claimed = threading.Event(), threading.Event()
+    real = gw._backend_gate
+
+    def slow_gate(preset_name: str, session_id: str | None = None) -> str | None:
+        scope = real(preset_name, session_id)  # claims the probe
+        claimed.set()
+        gate.wait(5)
+        return scope
+
+    monkeypatch.setattr(gw, "_backend_gate", slow_gate)
+
+    async def run() -> None:
+        raw = json.dumps(_second()).encode()
+        task = asyncio.create_task(gw.forward(gw.authorize(tok), "/v1/messages", {}, raw))
+        while not claimed.is_set():
+            await asyncio.sleep(0.01)
+        assert _probe_state(gw) == "half_open"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.set()
+        for _ in range(100):
+            if _probe_state(gw) == "open":
+                break
+            await asyncio.sleep(0.02)
+
+    asyncio.run(run())
+    assert _probe_state(gw) == "open" and sid not in gw._inflight
+
+
+class _Blocking(httpx2.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self) -> Any:
+        self.started.set()
+        await asyncio.Event().wait()
+        yield b""
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("path", "status"), [("/v1/messages", 500), ("/v1/messages/count_tokens", 200)]
+)
+def test_a_cancelled_body_read_releases_the_hold_the_premium_the_probe_and_closes(
+    path: str, status: int, client: TestClient, gw: Gateway, store: Store, budget: Budget,
+    upstream: Upstream, clock: list[float], cfg: Config,
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    _half_open_ready(gw, store, cfg)
+    body_stream = _Blocking()
+    gw.async_client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(lambda req: httpx2.Response(status, stream=body_stream))
+    )
+
+    async def run() -> None:
+        raw = json.dumps(_second()).encode()
+        task = asyncio.create_task(gw.forward(gw.authorize(tok), path, {}, raw))
+        await asyncio.wait_for(body_stream.started.wait(), 5)  # the body read is blocked
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert sid not in gw._inflight and budget.premium_total() == 0
+    assert _probe_state(gw) != "half_open" and body_stream.closed  # claimed, never left held
+
+
+def test_a_send_that_fails_before_the_response_starts_still_releases_exactly_once(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float], monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    from vigild.gateway.app import create_gateway_app
+
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.stream = True
+    released: list[float] = []
+    real = budget.release_premium
+    monkeypatch.setattr(budget, "release_premium", lambda s, a: (released.append(a), real(s, a))[1])
+
+    async def run() -> None:
+        payload = json.dumps({**_second(), "stream": True}).encode()
+        sent = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await asyncio.Event().wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg: dict[str, Any]) -> None:
+            raise OSError("client gone")
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1", "method": "POST", "path": "/v1/messages",
+            "raw_path": b"/v1/messages", "query_string": b"", "root_path": "",
+            "scheme": "http", "server": ("test", 80), "client": ("c", 1),
+            "headers": [(b"x-api-key", tok.encode()), (b"content-type", b"application/json")],
+        }  # fmt: skip
+        try:
+            await asyncio.wait_for(create_gateway_app(gw)(scope, receive, send), 5)
+        except BaseException as e:  # the failed send surfaces however the framework reports it
+            assert not isinstance(e, asyncio.TimeoutError)
+
+    asyncio.run(run())
+    assert sid not in gw._inflight and budget.premium_total() == 0
+    assert len([a for a in released if a > 0]) == 1

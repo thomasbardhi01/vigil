@@ -6,6 +6,7 @@ ANTHROPIC_BASE_URL pointing here and the session token as the auth token."""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -20,6 +21,22 @@ def _token(request: Request) -> str | None:
         return key
     auth = request.headers.get("authorization", "")
     return auth[7:].strip() if auth.lower().startswith("bearer ") else None
+
+
+class _HeldResponse(StreamingResponse):
+    """A streamed answer whose call is booked and hold released (`finish`, idempotent)
+    however the ASGI exchange ends: sent, cut off, or a `send` that fails before the
+    response starts (where a server may skip the background task)."""
+
+    def __init__(self, stream: AsyncIterator[bytes], finish: Any, **kw: Any) -> None:
+        super().__init__(stream, **kw)
+        self._finish = finish
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._finish()
 
 
 def create_gateway_app(gw: Gateway) -> FastAPI:
@@ -40,11 +57,14 @@ def create_gateway_app(gw: Gateway) -> FastAPI:
         # `finally` never runs: the response's background task books the call and releases
         # the hold (idempotent with the generator's own).
         finish = getattr(body, "finish", None)
-        return StreamingResponse(
+        if finish is None:
+            return StreamingResponse(stream, status_code=status, headers=out_headers)
+        return _HeldResponse(
             stream,
+            finish,
             status_code=status,
             headers=out_headers,
-            background=BackgroundTask(finish) if finish is not None else None,
+            background=BackgroundTask(finish),
         )
 
     @app.get("/health")

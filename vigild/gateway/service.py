@@ -693,6 +693,7 @@ class Gateway:
         else:
             self._fallback(gs, gs.preset, "no_count_endpoint")
             return None
+        fut: concurrent.futures.Future[httpx2.Response] | None = None
         try:
             url = self._upstream_url(preset, path)
             hdrs = self._headers(headers, self._key(preset), preset)
@@ -707,6 +708,8 @@ class Gateway:
             self._fallback(gs, gs.preset, "no_key")
             return None
         except TimeoutError, httpx2.TimeoutException:
+            if fut is not None:
+                fut.cancel()  # not yet started: never starts
             self._fallback(gs, gs.preset, "timeout")
             return None
         except httpx2.HTTPError as e:
@@ -977,7 +980,18 @@ class Gateway:
         """A preflight finished after its request was cancelled: nobody will use its hold."""
         if fut.cancelled() or fut.exception() is not None:
             return  # a refusal placed nothing (and its exception is now retrieved)
-        self.release(fut.result())
+        hold = fut.result()
+        self._release_probe(hold.probe)  # a half-open probe it claimed goes back too
+        self.release(hold)
+
+    async def _abandon(self, hold: Hold, resp: httpx2.Response) -> None:
+        """The request was cancelled while its response body was being read: close the
+        response and give back the hold, its premium and any half-open probe."""
+        try:
+            await resp.aclose()
+        finally:
+            self._release_probe(hold.probe)
+            self.release(hold)
 
     def release(self, hold: Hold) -> None:
         if hold.released:
@@ -1312,6 +1326,9 @@ class Gateway:
                 own = bool(self._http_failure(resp.status_code, await resp.aread())["context"])
             except Exception:
                 own = False
+            except BaseException:  # cancelled mid-read
+                await self._abandon(hold, resp)
+                raise
             if (
                 own
                 and self.cfg.preset(gs.preset).locality == "local"
@@ -1332,7 +1349,11 @@ class Gateway:
             )
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:
-            data = await resp.aread()
+            try:
+                data = await resp.aread()
+            except BaseException:  # cancelled (or failed) mid-read
+                await self._abandon(hold, resp)
+                raise
             await resp.aclose()
             self.release(hold)
             return resp.status_code, out_headers, data
