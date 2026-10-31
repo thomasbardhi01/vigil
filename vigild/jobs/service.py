@@ -1046,13 +1046,30 @@ class JobService:
             raise Conflict(f"inbox item {item_id} is not an open question or page")
         return item
 
-    def resume(self, item_id: int, actor: Actor = Actor.OWNER) -> Job:
+    def resume(
+        self,
+        item_id: int,
+        actor: Actor = Actor.OWNER,
+        note: object = None,
+        ruling_heading: str | None = None,
+    ) -> Job:
         """The owner resumes the job a page is about: a held job returns to the
-        state it left, and the runner picks up its remaining work."""
+        state it left, and the runner picks up its remaining work. On a question page
+        a `note` is the answer: recorded (redacted) as `owner_answer`, or `coord_answer`
+        for the coord, on each task that asked, and fenced into its re-run's packet."""
+        if note is not None:
+            self._check_note(note)
         with self.store.tx():
             item = self._question(item_id)
             if not item.body.get("resumable") or item.job_id is None:
                 raise Conflict(f"inbox item {item_id} has nothing to resume")
+            asked = {
+                tid: t
+                for tid, t in (item.body.get("tasks") or {}).items()
+                if isinstance(t, dict) and t.get("asked")
+            }
+            if note is not None and not asked:
+                raise Conflict(f"inbox item {item_id} is not a question; it takes no note")
             job = self.store.get_job(item.job_id)
             if job.state in (JobState.BLOCKED, JobState.ESCALATED):
                 assert job.blocked_from is not None
@@ -1068,6 +1085,23 @@ class JobService:
             self.store.add_event(
                 "resume", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
+            if note is not None:
+                coord = actor is Actor.COORD
+                for tid, t in asked.items():
+                    self.store.add_event(
+                        "coord_answer" if coord else "owner_answer",
+                        redact(
+                            {
+                                "answer": note,
+                                "question": t.get("question"),
+                                "inbox_item_id": item_id,
+                                **({"ruling": ruling_heading} if coord else {}),
+                            }
+                        ),
+                        Provenance.CLAUDE if coord else Provenance.HUMAN,
+                        job_id=job.id,
+                        task_id=tid,
+                    )
             self.store.resolve_inbox_item(item_id, actor.value)
             # round 3, F7: one resume per hold; the job's other resumable pages close
             for other in self.store.list_inbox():

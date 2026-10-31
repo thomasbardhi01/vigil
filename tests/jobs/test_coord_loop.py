@@ -1207,7 +1207,7 @@ def test_every_worker_failure_blocks_with_actions(world: World, cause: str) -> N
         w.standin.run = run  # type: ignore[method-assign]
     job = _approve(w)
     assert w.store.get_job(job).state.value == "blocked"
-    item = _failure_item(w, job)
+    item = _failure_item(w, job, "ask_coord" if cause == "ask_coord" else "worker_failed")
     assert "replan" in item["body"]["actions"] and "abandon" in item["body"]["actions"]
     assert f"{job}-w1" in item["body"]["tasks"]
     assert w.budget.open_today() == 0

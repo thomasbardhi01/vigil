@@ -342,8 +342,11 @@ stateDiagram-v2
   packet, never an acceptance error, until `ENFORCE` in `vigild/jobs/integrity.py` is flipped
   to True by a one-line PR carrying the false-positive count; enforcing, findings page the job
   like a weakened test, but `self-referential-evidence` alone never does), and publishes (decision `publishing`). A worker that writes `ask_coord.json`
-  instead files a question for its coord and your inbox, and its task
-  waits. A worker session with no `model_calls` row did no metered work: its task fails
+  instead files a question for its coord and your inbox (the whole question, up to the 16 KB
+  blob read), and its task waits. A wave of only questions blocks the job with a page titled `<task> is waiting on you`
+  (kind `ask_coord`) that neither counts toward nor resets `repo_failures`; resume it with a `note` and the
+  note is the answer (an `owner_answer` event, or `coord_answer` with the coord token, labelled with its ruling), fenced into the re-run
+  worker's packet next to the question. A worker session with no `model_calls` row did no metered work: its task fails
   before the import and pages (retry, re-plan, abandon), and nothing is published (#102). Work that can't start (a dependency failed or waits, or the repo
   is at its WIP limit) pages you and blocks the job.
 - **Inside review** (decision `review-ladder`). Each published PR is reviewed, and audited where
