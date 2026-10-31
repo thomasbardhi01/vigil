@@ -586,3 +586,31 @@ def test_vigil_forbidden_matches_the_path(text: str) -> None:
 )
 def test_vigil_forbidden_ignores_near_misses(text: str) -> None:
     assert not VIGIL_FORBIDDEN.search(text)
+
+
+# --- #158: a full-suite AC can't finish inside the verifier's cap ---------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd", ["pytest", "pytest -q", "uv run pytest -q -x", "python -m pytest", "vitest run"]
+)
+def test_full_suite_ac_is_refused(cmd: str) -> None:
+    bad = SPEC.replace("pytest -q tests/test_feature_map.py", cmd)
+    errors = check_job_spec(parse_spec(bad), parse_plan(PLAN), MONEY)
+    assert any("AC1" in e and "full suite" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pytest -q tests/test_feature_map.py",
+        "pytest -q tests/test_a.py::test_b",
+        "pytest -q -k feature",
+        "pytest -q -m unit",
+        "uv run pytest -q tests/test_feature_map.py",
+    ],
+)
+def test_targeted_ac_is_accepted(cmd: str) -> None:
+    ok = SPEC.replace("pytest -q tests/test_feature_map.py", cmd)
+    errors = check_job_spec(parse_spec(ok), parse_plan(PLAN), MONEY)
+    assert not any("full suite" in e for e in errors), errors

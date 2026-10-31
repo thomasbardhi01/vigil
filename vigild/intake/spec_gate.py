@@ -99,6 +99,29 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
     return None
 
 
+FULL_SUITE = (
+    "is a bare full suite run (no path, node id, -k or -m), too slow for the verifier's cap; "
+    "use a targeted command, e.g. `pytest -q tests/test_x.py`"
+)
+SELECTORS = {"-k", "-m"}
+
+
+def full_suite(cmd: str | None) -> bool:
+    """A command that runs pytest or vitest with nothing to select tests (#158)."""
+    for c in parse(cmd or "").commands:
+        words = [w.rsplit("/", 1)[-1] for w in c.words]
+        for i, w in enumerate(words):
+            if w not in ("pytest", "py.test", "vitest"):
+                continue
+            rest = [a for a in c.words[i + 1 :] if a != "run"]
+            if not any(not a.startswith("-") or a in SELECTORS for a in rest) and not any(
+                a.startswith(("-k", "-m")) and not a.startswith("--") for a in rest
+            ):
+                return True
+            break
+    return False
+
+
 MFF_REASON_RULE = (
     "must_fail_first is false, so must_fail_first_reason is required: "
     'say why, for example "tests only, code unchanged"'
@@ -227,6 +250,8 @@ def check_job_spec(
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
         elif why := test_cmd_problem(c.test_cmd, read):
             errors.append(f"spec.md {c.ident}: {why}")
+        elif full_suite(c.test_cmd):
+            errors.append(f"spec.md {c.ident}: test_cmd `{c.test_cmd}` {FULL_SUITE}")
 
     errors.extend(plan.errors)
     if not plan.workers and not plan.errors:
