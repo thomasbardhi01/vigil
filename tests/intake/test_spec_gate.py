@@ -592,7 +592,14 @@ def test_vigil_forbidden_ignores_near_misses(text: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "cmd", ["pytest", "pytest -q", "uv run pytest -q -x", "python -m pytest", "vitest run"]
+    "cmd",
+    [
+        "uv run pytest -q",
+        "uv run --offline pytest -q -p no:cacheprovider -n auto",
+        "pnpm exec vitest run",
+        "pytest",
+        "python -m pytest",
+    ],
 )
 def test_full_suite_ac_is_refused(cmd: str) -> None:
     bad = SPEC.replace("pytest -q tests/test_feature_map.py", cmd)
@@ -603,11 +610,11 @@ def test_full_suite_ac_is_refused(cmd: str) -> None:
 @pytest.mark.parametrize(
     "cmd",
     [
+        "uv run pytest -q tests/jobs/test_acceptance.py",
+        "uv run pytest -q tests/x.py::test_y",
+        "uv run pytest -q -k timed_out",
+        "uv run pytest -q -m docker",
         "pytest -q tests/test_feature_map.py",
-        "pytest -q tests/test_a.py::test_b",
-        "pytest -q -k feature",
-        "pytest -q -m unit",
-        "uv run pytest -q tests/test_feature_map.py",
     ],
 )
 def test_targeted_ac_is_accepted(cmd: str) -> None:

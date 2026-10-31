@@ -103,7 +103,14 @@ FULL_SUITE = (
     "is a bare full suite run (no path, node id, -k or -m), too slow for the verifier's cap; "
     "use a targeted command, e.g. `pytest -q tests/test_x.py`"
 )
-SELECTORS = {"-k", "-m"}
+SELECT_SUFFIXES = (".py", ".ts", ".js", ".tsx")
+
+
+def selects(arg: str) -> bool:
+    """An argument that picks tests: a path, node id, test file, or -k / -m."""
+    if "/" in arg or "::" in arg or arg.endswith(SELECT_SUFFIXES):
+        return True
+    return arg.startswith(("-k", "-m")) and not arg.startswith("--")
 
 
 def full_suite(cmd: str | None) -> bool:
@@ -114,9 +121,7 @@ def full_suite(cmd: str | None) -> bool:
             if w not in ("pytest", "py.test", "vitest"):
                 continue
             rest = [a for a in c.words[i + 1 :] if a != "run"]
-            if not any(not a.startswith("-") or a in SELECTORS for a in rest) and not any(
-                a.startswith(("-k", "-m")) and not a.startswith("--") for a in rest
-            ):
+            if not any(selects(a) for a in rest):
                 return True
             break
     return False
