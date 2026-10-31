@@ -26,6 +26,9 @@ PA = "thomasbardhi01/parkagent"
 class Upstream:
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
+        # the gateway's own counting calls (a first call's hold, owner ruling R23): apart,
+        # so `requests` stays the calls that were forwarded
+        self.counts: list[httpx2.Request] = []
         self.stream = False
         self.status = 200
         self.error_body: dict[str, Any] | None = None
@@ -33,6 +36,12 @@ class Upstream:
         self.stop_reason = "end_turn"
 
     def __call__(self, req: httpx2.Request) -> httpx2.Response:
+        if req.url.path.endswith(("/count_tokens", "/tokenize")):
+            self.counts.append(req)
+            n = -(-len(req.content) // 3)  # a counter that agrees with chars / 3
+            if req.url.path.endswith("/tokenize"):
+                return httpx2.Response(200, json={"tokens": list(range(n))})
+            return httpx2.Response(200, json={"input_tokens": n})
         self.requests.append(req)
         if self.raises is not None:
             raise self.raises
@@ -41,8 +50,6 @@ class Upstream:
                 self.status,
                 json=self.error_body or {"type": "error", "error": {"type": "overloaded_error"}},
             )
-        if req.url.path.endswith("/count_tokens"):
-            return httpx2.Response(200, json={"input_tokens": 12})
         body = json.loads(req.content)
         if body.get("stream"):
             events = [
@@ -235,7 +242,7 @@ def test_count_tokens_is_forwarded_and_free(
 ) -> None:
     _, tok = _session(store, budget, gw)
     r = client.post("/v1/messages/count_tokens", json=_msg(), headers={"x-api-key": tok})
-    assert r.status_code == 200 and r.json() == {"input_tokens": 12}
+    assert r.status_code == 200 and r.json()["input_tokens"] > 0
     assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
 
 
