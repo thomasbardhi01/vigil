@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tests.security.test_subject_broker_start_rule import intervals_overlap
 from vigild.config import Config
 from vigild.executors.runtime import DockerTestRunner
 from vigild.verifier import helper_file
@@ -125,13 +126,24 @@ except ImportError:
 out["unreadable"] = unreadable
 # four parallel calls all get served, each timed from when it starts
 import threading
-codes = []
-t0 = time.time()
-ts = [threading.Thread(target=lambda: codes.append(run_subject(["sleep", "1"], timeout=3)["returncode"])) for _ in range(4)]
+ts = []
+event_list = []
+# the subject stamps its own start and end, so the interval is when it ran, not when it queued
+STAMP = "import time;s=time.time_ns();time.sleep(1);print(s,time.time_ns())"
+def worker(e):
+    r = run_subject(["python3", "-c", STAMP], timeout=3)
+    e["code"] = r["returncode"]
+    try:
+        e["start"], e["end"] = (int(x) for x in r["stdout"].split()[:2])
+    except ValueError:
+        e["start"] = e["end"] = None
+for _ in range(4):
+    evt = {}
+    event_list.append(evt)
+    ts.append(threading.Thread(target=worker, args=(evt,)))
 [t.start() for t in ts]
 [t.join() for t in ts]
-out["parallel"] = codes
-out["parallel_secs"] = round(time.time() - t0, 1)
+out["parallel_events"] = event_list
 
 # the broker refuses what is not a well-formed run spec
 refused = {}
@@ -251,8 +263,10 @@ def test_the_test_process_cannot_read_the_subject_by_any_route(probe: dict[str, 
 
 
 def test_parallel_calls_are_all_served_and_timed_from_their_start(probe: dict[str, Any]) -> None:
-    assert probe["parallel"] == [0, 0, 0, 0]
-    assert probe["parallel_secs"] >= 3.5  # served one at a time, none timed out waiting
+    assert [e["code"] for e in probe["parallel_events"]] == [0, 0, 0, 0]
+    # served one at a time: the subject's own start/end stamps never overlap
+    assert all(e["start"] is not None for e in probe["parallel_events"])
+    assert not intervals_overlap([(e["start"], e["end"]) for e in probe["parallel_events"]])
 
 
 # --- the real JS path, in ParkAgent's dev image ------------------------------------------------
