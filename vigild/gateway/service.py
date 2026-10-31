@@ -127,11 +127,70 @@ THINKING_ANSWER_ROOM = 4096
 MIN_THINKING_BUDGET = 1024
 
 
-def worst_case_usd(prices: PriceTable, model: str, raw_len: int, max_out: int) -> float:
+def worst_case_usd(
+    prices: PriceTable, model: str, raw_len: int, max_out: int, cached_tokens: int = 0
+) -> float:
     """The most a call could cost: every input token written to the 1-hour
-    cache (the dearest input rate), plus max_out tokens of output."""
+    cache (the dearest input rate), plus max_out tokens of output. The first
+    `cached_tokens` of the input (a prefix the session's previous call wrote,
+    `Gateway._cached_prefix`) are priced at the cache-read rate instead (#79)."""
     est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
-    return prices.cost(model, CallUsage(tokens_cache_write_1h=est_in, tokens_out=max_out))
+    read = max(0, min(cached_tokens, est_in))
+    return prices.cost(
+        model,
+        CallUsage(tokens_cache_read=read, tokens_cache_write_1h=est_in - read, tokens_out=max_out),
+    )
+
+
+# #79 (a): a session's next call usually resends the previous call's input, which the
+# provider bills at the cache-read rate. The gateway prices it so in the worst case only
+# when all of this holds: the session's previous call reported cached tokens (usage,
+# never a request field); its input (tools, system, messages) is a hash-equal prefix of
+# this one's; it finished within the TTL below.
+PREFIX_TTL_S = 50 * 60
+EPS = 1e-9
+
+
+def _strip_cache_control(x: Any) -> Any:
+    """`cache_control` markers move from call to call (the CLI marks the newest
+    message); the provider's cache key ignores them, so the hash does too."""
+    if isinstance(x, dict):
+        return {k: _strip_cache_control(v) for k, v in x.items() if k != "cache_control"}
+    if isinstance(x, list):
+        return [_strip_cache_control(v) for v in x]
+    return x
+
+
+def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
+    """Hash and length (characters) of the request's input up to its first `n`
+    messages: the model and `thinking` setting (a change of either misses the
+    provider's cache), tools, then system, then those messages, as compact sorted JSON without
+    cache markers. This is the prefix the provider can cache, in its own order."""
+    msgs = body.get("messages")
+    part = [
+        body.get("model"),
+        body.get("thinking"),
+        body.get("tools"),
+        body.get("system"),
+        msgs[:n] if isinstance(msgs, list) else [],
+    ]
+    text = json.dumps(
+        _strip_cache_control(part), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(text.encode()).hexdigest(), len(text)
+
+
+@dataclass(frozen=True)
+class PrefixRecord:
+    """What a session's last finished call left in the provider's cache, as far as
+    vigild knows: the hash of its whole input, how many messages that was, its
+    length, the tokens its usage reported as cache reads (never writes, G1), and when."""
+
+    digest: str
+    messages: int
+    chars: int
+    cached_tokens: int
+    at: float
 
 
 UPSTREAM_READ_S = 600.0  # the longest an upstream call waits for its next bytes
@@ -234,6 +293,9 @@ class Hold:
     raw: bytes = b""  # what is forwarded: the request, with max_tokens clamped
     released: bool = False
     probe: str | None = None  # the backend breaker's half-open probe this call claimed
+    cached_tokens: int = 0  # the input tokens the hold priced at the cache-read rate (#79)
+    plain: float | None = None  # the same hold with no prefix at the read rate (metering failure)
+    fingerprint: tuple[str, int, int] | None = None  # this input: digest, messages, chars
 
 
 def _hash(token: str) -> str:
@@ -268,6 +330,8 @@ class Gateway:
         self._seen: dict[str, float] = {}  # session -> when one of its calls last moved
         self._own: dict[int, float] = {}  # vigild's own call's reservation -> when it began
         self._now: Callable[[], float] = time.monotonic
+        self._prefix: dict[str, PrefixRecord] = {}  # session -> its last call's cached input
+        self._rereserve: dict[str, float] = {}  # session -> excess a cache miss still owes
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
@@ -356,6 +420,8 @@ class Gateway:
         return int(rows[0]["n"])
 
     def revoke(self, session_id: str) -> None:
+        self._prefix.pop(session_id, None)
+        self._rereserve.pop(session_id, None)
         self.store.x(
             "UPDATE gateway_tokens SET revoked_at=? WHERE session_id=? AND revoked_at IS NULL",
             (iso(), session_id),
@@ -422,14 +488,93 @@ class Gateway:
             raise GatewayError(403, "permission_error", f"model {model} has no price; refused")
         return model
 
-    def worst_case(self, model: str, body: dict[str, Any], raw_len: int) -> float:
+    def worst_case(
+        self, model: str, body: dict[str, Any], raw_len: int, cached_tokens: int = 0
+    ) -> float:
         """The most a call could cost: every input token written to the 1-hour
-        cache (the dearest input rate), plus max_tokens of output."""
+        cache (the dearest input rate), plus max_tokens of output; the first
+        `cached_tokens` at the cache-read rate."""
         max_out = int(body.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        return worst_case_usd(self.prices, model, raw_len, max_out)
+        return worst_case_usd(self.prices, model, raw_len, max_out, cached_tokens)
+
+    def _cached_prefix(self, session_id: str, body: dict[str, Any]) -> int:
+        """Input tokens of this call that the session's previous call left in the
+        cache: 0 unless that call finished within `PREFIX_TTL_S`, reported cached
+        tokens (reads only), and its whole input is, by hash, the start of this
+        one's. At most the tokens it reported, and at most its length estimated as
+        for any input, so the cache-read price is only ever given to tokens the
+        provider said it read. Nothing the request claims about caching is read.
+        Called under `_inflight_lock`: with another call of the session in flight
+        (parallel, or a stream not yet booked) the answer is 0."""
+        if session_id in self._inflight:
+            return 0
+        rec = self._prefix.get(session_id)
+        if rec is None or self._now() - rec.at > PREFIX_TTL_S:
+            return 0
+        msgs = body.get("messages")
+        if not isinstance(msgs, list) or len(msgs) < rec.messages:
+            return 0
+        if prefix_digest(body, rec.messages)[0] != rec.digest:
+            return 0
+        return min(rec.cached_tokens, math.ceil(rec.chars / CHARS_PER_TOKEN))
+
+    def _learn(self, hold: Hold, gs: GatewaySession, usage: CallUsage, cost: float) -> None:
+        """After a session call is booked: remember what it left cached, and if the
+        hold priced a prefix at the read rate that the provider did not read and the
+        call cost more than the hold, it is a cache miss. Its real cost is already
+        the session's (settle books the metered sum, uncapped); it is recorded as
+        `settle_excess` with reason `cache_miss`, trips no breaker, and the session's
+        next call must first re-reserve the excess (`_hold_clamped`)."""
+        cached = usage.tokens_cache_read  # writes never earn the read rate (G1)
+        fp = hold.fingerprint
+        if fp is not None and cached > 0:
+            self._prefix[gs.session_id] = PrefixRecord(fp[0], fp[1], fp[2], cached, self._now())
+        else:
+            self._prefix.pop(gs.session_id, None)
+        if hold.cached_tokens and usage.tokens_cache_read < hold.cached_tokens:
+            excess = cost - hold.amount
+            if excess > EPS:
+                with self._inflight_lock:
+                    self._rereserve[gs.session_id] = (
+                        self._rereserve.get(gs.session_id, 0.0) + excess
+                    )
+                self.store.add_event(
+                    "settle_excess",
+                    {"reason": "cache_miss", "session_id": gs.session_id,
+                     "reserved_usd": round(hold.amount, 6), "reported_usd": round(cost, 6),
+                     "excess_usd": round(excess, 6), "priced_as_read_tokens": hold.cached_tokens,
+                     "read_tokens": usage.tokens_cache_read},
+                    Provenance.HUMAN,
+                    job_id=gs.job_id,
+                    session_id=gs.session_id,
+                    task_id=gs.task_id,
+                )  # fmt: skip
+
+    def _rereserve_miss(self, session_id: str, task_id: str | None) -> None:
+        """A cache miss spent more than its hold covered: before the session's next
+        call, reserve that excess under the same caps as any reservation (the task's
+        $2, the day, the month). Refused with the normal budget message if it does
+        not fit, and the session stays refused. Called under `_inflight_lock`."""
+        owed = self._rereserve.get(session_id, 0.0)
+        if owed <= EPS:
+            return
+        try:
+            self.budget.reserve(
+                session_id=session_id, task_id=task_id, amount=owed, purpose="cache_miss_rereserve"
+            )
+        except BudgetExceeded as e:
+            raise GatewayError(403, "permission_error", f"budget: {e}") from e
+        self._rereserve.pop(session_id, None)
 
     def _hold_clamped(
-        self, session_id: str, model: str, body: dict[str, Any], raw: bytes
+        self,
+        session_id: str,
+        model: str,
+        body: dict[str, Any],
+        raw: bytes,
+        *,
+        task_id: str | None = None,
+        info: dict[str, Any] | None = None,
     ) -> tuple[float, dict[str, Any], bytes]:
         """Hold the call's worst case, clamping max_tokens (and a thinking
         budget) to the session cap and to what the reservation affords. Refuses
@@ -449,15 +594,20 @@ class Gateway:
                 (session_id,),
             ):
                 raise GatewayError(401, "authentication_error", "invalid or revoked session token")
+            self._rereserve_miss(session_id, task_id)  # a cache miss owes a reservation (#79)
+            cached_tokens = self._cached_prefix(session_id, body)
             held = self._inflight.get(session_id, 0.0)
             headroom = self.budget.session_headroom(session_id) - held
-            need = self.worst_case(model, {"max_tokens": want}, len(raw))
+            need = self.worst_case(model, {"max_tokens": want}, len(raw), cached_tokens)
             if need > headroom and self._over_cap_ok(session_id, need - headroom):
                 headroom = need
             out = want
             # step down until the worst case fits (long-context rates make the
             # price per token depend on the input, so search rather than divide)
-            while out > 0 and self.worst_case(model, {"max_tokens": out}, len(raw)) > headroom:
+            while (
+                out > 0
+                and self.worst_case(model, {"max_tokens": out}, len(raw), cached_tokens) > headroom
+            ):
                 out = min(out - 1, int(out * 0.98))
             if out < min(want, MIN_OUTPUT_TOKENS):
                 raise GatewayError(
@@ -476,7 +626,10 @@ class Gateway:
                     f"{THINKING_ANSWER_ROOM} for the answer, but this call may output only "
                     f"{out} (session cap {cap})",
                 )
-            amount = self.worst_case(model, {"max_tokens": out}, len(raw))
+            amount = self.worst_case(model, {"max_tokens": out}, len(raw), cached_tokens)
+            if info is not None:
+                info["cached_tokens"] = cached_tokens
+                info["plain"] = self.worst_case(model, {"max_tokens": out}, len(raw))
             self._inflight[session_id] = held + amount
             self._seen[session_id] = self._now()
         changed = out != body.get("max_tokens")
@@ -583,9 +736,14 @@ class Gateway:
         """Record a finished upstream call. If that fails the call's spend is
         unknown: stop the session, book the worst case, page the owner."""
         try:
-            self._record(gs=gs, **kw)
+            cost = self._record(gs=gs, **kw)
         except Exception as e:
             self._metering_failed(hold, gs, kw["model"], kw["usage"], e)
+            return
+        try:
+            self._learn(hold, gs, kw["usage"], cost)
+        except Exception:
+            log.exception("cache-prefix bookkeeping failed for %s", gs.session_id)
 
     def _metering_failed(
         self, hold: Hold, gs: GatewaySession, model: str, usage: CallUsage, err: Exception
@@ -595,9 +753,10 @@ class Gateway:
         call_id = f"{gs.session_id}:{secrets.token_hex(4)}"
         reason = redact(f"{type(err).__name__}: {err}")
         replay = self.store.is_replay(gs.session_id)  # a replay files no inbox item (#47)
+        booked = hold.plain if hold.plain is not None else hold.amount  # never the cheaper hold
         steps: list[Callable[[], Any]] = [
             lambda: self.revoke(gs.session_id),  # no further call is forwarded
-            lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, hold.amount),
+            lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, booked),
             lambda: self.store.update_session(gs.session_id, status="failed"),
             lambda: self.store.add_event(
                 "metering_failed",
@@ -623,7 +782,7 @@ class Gateway:
                         "tokens_cache_read": usage.tokens_cache_read,
                         "tokens_cache_write_5m": usage.tokens_cache_write_5m,
                         "tokens_cache_write_1h": usage.tokens_cache_write_1h,
-                        "booked_usd": hold.amount,
+                        "booked_usd": booked,
                         "note": "the call's worst-case reservation was booked as spent; "
                         "reconcile with the provider's usage",
                         "resumable": False,
@@ -732,9 +891,16 @@ class Gateway:
             self._check_body(body, headers or {})
             self._check_locality(gs, preset, body.get("model"))
             model = self._check_model(gs.repo, preset, body.get("model"), gs.model or None)
-            amount = 0.0
+            amount, fp = 0.0, None
+            info: dict[str, Any] = {}
             if path in METERED_PATHS:
-                amount, body, raw = self._hold_clamped(gs.session_id, model, body, raw)
+                msgs = body.get("messages")
+                if isinstance(msgs, list):
+                    digest, chars = prefix_digest(body, len(msgs))
+                    fp = (digest, len(msgs), chars)
+                amount, body, raw = self._hold_clamped(
+                    gs.session_id, model, body, raw, task_id=gs.task_id, info=info
+                )
             try:
                 probe = self._backend_gate(
                     gs.preset, gs.session_id
@@ -745,7 +911,10 @@ class Gateway:
                 raise
         except GatewayError as e:
             raise self._refuse(gs, e) from None
-        return Hold(gs.session_id, amount, preset, body, raw, probe=probe)
+        return Hold(
+            gs.session_id, amount, preset, body, raw, probe=probe,
+            cached_tokens=info.get("cached_tokens", 0), plain=info.get("plain"), fingerprint=fp,
+        )  # fmt: skip
 
     # --- forwarding ------------------------------------------------------------------
 
