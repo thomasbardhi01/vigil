@@ -25,9 +25,12 @@ from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import REPO, BarePublisher
 from vigild.api.app import create_app
 from vigild.config import CoordRule, RepoPolicy
+from vigild.contract.models import WorkerReport
 from vigild.devimage import DevImages, DockerImages, SessionImages
 from vigild.executors.runtime import DockerRuntime, DockerTestRunner
 from vigild.gateway.app import create_gateway_app
+from vigild.jobs.artifacts import artifact_path
+from vigild.jobs.evidence import without_executor
 from vigild.jobs.runner import JobRunner
 from vigild.server import Vigild, build
 from vigild.services import Tokens
@@ -128,7 +131,7 @@ def test_two_workers_build_in_their_own_containers(
     tokens: Tokens,
     fixture_repo: dict[str, Path],
 ) -> None:
-    v, _, publisher, c = live
+    v, runner, publisher, c = live
     r = c.post(
         "/api/jobs",
         headers=auth(tokens.admin),
@@ -187,7 +190,16 @@ def test_two_workers_build_in_their_own_containers(
     assert tree["job"]["state"] == "ready", inbox["questions"]
     for w in latest.values():
         assert v.store.get_artifact(tree["job"]["id"], "review.json", w["task_id"]) is not None
+    # the worker report lives in the vault at each task's verified head; publish
+    # strips .vigil/, so no published tree carries it (#224)
+    job_id = tree["job"]["id"]
+    for a in v.store.q("SELECT task_id, content FROM artifacts WHERE name='tests.json'"):
+        head = json.loads(a["content"])["after"]["sha"]
+        rel = artifact_path(Path(), job_id, "worker_report.json", a["task_id"]).as_posix()
+        raw = runner.workspace.read_blob(REPO, head, rel)
+        assert raw, f"no worker report for {a['task_id']} in the vault at {head}"
+        WorkerReport.model_validate_json(without_executor(raw))
     for p in publisher.prs:
-        files = git(fixture_repo["bare"], "ls-tree", "-r", "--name-only", p["head"])
-        assert "worker_report.json" in files
+        files = git(fixture_repo["bare"], "ls-tree", "-r", "--name-only", p["head"]).splitlines()
+        assert not [f for f in files if f.split("/", 1)[0].lower() == ".vigil"], files
     assert spend() < 1.5
