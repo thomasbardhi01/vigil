@@ -156,6 +156,24 @@ def test_remote_difference_fails_the_run(
     assert ev["ok"] is False and ev["remote_verified"] is False
 
 
+def test_verify_ignores_directory_mtime_but_sees_content(tmp_path: Path) -> None:
+    import os
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "vigil.db").write_text("same")
+    (dst / "vigil.db").write_text("same")
+    os.utime(src / "vigil.db", (1_700_000_000, 1_700_000_000))
+    os.utime(dst / "vigil.db", (1_700_000_000, 1_700_000_000))
+    os.utime(dst, (1_600_000_000, 1_600_000_000))  # the parent's mtime differs
+    assert backup._rsync_diff(src / "vigil.db", f"{dst}/vigil.db", is_dir=False) == []
+    assert backup._rsync_diff(src, f"{dst}", is_dir=True) == []
+    (dst / "vigil.db").write_text("diff")
+    os.utime(dst / "vigil.db", (1_700_000_000, 1_700_000_000))
+    assert backup._rsync_diff(src / "vigil.db", f"{dst}/vigil.db", is_dir=False) != []
+
+
 def _fake_set(remote: backup.RsyncRemote, when: datetime, *, marked: bool) -> str:
     name = when.strftime("%Y%m%dT%H%M%SZ")
     d = remote.root_path / name

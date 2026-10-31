@@ -452,7 +452,13 @@ def _rsync_diff(src: Path, dst: str, *, is_dir: bool, ssh_e: str = "ssh") -> lis
     )  # fmt: skip
     if r.returncode not in (0, RSYNC_VANISHED):
         raise BackupError(f"remote verify failed ({r.returncode}): {r.stderr.strip()[:200]}")
-    return [line for line in r.stdout.splitlines() if line.strip()]
+    # A directory whose only difference is its mtime (GNU rsync lists the root `./` when
+    # its mtime moved, e.g. a sibling was written later) is not a content difference.
+    return [
+        line
+        for line in r.stdout.splitlines()
+        if line.strip() and not re.fullmatch(r"\.d[.t]+ .*", line)
+    ]
 
 
 def _ship_piece(src: Path, dst: str, *, is_dir: bool, ssh_e: str = "ssh") -> None:
