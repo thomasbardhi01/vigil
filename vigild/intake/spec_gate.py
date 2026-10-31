@@ -99,6 +99,31 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
     return None
 
 
+RUNNERS = {"pytest", "vitest"}
+SELECT_SUFFIXES = (".py", ".ts", ".js", ".tsx")
+SELECTORS = ("-k", "-m")
+
+
+def _selects(arg: str) -> bool:
+    return "/" in arg or "::" in arg or arg.endswith(SELECT_SUFFIXES)
+
+
+def full_suite_run(cmd: str) -> bool:
+    """A pytest or vitest run with no path, node id, `-k` or `-m`: the whole suite."""
+    for c in parse(cmd).commands:
+        words = list(c.words)
+        for i, w in enumerate(words):
+            if w.rsplit("/", 1)[-1] not in RUNNERS:
+                continue
+            rest = words[i + 1 :]
+            if any(a in SELECTORS or a.startswith(("-k=", "-m=", "-k", "-m")) for a in rest):
+                continue
+            positional = [a for a in rest if not a.startswith("-") and _selects(a)]
+            if not positional:
+                return True
+    return False
+
+
 MFF_REASON_RULE = (
     "must_fail_first is false, so must_fail_first_reason is required: "
     'say why, for example "tests only, code unchanged"'
@@ -228,6 +253,12 @@ def check_job_spec(
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
         elif why := test_cmd_problem(c.test_cmd, read):
             errors.append(f"spec.md {c.ident}: {why}")
+        elif full_suite_run(c.test_cmd):
+            errors.append(
+                f"spec.md {c.ident}: `{c.test_cmd}` runs the full suite, which can't finish "
+                "inside the verifier's time cap; use a targeted command (a test path, node id, "
+                "`-k` or `-m`)"
+            )
 
     errors.extend(plan.errors)
     if not plan.workers and not plan.errors:

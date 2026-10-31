@@ -424,3 +424,25 @@ def test_enforcing_fails_self_referential_evidence_with_another_rule(
     errors = _check(ws, *_result(ws, tmp_path, _todo), contract=WIDE, report=SELF_REF)
     assert any("todo-without-issue" in e for e in errors)
     assert any("self-referential-evidence" in e for e in errors)
+
+
+# --- #158: a timeout is named, not "selected 0 tests" ----------------------------------------
+
+
+def test_ac_errors_timed_out() -> None:
+    from vigild.jobs.acceptance import ac_errors
+
+    run = {"acs": ["AC1", "AC2"], "command": "pytest -q", "outcome": "timeout", "selected": 0}
+    assert ac_errors({"ac": [run]}) == ["AC1/AC2: `pytest -q` timed out (no report)"]
+
+
+def test_ac_errors_unchanged_for_other_outcomes() -> None:
+    from vigild.jobs.acceptance import ac_errors
+
+    empty = {"acs": ["AC1"], "command": "c", "outcome": "unknown", "selected": 0}
+    failed = {"acs": ["AC2"], "command": "d", "outcome": "fail", "selected": 2, "report": True}
+    ok = {"acs": ["AC3"], "command": "e", "outcome": "pass", "selected": 1, "report": True}
+    assert ac_errors({"ac": [empty, failed, ok]}) == [
+        "AC1: `c` selected 0 tests",
+        "AC2: `d` did not pass (the verifier saw fail)",
+    ]
