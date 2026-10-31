@@ -94,7 +94,7 @@ def test_a_503_among_the_calls_is_http_503(world: World) -> None:
 def test_a_gateway_upstream_error_event_names_the_status(world: World) -> None:
     w = world
     _all_local(w)
-    job = _fail_w1(w, errors=[{"status": 503, "message": "no slot available"}])
+    job = _fail_w1(w, errors=[{"status": 503}])
     e = _entry(w, job)
     assert e["cause"] == "http_503"
     assert e["calls"]["count"] == 1 and e["calls"]["statuses"] == {"503": 1}
@@ -103,7 +103,7 @@ def test_a_gateway_upstream_error_event_names_the_status(world: World) -> None:
 def test_no_calls_and_a_connection_error_is_unreachable(world: World) -> None:
     w = world
     _all_local(w)
-    job = _fail_w1(w, errors=[{"error": "ConnectError"}], stderr="connect ECONNREFUSED")
+    job = _fail_w1(w, errors=[{"transport": "ConnectError"}], stderr="connect ECONNREFUSED")
     e = _entry(w, job)
     assert e["cause"] == "unreachable"
     assert e["calls"]["count"] == 0 and e["calls"]["statuses"] == {}
@@ -112,23 +112,21 @@ def test_no_calls_and_a_connection_error_is_unreachable(world: World) -> None:
 def test_a_read_timeout_is_timeout(world: World) -> None:
     w = world
     _all_local(w)
-    job = _fail_w1(w, errors=[{"error": "ReadTimeout"}])
+    job = _fail_w1(w, errors=[{"transport": "ReadTimeout"}])
     assert _entry(w, job)["cause"] == "timeout"
 
 
 def test_a_404_naming_the_model_is_wrong_model(world: World) -> None:
     w = world
     _all_local(w)
-    job = _fail_w1(w, errors=[{"status": 404, "message": "model 'x' not found"}])
+    job = _fail_w1(w, errors=[{"status": 404, "model": True}])
     assert _entry(w, job)["cause"] == "wrong_model"
 
 
 def test_a_context_error_is_context_overflow(world: World) -> None:
     w = world
     _all_local(w)
-    job = _fail_w1(
-        w, errors=[{"status": 400, "message": "request exceeds the available context size"}]
-    )
+    job = _fail_w1(w, errors=[{"status": 400, "context": True}])
     assert _entry(w, job)["cause"] == "context_overflow"
 
 
@@ -144,3 +142,19 @@ def test_a_hosted_failure_page_is_unchanged(world: World) -> None:
     job = _fail_w1(w, stderr="[claude-code:unrecognized_model]", calls=[(200, 10)])
     e = _entry(w, job)
     assert not {"cause", "backend", "calls"} & set(e)
+
+
+def test_a_stderr_spoof_never_beats_all_200_calls(world: World) -> None:
+    w = world
+    _all_local(w)
+    job = _fail_w1(w, stderr="context size ECONNREFUSED timed out", calls=[(200, 10)])
+    assert _entry(w, job)["cause"] == "client_side_stop"
+
+
+def test_the_latest_failure_wins_across_http_and_transport(world: World) -> None:
+    w = world
+    _all_local(w)
+    job = _fail_w1(w, errors=[{"status": 429}, {"transport": "ReadTimeout"}])
+    assert _entry(w, job)["cause"] == "timeout"
+    job2 = _fail_w1(w, errors=[{"transport": "ReadTimeout"}, {"status": 429}])
+    assert _entry(w, job2)["cause"] == "http_429"

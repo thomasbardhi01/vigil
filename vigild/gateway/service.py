@@ -184,6 +184,8 @@ def check_content(body: dict[str, Any]) -> None:
 
 
 log = logging.getLogger(__name__)
+CONTEXT_WORDS = ("context size", "context length", "context window", "context_overflow",
+                 "prompt is too long", "too many tokens")  # fmt: skip
 
 
 class GatewayError(Exception):
@@ -633,13 +635,39 @@ class Gateway:
         return key
 
     def _upstream_error(self, gs: GatewaySession, data: dict[str, Any]) -> None:
-        """The backend's own failure for a session's call (an HTTP status with the
-        start of its body, or a transport error class): a call that has no
-        `model_calls` row. A page's `cause` is read from it (#181)."""
-        self.store.add_event(
-            "upstream_error", redact(data), Provenance.HUMAN,
-            job_id=gs.job_id, session_id=gs.session_id, task_id=gs.task_id,
-        )  # fmt: skip
+        """The backend's own failure for a session's call, which has no
+        `model_calls` row: `{status, type?, code?, context, model}` for an HTTP
+        status, `{transport}` for a transport error class. No free text. A page's
+        `cause` is read from it (#181). It never breaks the call it records."""
+        try:
+            self.store.add_event(
+                "upstream_error", data, Provenance.HUMAN,
+                job_id=gs.job_id, session_id=gs.session_id, task_id=gs.task_id,
+            )  # fmt: skip
+        except Exception:
+            log.exception("upstream_error event failed for %s", gs.session_id)
+
+    @staticmethod
+    def _http_failure(status: int, body: bytes) -> dict[str, Any]:
+        """Only what the cause needs from a backend's error body: its type and
+        code (64 characters each, redacted) and two flags computed here."""
+        text = body[:4000].decode(errors="replace")
+        low = text.lower()
+        out: dict[str, Any] = {
+            "status": status,
+            "context": any(w in low for w in CONTEXT_WORDS),
+            "model": "model" in low and ("not found" in low or "not_found" in low),
+        }
+        try:
+            err = json.loads(text).get("error")
+        except ValueError, AttributeError:
+            err = None
+        if isinstance(err, dict):
+            for k in ("type", "code"):
+                v = err.get(k)
+                if isinstance(v, str | int) and not isinstance(v, bool):
+                    out[k] = str(redact(str(v)))[:64]
+        return out
 
     def _refuse(self, gs: GatewaySession, err: GatewayError) -> GatewayError:
         self.store.add_event(
@@ -772,7 +800,7 @@ class Gateway:
         except httpx2.TransportError as e:  # a timeout or a dropped connection
             self.release(hold)
             self._upstream(gs.preset, False, type(e).__name__, gs.session_id)
-            self._upstream_error(gs, {"error": type(e).__name__})
+            self._upstream_error(gs, {"transport": type(e).__name__})
             raise
         except BaseException:
             self.release(hold)
@@ -820,9 +848,7 @@ class Gateway:
             data = await resp.aread()
             await resp.aclose()
             if resp.status_code != 200:
-                self._upstream_error(
-                    gs, {"status": resp.status_code, "message": data[:300].decode(errors="replace")}
-                )
+                self._upstream_error(gs, self._http_failure(resp.status_code, data))
             if resp.status_code == 200:
                 try:
                     payload = json.loads(data)

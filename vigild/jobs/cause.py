@@ -10,8 +10,6 @@ from typing import Any
 
 from vigild.db import Store
 
-CONTEXT_WORDS = ("context size", "context length", "context window", "context_overflow",
-                 "prompt is too long", "too many tokens")  # fmt: skip
 UNREACHABLE_STDERR = ("econnrefused", "enotfound", "connection refused", "getaddrinfo",
                       "name or service not known", "unreachable")  # fmt: skip
 TIMEOUT_STDERR = ("etimedout", "timed out", "timeout")
@@ -48,8 +46,8 @@ def calls_summary(store: Store, session_id: str) -> dict[str, Any]:
         if isinstance(e.get("status"), int):
             statuses[str(e["status"])] = statuses.get(str(e["status"]), 0) + 1
             count += 1
-        elif e.get("error"):
-            name = str(e["error"])
+        elif e.get("transport"):
+            name = str(e["transport"])
             transport[name] = transport.get(name, 0) + 1
     out: dict[str, Any] = {
         "count": count,
@@ -62,38 +60,34 @@ def calls_summary(store: Store, session_id: str) -> dict[str, Any]:
     return out
 
 
-def _http_cause(status: int, message: str) -> str:
-    low = message.lower()
-    if any(w in low for w in CONTEXT_WORDS):
+def _http_cause(e: dict[str, Any]) -> str:
+    if e.get("context"):
         return "context_overflow"
-    if status in (400, 404) and "model" in low:
+    if e.get("model") and e["status"] in (400, 404):
         return "wrong_model"
-    return f"http_{status}"
+    return f"http_{e['status']}"
 
 
 def cause_of(store: Store, session_id: str, stderr: str, calls: dict[str, Any]) -> str:
+    """The latest failure evidence wins (events are in time order). When every
+    gateway call was 200 and no error event exists, the CLI stopped it itself,
+    whatever its stderr says (stderr is only a hint when the gateway saw nothing)."""
     events = _events(store, session_id)
-    http = [e for e in events if isinstance(e.get("status"), int)]
-    if http:
-        last = http[-1]
-        return _http_cause(int(last["status"]), str(last.get("message") or ""))
+    for e in reversed(events):
+        if isinstance(e.get("status"), int):
+            return _http_cause(e)
+        if e.get("transport"):
+            return "timeout" if "Timeout" in str(e["transport"]) else "unreachable"
     bad = [int(k) for k in calls["statuses"] if k.isdigit() and int(k) != 200]
     if bad:
-        return _http_cause(max(bad), "")
-    names = [str(e["error"]) for e in events if e.get("error")]
-    if any("Timeout" in n for n in names):
-        return "timeout"
-    if names:
-        return "unreachable"  # a refused connection, DNS, or a dropped one
+        return _http_cause({"status": max(bad)})
+    if calls["count"] and set(calls["statuses"]) == {"200"}:
+        return "client_side_stop"
     low = stderr.lower()
-    if any(w in low for w in CONTEXT_WORDS):
-        return "context_overflow"
     if any(w in low for w in UNREACHABLE_STDERR):
         return "unreachable"
     if any(w in low for w in TIMEOUT_STDERR):
         return "timeout"
-    if calls["count"] and set(calls["statuses"]) == {"200"}:
-        return "client_side_stop"
     return "unknown"
 
 

@@ -28,13 +28,18 @@ class Upstream:
         self.requests: list[httpx2.Request] = []
         self.stream = False
         self.status = 200
+        self.error_body: dict[str, Any] | None = None
+        self.raises: Exception | None = None
         self.stop_reason = "end_turn"
 
     def __call__(self, req: httpx2.Request) -> httpx2.Response:
         self.requests.append(req)
+        if self.raises is not None:
+            raise self.raises
         if self.status != 200:
             return httpx2.Response(
-                self.status, json={"type": "error", "error": {"type": "overloaded_error"}}
+                self.status,
+                json=self.error_body or {"type": "error", "error": {"type": "overloaded_error"}},
             )
         if req.url.path.endswith("/count_tokens"):
             return httpx2.Response(200, json={"input_tokens": 12})
@@ -984,3 +989,63 @@ def test_an_upstream_error_leaves_an_event_for_the_page_cause(
     assert client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 503
     rows = store.q("SELECT data FROM events WHERE type='upstream_error' AND session_id=?", (sid,))
     assert len(rows) == 1 and json.loads(rows[0]["data"])["status"] == 503
+
+
+def _events(store: Store, sid: str) -> list[dict[str, Any]]:
+    rows = store.q("SELECT data FROM events WHERE type='upstream_error' AND session_id=?", (sid,))
+    return [json.loads(r["data"]) for r in rows]
+
+
+def test_the_upstream_event_holds_no_free_text(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    sid, tok = _session(store, budget, gw)
+    upstream.status = 400
+    upstream.error_body = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "x" * 200,
+            "message": "sk-ant-api03-"
+            + "A" * 40
+            + " the request exceeds the context size "
+            + "PROMPT-LIKE-SECRET " * 40,
+        }
+    }
+    assert client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 400
+    (ev,) = _events(store, sid)
+    raw = json.dumps(ev)
+    assert "sk-ant" not in raw and "PROMPT-LIKE" not in raw and "message" not in ev
+    assert ev["status"] == 400 and ev["type"] == "invalid_request_error"
+    assert len(ev["code"]) <= 64 and ev["context"] is True and ev["model"] is False
+
+
+def test_a_failing_event_write_never_breaks_the_call(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sid, tok = _session(store, budget, gw)
+
+    def boom(*a: Any, **k: Any) -> None:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(store, "add_event", boom)
+    upstream.status = 503
+    assert client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 503
+    upstream.status = 200
+    upstream.raises = httpx2.ConnectError("refused")
+    with pytest.raises(httpx2.ConnectError):
+        client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+
+
+def test_a_transport_error_writes_the_event(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    sid, tok = _session(store, budget, gw)
+    upstream.raises = httpx2.ConnectError("refused")
+    with pytest.raises(httpx2.ConnectError):
+        client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert _events(store, sid) == [{"transport": "ConnectError"}]
