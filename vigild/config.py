@@ -35,7 +35,7 @@ class Preset(Backend):
     live: bool = True
     # the least max_cost_usd a task on this preset may carry: the gateway reserves a
     # worst case per call, so a smaller cap can never run (owner, 2026-10-31, #79)
-    min_task_usd: float | None = None
+    min_task_usd: float | None = Field(default=None, ge=0)
 
 
 class DeciderRoute(_M):

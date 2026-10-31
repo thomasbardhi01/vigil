@@ -63,3 +63,12 @@ def test_min_task_usd_loads_and_an_unknown_key_still_fails(tmp_path: Path) -> No
     raw["presets"]["claude-sonnet"]["min_task_usdd"] = 1
     with pytest.raises(ValidationError):
         type(c.backends).model_validate(raw)
+
+
+def test_a_negative_minimum_is_refused() -> None:
+    """Owner ruling 2026-10-31: min_task_usd is non-negative, default None."""
+    raw = config_mod.load().backends.model_dump()
+    assert raw["presets"]["claude-opus"]["min_task_usd"] is None
+    raw["presets"]["claude-sonnet"]["min_task_usd"] = -0.01
+    with pytest.raises(ValidationError):
+        type(config_mod.load().backends).model_validate(raw)
