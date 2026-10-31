@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -42,47 +43,85 @@ def props_url(preset: Preset) -> str:
     return preset.base_url.rstrip("/").removesuffix("/v1") + "/props"
 
 
+class StatusError(Exception):
+    """A /props answer that was not 200; its text is `HTTP <status>`, nothing else."""
+
+
 def _fetch(url: str, headers: Mapping[str, str]) -> dict[str, Any]:
     with httpx2.Client(timeout=READ_TIMEOUT_SECONDS) as http:
         r = http.get(url, headers=dict(headers))
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
+        raise StatusError(f"HTTP {r.status_code}")
     out = r.json()
     if not isinstance(out, dict):
         raise ValueError("not an object")
     return out
 
 
+MAX_SLOTS = 64  # a ceiling on whatever a server claims
+FAILURE_TTL_SECONDS = 30.0  # a failed read is remembered this long (as 1 slot)
+
+
 class Capacity:
     def __init__(
-        self, cfg: Config, secrets: Secrets, store: Store, *, fetch: Fetch | None = None
+        self,
+        cfg: Config,
+        secrets: Secrets,
+        store: Store,
+        *,
+        fetch: Fetch | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.cfg = cfg
         self.secrets = secrets
         self.store = store
         self._fetch = fetch or _fetch
+        self._clock = clock
         self._cache: dict[str, Slots] = {}
-        self._lock = threading.Lock()
+        self._failed: dict[str, float] = {}  # server -> when its failed read stops counting
+        self._locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()  # guards the dicts only, never held over I/O
+
+    def server(self, preset_name: str) -> str:
+        """The server a preset lives on: its /props URL, normalized. Presets that
+        share one share its slots."""
+        return props_url(self.cfg.preset(preset_name)).lower()
 
     def limits(self, preset_name: str) -> int:
         return self.get(preset_name).total_slots
 
     def get(self, preset_name: str) -> Slots:
         """The cached capacity, read now if there is none. A failed read is
-        1 slot, logged and recorded, and not cached."""
+        1 slot, logged and recorded, and remembered for 30 s."""
+        server = self.server(preset_name)
         with self._lock:
-            hit = self._cache.get(preset_name)
+            hit = self._cache.get(server)
             if hit is not None:
                 return hit
+            if self._failed.get(server, 0.0) > self._clock():
+                return Slots(1, None)
+            lock = self._locks.setdefault(server, threading.Lock())
+        with lock:  # one reader per server; the others wait for its answer
+            with self._lock:
+                hit = self._cache.get(server)
+                if hit is not None:
+                    return hit
+                if self._failed.get(server, 0.0) > self._clock():
+                    return Slots(1, None)
             got = self._read(preset_name)
-            if got is not None:
-                self._cache[preset_name] = got
+            with self._lock:
+                if got is None:
+                    self._failed[server] = self._clock() + FAILURE_TTL_SECONDS
+                    return Slots(1, None)
+                self._cache[server] = got
+                self._failed.pop(server, None)
                 return got
-            return Slots(1, None)
 
     def refresh(self, preset_name: str) -> Slots:
+        server = self.server(preset_name)
         with self._lock:
-            self._cache.pop(preset_name, None)
+            self._cache.pop(server, None)
+            self._failed.pop(server, None)
         return self.get(preset_name)
 
     def start(self) -> None:
@@ -97,13 +136,14 @@ class Capacity:
         headers = {"authorization": f"Bearer {key}"} if key else {}
         try:
             props = self._fetch(props_url(preset), headers)
-            total = int(props["total_slots"])
-            if total < 1:
-                raise ValueError("total_slots < 1")
+            total = props["total_slots"]
+            if not isinstance(total, int) or isinstance(total, bool) or total < 1:
+                raise ValueError("total_slots is not an int >= 1")
+            total = min(total, MAX_SLOTS)
             ctx = (props.get("default_generation_settings") or {}).get("n_ctx")
-            n_ctx = int(ctx) if isinstance(ctx, int) and not isinstance(ctx, bool) else None
-        except Exception as e:  # never the key: the class name only
-            why = type(e).__name__
+            n_ctx = ctx if isinstance(ctx, int) and not isinstance(ctx, bool) else None
+        except Exception as e:  # never the key: the class name, or the HTTP status
+            why = str(e) if isinstance(e, StatusError) else type(e).__name__
             log.warning("%s: /props unreadable (%s); assuming 1 slot", preset_name, why)
             self._event("backend_capacity", {"preset": preset_name, "ok": False, "error": why,
                                              "total_slots": 1})  # fmt: skip
@@ -130,6 +170,7 @@ class SlotGate:
         self._live: dict[str, int] = {}
 
     def live(self, preset: str) -> int:
+        preset = self.capacity.server(preset)
         with self._cond:
             return self._live.get(preset, 0)
 
@@ -146,6 +187,7 @@ class SlotGate:
         poll = SLOT_POLL_SECONDS if poll is None else poll
         waited = False
         limit = self.capacity.limits(preset)  # outside the condition: it may do I/O
+        preset = self.capacity.server(preset)  # presets on one server share its slots
         while True:
             with self._cond:
                 if self._live.get(preset, 0) < limit:
@@ -159,6 +201,7 @@ class SlotGate:
                 self._cond.wait(timeout=poll)
 
     def release(self, preset: str) -> None:
+        preset = self.capacity.server(preset)
         with self._cond:
             self._live[preset] = max(0, self._live.get(preset, 0) - 1)
             self._cond.notify_all()
