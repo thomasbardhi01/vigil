@@ -190,7 +190,7 @@ def _context_pack(
         body = _read(repo, rel)
         if body is not None:
             items.append(("related tests", f"{rel} (related test)", body))
-    if related:
+    if related - set(files):
         items.append(("related tests", "blind spots of the related-tests list", BLIND_SPOTS))
     log = _git_log(repo, [f for f in files if "*" not in f])
     if log:
