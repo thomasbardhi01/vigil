@@ -33,6 +33,7 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import functools
 import hashlib
@@ -41,7 +42,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -158,6 +159,7 @@ from vigild.router.rules import (
     route_coord,
 )
 from vigild.scheduler import wip
+from vigild.scheduler.capacity import Capacity, SlotGate
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import TEST_FILE, Halted, Verifier, halt_when, runner_class, runner_like
@@ -212,7 +214,7 @@ REVIEW_OUTPUT_TOKENS = 8192
 # a review pass reviews at most this many tasks, each pass reserving for its
 # own (owner, 2026-10-23); as the WIP limit, so a pass is $4.80 at most
 REVIEW_PASS_TASKS = 4
-LIVE_SESSION = ("created", "running")
+LIVE_SESSION = ("created", "queued", "running")  # queued: waiting for a backend slot
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
 QUEUE_POLL_SECONDS = 15.0  # how often a queued session looks for room in the day
 PUBLISHED = ("pr_open", "reviewed")  # a task whose draft PR is open (reviewed: clean at its head)
@@ -323,6 +325,7 @@ class JobRunner:
         breakers: Breakers | None = None,
         deps: Any = None,
         pr_state: Callable[[str, str], str] | None = None,
+        capacity: Capacity | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -369,6 +372,9 @@ class JobRunner:
         self.breakers.on_close = self._probe_closed  # a probe closed a backend breaker
         self._sdk_seen: set[tuple[str, str]] = set()
         self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
+        # a local backend's own limit: its server's slot count (owner, 2026-10-31)
+        self.capacity = capacity
+        self.slot_gate = SlotGate(capacity) if capacity is not None else None
 
     def close(self) -> None:
         for close in self.closers:
@@ -1366,10 +1372,10 @@ class JobRunner:
             # role separation, enforced at dispatch: a session row never runs as
             # another role, so an author's session is never a worker or a reviewer
             raise SessionRoleError(f"session {s.id} is a {s.role.value}, not a {spec.role.value}")
-        with self.slots.session():
+        with self._backend_slot(s, spec) as got, self.slots.session():
             out: ExecOutcome | None = None
             try:
-                if spec.job_id and self._abandoned(spec.job_id):
+                if not got or (spec.job_id and self._abandoned(spec.job_id)):
                     # killed while this session waited for a slot: it never starts, and
                     # never gets a token (issue #52). The finally settles its reservation.
                     out = ExecOutcome("killed", None, {}, "the job was killed")
@@ -1445,6 +1451,49 @@ class JobRunner:
                         s.id, functools.partial(self._settle_checked, s, spec, reservation, out)
                     )
                 self.store.update_session(s.id, ended_at=iso())
+
+    @contextlib.contextmanager
+    def _backend_slot(self, s: SessionRow, spec: SessionSpec) -> Iterator[bool]:
+        """A session on a `locality: local` preset takes one of its server's slots
+        first, waiting while they are all live across every job. The wait is a
+        queue, not a failure: no page, no attempt used, a `queued` event (for
+        `backend_slot`) and a `dequeued` one when it starts. False: its job was
+        killed while it waited, so it never starts. Hosted presets pass straight."""
+        gate = self.slot_gate
+        preset = spec.preset
+        if gate is None or preset not in self.cfg.backends.presets:
+            yield True
+            return
+        if self.cfg.preset(preset).locality != "local":
+            yield True
+            return
+        job_id = spec.job_id
+
+        queued: list[bool] = []
+
+        def waiting() -> None:
+            queued.append(True)
+            self.store.update_session(s.id, status="queued")
+            if job_id:
+                self._queue_event(
+                    "queued", job_id, "backend_slot", spec.task_id,
+                    preset=preset, session_id=s.id,
+                )  # fmt: skip
+
+        def cancelled() -> bool:
+            return bool(job_id) and self._abandoned(str(job_id))
+
+        got = gate.acquire(preset, cancelled=cancelled, on_wait=waiting)
+        if queued and job_id:
+            self._queue_event(
+                "dequeued", job_id, "backend_slot", spec.task_id,
+                preset=preset, session_id=s.id, **({} if got else {"cancelled": True}),
+            )  # fmt: skip
+        try:
+            yield got
+        finally:
+            if got:
+                gate.release(preset)
 
     def _settle_checked(
         self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None

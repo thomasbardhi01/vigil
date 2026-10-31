@@ -29,6 +29,7 @@ from vigild.gateway.service import Gateway
 from vigild.jobs import rulings
 from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService, Runner
+from vigild.scheduler.capacity import Capacity
 from vigild.services import Services, Tokens
 from vigild.telemetry.spans import Telemetry
 
@@ -320,6 +321,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
             v.cfg.vigild.data_path / "deps",
         ),
         pr_state=GitHubPRs(app).state if app else None,
+        capacity=Capacity(v.cfg, v.secrets, v.store),
     )
     runner.closers.append(client.close)
     runner.closers.append(hosts.close_remote)
@@ -456,6 +458,8 @@ def main() -> None:
     check_sandbox_hosts(v.cfg)
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
+    if runner.capacity is not None:
+        runner.capacity.start()  # each live local preset's slot count, once, at start
     # Hold every job a restart interrupted. Approved builds start only once the
     # gateway is listening (review round 2, N11), and every session checks its
     # repo's dev image first: built and validated when its lockfiles change,

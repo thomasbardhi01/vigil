@@ -243,6 +243,7 @@ def check_content(body: dict[str, Any]) -> None:
 
 
 log = logging.getLogger(__name__)
+EXEMPT_OVERFLOWS = 10  # context-overflow 5xx in a row a local preset may answer with
 CONTEXT_WORDS = ("context size", "context length", "context window", "context_overflow",
                  "prompt is too long", "too many tokens")  # fmt: skip
 
@@ -317,6 +318,7 @@ class Gateway:
         self.store = store
         self.budget = budget
         self.secrets = secrets_
+        self._exempt: dict[str, int] = {}  # preset -> context-overflow 5xx in a row
         self.prices = PriceTable(cfg.prices)
         self.sync_client = httpx2.Client(transport=transport, timeout=UPSTREAM_TIMEOUT)
         self.async_client = httpx2.AsyncClient(transport=async_transport, timeout=UPSTREAM_TIMEOUT)
@@ -385,6 +387,24 @@ class Gateway:
                 Kind.BACKEND, scope, self.cfg.vigild.breakers.backend_errors,
                 {"preset": preset_name, "error": detail[:300]},
             )  # fmt: skip
+
+    def _exempt_streak(self, preset_name: str, session_id: str | None) -> int:
+        """One more context-overflow 5xx in a row from this local preset."""
+        if self.store.is_replay(session_id):
+            return 0
+        self._exempt[preset_name] = self._exempt.get(preset_name, 0) + 1
+        return self._exempt[preset_name]
+
+    def _trip_overflow(self, preset_name: str, session_id: str | None) -> None:
+        if self.breakers is None or self.store.is_replay(session_id):
+            return
+        from vigild.breakers import Kind
+
+        self.breakers.trip(
+            Kind.BACKEND, f"backend:{preset_name}",
+            {"preset": preset_name, "error": "only context overflows",
+             "in_a_row": self._exempt.get(preset_name, 0)},
+        )  # fmt: skip
 
     # --- tokens -------------------------------------------------------------------
 
@@ -1012,8 +1032,33 @@ class Gateway:
             self.release(hold)
             self._release_probe(hold.probe)  # the call never reached upstream
             raise
-        self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}", gs.session_id)
         ctype = resp.headers.get("content-type", "")
+        if resp.status_code >= 500 and "text/event-stream" not in ctype:
+            # a 500 that says the prompt outgrew its slot's context is the session's
+            # own cause, not the backend's health: it neither counts toward the breaker
+            # nor ends a run of failures (owner, 2026-10-31)
+            try:
+                own = bool(self._http_failure(resp.status_code, await resp.aread())["context"])
+            except Exception:
+                own = False
+            if (
+                own
+                and self.cfg.preset(gs.preset).locality == "local"
+                and (self._exempt_streak(gs.preset, gs.session_id) <= EXEMPT_OVERFLOWS)
+            ):
+                self._release_probe(hold.probe)
+            elif own and self.cfg.preset(gs.preset).locality == "local":
+                # a server that only ever answers with overflow is unhealthy
+                self._release_probe(hold.probe)
+                self._trip_overflow(gs.preset, gs.session_id)
+            else:
+                self._exempt.pop(gs.preset, None)
+                self._upstream(gs.preset, False, f"HTTP {resp.status_code}", gs.session_id)
+        else:
+            self._exempt.pop(gs.preset, None)  # any other answer ends the overflow run
+            self._upstream(
+                gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}", gs.session_id
+            )
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:
             data = await resp.aread()

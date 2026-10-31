@@ -1229,3 +1229,82 @@ def test_a_transport_error_writes_the_event(
     with pytest.raises(httpx2.ConnectError):
         client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
     assert _events(store, sid) == [{"transport": "ConnectError"}]
+
+
+# --- overlap is not a sick backend (owner, 2026-10-31) -----------------------------------
+
+_OVERFLOW = {"error": {"type": "server_error", "message": "the request exceeds the context size"}}
+_PLAIN = {"error": {"type": "server_error", "message": "boom"}}
+_QWEN = "qwen3.6-35b-a3b"
+
+
+def _post(client: TestClient, tok: str, model: str | None = None) -> int:
+    body = _msg(model=model) if model else _msg()
+    return client.post("/v1/messages", json=body, headers={"x-api-key": tok}).status_code
+
+
+def _local(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config, bodies: list[dict[str, Any]], *, hosted: bool = False,
+) -> list[int]:  # fmt: skip
+    from vigild.breakers import Breakers
+
+    gw.breakers = Breakers(store, cfg)
+    if hosted:
+        _, tok = _session(store, budget, gw)
+    else:
+        _, tok = _local_session(cfg, store, budget, gw)
+    upstream.status = 500
+    out = []
+    for b in bodies:
+        upstream.error_body = b
+        out.append(_post(client, tok, None if hosted else _QWEN))
+    return out
+
+
+def test_a_local_context_overflow_500_does_not_count_toward_backend_errors(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    n = cfg.vigild.breakers.backend_errors + 2
+    _local(gw, client, store, budget, upstream, cfg, [_OVERFLOW] * n)
+    assert gw.breakers.open_breakers() == []
+    events = [e for e in store.events() if e.type == "upstream_error"]
+    assert events and all(e.data["context"] is True for e in events)  # still recorded
+
+
+def test_a_hosted_500_that_mentions_context_still_counts(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    n = cfg.vigild.breakers.backend_errors
+    _local(gw, client, store, budget, upstream, cfg, [_OVERFLOW] * n, hosted=True)
+    assert len(gw.breakers.open_breakers()) == 1
+
+
+def test_plain_500s_in_a_row_still_trip_backend_errors(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    _local(gw, client, store, budget, upstream, cfg, [_PLAIN] * cfg.vigild.breakers.backend_errors)
+    assert len(gw.breakers.open_breakers()) == 1
+
+
+def test_an_overflow_between_plain_500s_ends_the_overflow_run_only(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    _local(gw, client, store, budget, upstream, cfg,
+           [_PLAIN, _OVERFLOW, _PLAIN, _OVERFLOW, _PLAIN])  # fmt: skip
+    assert len(gw.breakers.open_breakers()) == 1
+
+
+def test_eleven_local_overflows_in_a_row_trip_on_the_eleventh(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    _local(gw, client, store, budget, upstream, cfg, [_OVERFLOW] * 10)
+    assert gw.breakers.open_breakers() == []
+    _, tok = _local_session(cfg, store, budget, gw)
+    assert _post(client, tok, _QWEN) == 500  # the 11th
+    assert len(gw.breakers.open_breakers()) == 1
