@@ -25,6 +25,7 @@ from vigild.api.auth import (
     identify,
     require,
 )
+from vigild.backup import backup_degraded
 from vigild.db import Store
 from vigild.jobs import rulings
 from vigild.jobs.batch import MAX_JOBS, batch_view
@@ -121,7 +122,13 @@ def health(request: Request) -> dict[str, Any]:
         db = "ok"
     except Exception as e:  # pragma: no cover - a broken DB is the point of the check
         db = f"error: {e}"
-    return {"ok": db == "ok", "db": db, "degraded": sorted(svc.degraded), "version": "0.1.0"}
+    degraded = set(svc.degraded)
+    try:
+        if backup_degraded(svc.store):
+            degraded.add("backup")
+    except Exception:  # an unreadable store is as bad as no backup
+        degraded.add("backup")
+    return {"ok": db == "ok", "db": db, "degraded": sorted(degraded), "version": "0.1.0"}
 
 
 # --- the web UI's session (P7: no token in the browser) -----------------------------

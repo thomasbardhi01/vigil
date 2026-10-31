@@ -466,6 +466,39 @@ untracked change, and whose HEAD is the SHA `scripts/deploy.sh` last wrote to
 directories. Code: `vigild/doctor.py`.
 There is no automated restore; the runbook has the manual steps. Code: `vigild/backup.py`.
 
+**Off-machine copy (nightly).** With `--remote` (or `VIGIL_BACKUP_REMOTE`; a host
+value, never in the repo) the same run goes on: the local set also holds
+`vigil-<stamp>.coord/`, an rsync of `<data>/coord/` that leaves out `*.pid`,
+`__pycache__` and `*.tmp`; before anything is kept, the copied DB passes
+`integrity_check` and every bare repo in the copied vault passes
+`git fsck --no-dangling` (through `vigild/gitsafe.py`). A failed check discards
+the set and ships nothing. Then `run_nightly` ships it by `rsync -a` to
+`<remote><stamp>/` (`vigil.db`, `vault/`, `coord/`, and `vigil.marker` last),
+verifies the remote with a second `rsync --dry-run --checksum --itemize-changes`
+that must print nothing, and applies 14-day retention. rsync cannot rename, so the
+set goes first to `<stamp>.partial/`; only after that verifies clean is it shipped
+again to `<stamp>/`, verified, and the `.partial` dropped. A failed verify deletes
+nothing: the failed copy stays as `<stamp>.partial/`, the run records `ok: false`
+and health stays degraded. Retention removes a set (or its `.partial`/`.bad` copy)
+only when it is over 14 days old and a newer verified-good set exists (a recorded
+`ok: true` event for a newer stamp, present on the remote under its plain name with
+our marker); `.partial`/`.bad` copies never count as good, so the newest good set is
+kept however old. The tower side is a
+dedicated key restricted there to `command="rrsync ~/vigil-backups",restrict`,
+so the remote accepts only rsync and every remote step is an rsync (the key is
+given by path, `VIGIL_BACKUP_SSH_KEY`, and never read). Remote retention
+lists the root with `rsync --list-only`, takes only real directories named like a
+stamp and older than 14 days, fetches each one's marker and requires a plain file
+holding a 16-hex run id, then deletes with `rsync -r --delete` of an empty
+directory under filter rules `--include=/<stamp>`, `--include=/<stamp>/***`,
+`--exclude=*`: the exclude protects every other remote path. The result is
+recorded as an `events` row `type: backup` (provenance `human`; fields `ok`,
+`stamp`, `remote`, `sizes`, `integrity`, `fsck`, `remote_verified`,
+`retention_removed`, `local_pruned`, `duration_s`, `error`), written by the CLI
+through `Store`. `/api/health` adds `backup` to `degraded` when the newest event
+with `ok: true` is over 36 h old or there is none; it is read from the store on
+every request.
+
 Every record table carries `provenance: claude | local | human`, enforced
 by a CHECK constraint. `human` means not model output: you, or vigild's own
 code. Hosted non-Claude output (Jev) has no value of its own and is tagged

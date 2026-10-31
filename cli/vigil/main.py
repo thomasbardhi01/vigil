@@ -164,6 +164,18 @@ def backup(
     ),
     keep_days: int = typer.Option(14, "--keep-days", min=1, help="Prune older dated sets."),
     data_dir: str = typer.Option("", "--data-dir", help="Default: VIGIL_DATA_DIR or the config."),
+    remote: str = typer.Option(
+        "",
+        "--remote",
+        envvar="VIGIL_BACKUP_REMOTE",
+        help="Also verify, ship (rsync only) and record: `tower:` (rrsync fixes the root).",
+    ),
+    ssh_key: str = typer.Option(
+        "",
+        "--ssh-key",
+        envvar="VIGIL_BACKUP_SSH_KEY",
+        help="Path of the backup-only ssh key (passed to ssh by path, never read).",
+    ),
 ) -> None:
     """Back up the database (SQLite online backup, mode 600) and the vault
     (rsync) into a dated set; keep N days. Never reads ~/.config/vigil/."""
@@ -172,6 +184,24 @@ def backup(
     if not dest:
         typer.echo("no destination: pass --dest or set VIGIL_BACKUP_DIR")
         raise typer.Exit(2)
+    if remote:
+        from vigild.backup import RsyncRemote, run_nightly
+
+        try:
+            res = run_nightly(
+                _data_dir(data_dir or None),
+                Path(dest),
+                RsyncRemote.parse(remote, ssh_key or None),
+                keep_days=keep_days,
+            )
+        except BackupError as e:
+            typer.echo(f"backup failed: {e}")
+            raise typer.Exit(1) from e
+        if not res.ok:
+            typer.echo(f"backup failed: {res.event.get('error', 'unknown')}")
+            raise typer.Exit(1)
+        typer.echo(f"backed up {res.stamp} and shipped it to {res.event['remote']}")
+        return
     try:
         made = run_backup(_data_dir(data_dir or None), Path(dest), keep_days=keep_days)
     except BackupError as e:
