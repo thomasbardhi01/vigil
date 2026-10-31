@@ -29,7 +29,12 @@ step() { echo "==> $*"; }
 die() { echo "deploy: $*" >&2; exit 1; }
 git_prod() { git -C "$PROD_DIR" "$@"; }
 
+if [ ! -e "$PROD_DIR" ]; then
+  origin_url="$(git -C "$(dirname "$0")/.." remote get-url origin 2>/dev/null || echo '<origin url>')"
+  die "$PROD_DIR does not exist; this script never creates it. One-time setup (owner): git clone --branch main $origin_url $PROD_DIR"
+fi
 [ -d "$PROD_DIR/.git" ] || die "$PROD_DIR is not a git checkout"
+[ "$(git_prod rev-parse --abbrev-ref HEAD)" = main ] || die "$PROD_DIR is not on main; nothing changed"
 export VIGIL_DATA_DIR="$DATA_DIR"
 
 # 1. Idle check (read-only).
@@ -70,12 +75,20 @@ rc=0
 rebuilt=""
 failed=""
 
+# The deployed SHA, for `vigil doctor`: written atomically once the checkout is at it.
+record_sha() {
+  mkdir -p "$DATA_DIR"
+  git_prod rev-parse HEAD > "$DATA_DIR/deployed_sha.tmp.$$"
+  mv "$DATA_DIR/deployed_sha.tmp.$$" "$DATA_DIR/deployed_sha"
+}
+
 merge_ff() {
   if [ "$DRY" = 1 ]; then
     step "[dry-run] git -C $PROD_DIR merge --ff-only origin/main"
   else
     step "fast-forward $PROD_DIR"
     git_prod merge --ff-only origin/main || die "merge failed; check whether vigild is running"
+    record_sha
   fi
 }
 
