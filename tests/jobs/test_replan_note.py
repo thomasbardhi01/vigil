@@ -123,7 +123,7 @@ def test_the_author_contract_takes_every_matching_section_and_ignores_case() -> 
     assert author_contract(note) == "2. AUTHOR notes:\n   - a\n\n4. For the Author\n   - c"
 
 
-def test_without_an_author_section_the_author_gets_the_whole_note() -> None:
+def test_author_contract_without_an_author_section_is_the_whole_note() -> None:
     note = "1. Interface: add --root\n 2 is not an item\n2. AC3: rewrite\n"
     assert author_contract(note) == note.strip()
 

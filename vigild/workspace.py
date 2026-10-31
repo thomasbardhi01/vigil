@@ -40,6 +40,13 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 RO_DIRS = (".github", ".claude", ".opencode", ".git/hooks")
 RO_FILES = (".git/config",)
 VIGIL_DIR = ".vigil"
+# a diff block of the top-level `.vigil` entry (a directory or a file), any case
+# A `diff --git` header for the top-level `.vigil` only: the directory (`a/.vigil/...`) or a
+# file named exactly `.vigil` (the whole header line), unquoted or git-quoted. Never a path
+# that merely starts with ".vigil " (a directory `.vigil b/` is published and reviewed).
+VIGIL_BLOCK = re.compile(
+    r'diff --git (?:"?a/\.vigil/|a/\.vigil b/\.vigil\n|"a/\.vigil" "b/\.vigil"\n)', re.I
+)
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
 MAX_BUNDLE = 512 << 20
@@ -645,6 +652,15 @@ class Workspace:
             base_sha, head,
         )  # fmt: skip
 
+    def published_diff(self, repo: str, base_sha: str, head: str) -> str:
+        """`full_diff` as it will be published: without the top-level `.vigil`, the
+        entry `public_commit` replaces with the base's. What a reviewer reads. The whole
+        diff is taken and the `.vigil` entries' blocks dropped (git runs with literal
+        pathspecs and `git diff` has no pathspec file, so no argv limit applies)."""
+        full = self.full_diff(repo, base_sha, head)
+        blocks = re.split(r"(?m)^(?=diff --git )", full)
+        return "".join(blk for blk in blocks if not VIGIL_BLOCK.match(blk))
+
     def read_blob(self, repo: str, head: str, path: str, max_bytes: int = MAX_BLOB) -> str | None:
         """A regular file's content at `head`; None for a symlink, a submodule,
         a missing path or one over the cap."""
@@ -663,11 +679,15 @@ class Workspace:
         except GitError as e:
             raise WorkspaceError(str(e)) from e
 
-    def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+    def push(self, repo: str, head: str, branch: str, token: str | None, lease: str | None) -> None:
+        """Push `head` to `branch` only if the remote tip is still `lease` (the SHA
+        publish checked; None means the branch must not exist yet). The caller has
+        already refused a non-fast-forward: a lease alone would let git make one."""
         if is_bench_repo(repo):
             raise WorkspaceError(f"{repo} is a bench repo: nothing is pushed")
         self._git(
-            self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
+            self.vault(repo), "push", "--quiet", "--no-verify",
+            f"--force-with-lease=refs/heads/{branch}:{lease or ''}", self.remote_url(repo),
             f"{head}:refs/heads/{branch}", token=token,
         )  # fmt: skip
 

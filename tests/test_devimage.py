@@ -11,9 +11,10 @@ from typing import Any
 import pytest
 
 from tests.conftest import git
+from tests.test_devimage_failed_names import IDS, big_output
 from vigild.config import Config, RepoPolicy
 from vigild.db import Store
-from vigild.devimage import DevImages, StaleDevImage, missing_tools, tools_in
+from vigild.devimage import TAIL, DevImages, StaleDevImage, missing_tools, tools_in
 from vigild.verifier import RunResult
 from vigild.workspace import Workspace
 
@@ -57,6 +58,7 @@ class FakeDocker:
 class FakeSuites:
     def __init__(self) -> None:
         self.exit: dict[str, int] = {}
+        self.output: str | None = None
         self.ran: list[tuple[str, str, list[str]]] = []
 
     def run(
@@ -64,7 +66,7 @@ class FakeSuites:
     ) -> RunResult:
         files = sorted(p.name for p in source.iterdir())
         self.ran.append((image, command, files))
-        return RunResult(self.exit.get(command, 0), f"ran {command}")
+        return RunResult(self.exit.get(command, 0), self.output or f"ran {command}")
 
 
 @pytest.fixture
@@ -345,3 +347,87 @@ def test_on_rebuild_validates_at_mains_tip_not_the_pages_stale_base(world: Any) 
     JobRunner.on_rebuild(me, REPO, stale)  # type: ignore[arg-type]
     row = images.latest(REPO)
     assert row is not None and row["ok"] and row["base_sha"] == tip
+
+
+def test_a_validation_record_stores_names(world: Any) -> None:
+    images, _, suites, _, base, _ = world
+    suites.exit = {c: 1 for c in images.cfg.repo("o/fixture").dev_suites.values()}
+    suites.output = big_output()
+    with pytest.raises(StaleDevImage):
+        images.ensure_fresh("o/fixture", base)
+    body = json.loads(images.latest("o/fixture")["output"])
+    for s in body["suites"].values():
+        assert s["failed_tests"] == IDS
+        assert "VIGIL-REPORT" not in s["tail"] and len(s["tail"]) <= TAIL
+
+
+# --- a CI-green failure is a flake, not a page (#191) --------------------------------
+
+
+def _flake_world(world: Any, ci: str | Exception) -> tuple[Any, Any, Any, list[Any]]:
+    images, _, suites, _, base, ctx = world
+    seen: list[tuple[str, str]] = []
+
+    def check(repo: str, sha: str) -> str:
+        seen.append((repo, sha))
+        if isinstance(ci, Exception):
+            raise ci
+        return ci
+
+    images.ci_result = check
+    images.on_flake = lambda r, t, b: ctx.setdefault("flakes", []).append({"title": t, **b})
+    suites.exit["test -f docs/runbook.md"] = 1
+    suites.output = big_output()
+    return images, base, ctx, seen
+
+
+def test_a_failure_with_green_ci_is_a_flake_with_no_page(world: Any) -> None:
+    images, base, ctx, seen = _flake_world(world, "success")
+    with pytest.raises(StaleDevImage, match="validate"):
+        images.ensure_fresh(REPO, base)
+    assert seen == [(REPO, base)]
+    assert ctx["pages"] == []
+    (flake,) = ctx["flakes"]
+    assert flake["kind"] == "dev_image_flake" and flake["actions"] == ["rebuild", "dismiss"]
+    assert flake["base_sha"] == base and flake["failed_suites"] == ["docs"]
+    row = images.latest(REPO)
+    assert not row["ok"]  # the record stays failed: dispatch is still refused
+    body = json.loads(row["output"])
+    assert body["verdict"] == f"suite flaked, CI green on {base}"
+    assert body["suites"]["docs"]["failed_tests"] == IDS
+
+
+@pytest.mark.parametrize("ci", ["failure", "pending", "unknown", RuntimeError("403")])
+def test_a_failure_without_green_ci_still_pages(world: Any, ci: Any) -> None:
+    images, base, ctx, _ = _flake_world(world, ci)
+    with pytest.raises(StaleDevImage, match="validate"):
+        images.ensure_fresh(REPO, base)
+    (page,) = ctx["pages"]
+    assert page["kind"] == "dev_image" and "flakes" not in ctx
+    assert "verdict" not in json.loads(images.latest(REPO)["output"])
+
+
+def test_a_failed_build_never_asks_ci(world: Any) -> None:
+    images, base, ctx, seen = _flake_world(world, "success")
+    images.docker.ok = False
+    with pytest.raises(StaleDevImage, match="build"):
+        images.ensure_fresh(REPO, base)
+    assert seen == [] and len(ctx["pages"]) == 1
+
+
+def test_the_flake_item_is_an_open_question_and_not_a_page(world: Any, store: Store) -> None:
+    import types
+
+    from vigild.jobs.runner import JobRunner
+
+    images, base, _, _ = _flake_world(world, "success")
+    me = types.SimpleNamespace(store=store, jobs=object())
+    images.on_flake = lambda r, t, b: JobRunner.dev_image_flaked(me, r, t, b)  # type: ignore[arg-type]
+    with pytest.raises(StaleDevImage):
+        images.ensure_fresh(REPO, base)
+    (item,) = store.list_inbox()
+    assert item.kind == "dev_image_flake" and item.queue == "questions"
+    assert item.body["actions"] == ["rebuild", "dismiss"] and "flake" in item.title
+    assert [e.type for e in store.events() if e.type in ("page", "dev_image_flake")] == [
+        "dev_image_flake"
+    ]
