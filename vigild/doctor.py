@@ -23,6 +23,7 @@ from vigild.repos import JEV, is_bench_repo, live_private, repo_rule_errors
 TIMEOUT = 15.0
 BACKUP_PLIST = Path.home() / "Library" / "LaunchAgents" / "dev.vigil.backup.plist"
 BACKUP_PLACEHOLDER = "__BACKUP_DESTINATION__"
+VIGILD_PLIST = Path.home() / "Library" / "LaunchAgents" / "dev.vigil.vigild.plist"
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,49 @@ def backup_freshness_check(
     if dest is None:
         return Check(name, verdict, note)
     return _safe(name, lambda: freshness(dest, now=now or datetime.now(UTC)))
+
+
+def prod_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Where production vigild runs from: $VIGIL_PROD_DIR, else ~/vigil-prod."""
+    env = (os.environ if environ is None else environ).get("VIGIL_PROD_DIR")
+    return Path(env).expanduser() if env else Path.home() / "vigil-prod"
+
+
+def prod_checkout_check(prod: Path, plist: Path, data_dir: Path) -> Check:
+    """Production runs from a clean checkout of `prod` at the SHA the deploy script
+    last recorded (`<data_dir>/deployed_sha`), and the vigild plist's
+    WorkingDirectory is that checkout (#189). Paths and verdicts only."""
+    from vigild.gitsafe import git
+
+    name = "prod checkout"
+    switch = "see runbook: Switch production to ~/vigil-prod"
+    try:
+        wd = plistlib.loads(plist.read_bytes()).get("WorkingDirectory")
+    except FileNotFoundError:
+        return Check(name, False, f"vigild plist not installed; {switch}")
+    except Exception as e:  # the kind only, never the content
+        return Check(name, False, f"vigild plist unreadable ({type(e).__name__})")
+    if not isinstance(wd, str) or Path(wd).expanduser() != prod:
+        return Check(name, False, f"production runs from {wd}, not {prod}; {switch}")
+    if not prod.is_dir():
+        return Check(name, False, f"{prod} does not exist; {switch}")
+    if not (prod / ".git").exists():
+        return Check(name, False, f"{prod} is not a git checkout; {switch}")
+    try:
+        if git(prod, "status", "--porcelain", "--untracked-files=all"):
+            return Check(name, False, f"{prod} has uncommitted or untracked changes")
+        head = git(prod, "rev-parse", "HEAD")
+    except Exception as e:  # GitError, timeout: the kind only
+        return Check(name, False, f"git failed in {prod} ({type(e).__name__})")
+    try:
+        deployed = (data_dir / "deployed_sha").read_text().strip()
+    except OSError:
+        return Check(name, False, "no deployed_sha recorded; the deploy script writes it")
+    if head != deployed:
+        return Check(
+            name, False, f"HEAD {head[:12]} is not the deployed SHA {deployed[:12]}; redeploy"
+        )
+    return Check(name, True, head[:12])
 
 
 def unowned_containers_check(docker: Any, recorded: set[str]) -> Check:
@@ -486,6 +530,7 @@ def run_checks(
                 out += _freshness(fresh, repo)
     out.append(_experiment_line(cfg))
     out.append(backup_freshness_check())
+    out.append(prod_checkout_check(prod_dir(), VIGILD_PLIST, cfg.vigild.data_path))
     return out
 
 
