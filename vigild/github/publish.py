@@ -226,5 +226,8 @@ def publish(
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
     if existing:
-        return existing
-    return pulls.create_pull(repo, head=branch, base=base, title=title, body=body, draft=True)
+        return existing  # the open PR's title and body are never rewritten here
+    # the one redactor, for every caller: the title and body carry coord and worker text
+    return pulls.create_pull(
+        repo, head=branch, base=base, title=redact(title), body=redact(body), draft=True
+    )

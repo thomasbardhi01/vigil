@@ -1969,3 +1969,37 @@ def test_a_failed_end_of_session_settle_fails_closed(world: World) -> None:
     )
     assert booked and all(b["l"] == pytest.approx(b["a"]) and b["a"] > 0 for b in booked)
     assert not w.store.q("SELECT 1 FROM sessions WHERE status='done'")
+
+
+def test_a_secret_in_a_worker_report_or_a_goal_never_reaches_the_published_pr(
+    world: World,
+) -> None:
+    """End to end through the runner's own body and title builders (#234)."""
+    w = world
+    sk, ghs, vgw = "sk-" + "A1b2C3d4E5f6", "ghs_" + "A1b2C3d4E5f6", "vgw_" + "A1b2C3d4E5f6"
+    pem = (
+        "-----BEGIN " + "PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0B\n-----END " + "PRIVATE KEY-----"
+    )
+    w.standin.coord_drafts = [lambda j: (SPEC, plan(j).replace("feature map row", f"row {sk}"))]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        d = spec.clone / ".vigil" / spec.job_id / spec.task_id  # type: ignore[operator]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "worker_report.json").write_text(json.dumps({
+            "task_id": spec.task_id, "job_id": spec.job_id, "test_before": "fail",
+            "test_after": "pass", "files_changed": task["spec"]["files_in_scope"],
+            "summary": f"log said {sk} and {ghs}",
+            "self_check": {"test_failed_first": True, "outside_scope": [],
+                           "not_done": f"{vgw}", "reviewer_would_flag": pem,
+                           "could_delete": "nothing"},
+            "open_questions": [], "provenance": "claude"}))  # fmt: skip
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.publisher.prs
+    for pr in w.publisher.prs:
+        for out in (pr["title"], pr["body"]):
+            assert "A1b2C3d4E5f6" not in out and "MIIEvQ" not in out and "PRIVATE KEY" not in out
+    pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
+    assert "[redacted]" in pr["title"] and pr["body"].count("[redacted]") >= 4

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from vigild.gitsafe import GitError, git, git_bytes
+from vigild.redact import redact
 from vigild.repos import is_bench_repo
 from vigild.safefile import UnsafeFile, safe_read_bytes
 
@@ -740,20 +741,40 @@ class Workspace:
             raise WorkspaceError("bad sha")
         self._git(self.vault(repo), "update-ref", self._pub_ref(branch), sha)
 
+    def _history_is_clean(self, vault: Path, base_sha: str, head: str) -> bool:
+        """Whether every commit message from the base to `head` is unchanged by `redact`:
+        a head passed through as-is publishes its whole history (review of #249)."""
+        try:
+            messages = git(vault, "log", "-z", "--format=%B", f"{base_sha}..{head}", raw=True)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        return all(redact(m) == m for m in messages.split("\0"))
+
     def public_commit(self, repo: str, head: str, base_sha: str, branch: str) -> str:
         """The commit to send for the vault's `head`: `head` itself when its
         top-level `.vigil` is the base's and nothing went to `branch` before;
         otherwise a commit of the same tree with that entry replaced by the base's
         (removed if the base has none), on the last commit sent to `branch` (or the
         base), so the branch only moves forward and never carries the job's
-        artifacts. It keeps the head commit's author, committer, dates and message,
+        artifacts. It keeps the head commit's author, committer and dates, and its message
+        with secrets redacted (a head whose message needed that is rebuilt on the base too),
         so the same inputs give the same commit. The vault keeps `head` whole."""
         if not (SHA.match(head) and SHA.match(base_sha)):
             raise WorkspaceError("bad sha")
         vault = self.vault(repo)
         prev = self.published_sha(repo, branch)
-        if prev is None and not self.has_vigil(repo, head, base_sha):
-            return head
+        try:
+            raw_message = git(vault, "log", "-1", "--format=%B", head, raw=True)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        message = redact(raw_message)  # the one redactor; deterministic, so a retry is the same
+        if (
+            prev is None
+            and message == raw_message
+            and self._history_is_clean(vault, base_sha, head)
+            and not self.has_vigil(repo, head, base_sha)
+        ):
+            return head  # passed through with its history, so every message in it must be clean
         entries = [
             e
             for e in self._git(vault, "ls-tree", "-z", head).split("\0")
@@ -782,7 +803,6 @@ class Workspace:
             meta, strict=True,
         ))  # fmt: skip
         try:
-            message = git(vault, "log", "-1", "--format=%B", head, raw=True)
             return git(vault, "commit-tree", tree, "-p", parent, stdin=message, env=env)
         except GitError as e:
             raise WorkspaceError(str(e)) from e

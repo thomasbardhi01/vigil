@@ -31,7 +31,7 @@ class FakePulls:
         if self.refuse_draft:
             raise PublishError("422: Draft pull requests are not supported in this repository.")
         git(self.bare, "rev-parse", "--verify", f"refs/heads/{head}")  # GitHub checks too
-        self.prs.append({"head": head, "base": base, "draft": draft})
+        self.prs.append({"head": head, "base": base, "draft": draft, "title": title, "body": body})
         return f"https://github.com/{repo}/pull/{len(self.prs)}"
 
 
@@ -355,3 +355,95 @@ def test_a_non_fast_forward_is_refused_and_nothing_is_pushed(
     assert BRANCH in str(raised.value) and "forced" in str(raised.value)
     assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == outside
     assert pulls.prs == []
+
+
+# fake token shapes, assembled so no whole one sits in the source
+SECRETS = {
+    "sk": "sk-" + "A1b2C3d4E5f6",
+    "ghs": "ghs_" + "A1b2C3d4E5f6",
+    "vgw": "vgw_" + "A1b2C3d4E5f6",
+    "pem": "-----BEGIN "
+    + "PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0B\n-----END "
+    + "PRIVATE KEY-----",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(SECRETS))
+def test_publish_redacts_the_title_and_body_whatever_the_caller_built(
+    setup: tuple[Workspace, str, str, Path], kind: str
+) -> None:
+    ws, base, head, bare = setup
+    pulls = FakePulls(bare)
+    publish(
+        ws,
+        repo=REPO,
+        head=head,
+        base_sha=base,
+        branch=BRANCH,
+        base="main",
+        title=f"[vigil x] fix {SECRETS[kind]} leak",
+        body=f"summary quoting {SECRETS[kind]} from a log\n\nOpened by vigild",
+        pulls=pulls,
+        scope=["docs/feature-map.md"],
+    )
+    (pr,) = pulls.prs
+    assert "[redacted]" in pr["title"] and "[redacted]" in pr["body"]
+    for out in (pr["title"], pr["body"]):
+        assert "A1b2C3d4E5f6" not in out and "MIIEvQ" not in out and "PRIVATE KEY" not in out
+    assert pr["body"].endswith("\n\nOpened by vigild")
+
+
+def test_an_ordinary_title_and_body_are_published_unchanged(
+    setup: tuple[Workspace, str, str, Path],
+) -> None:
+    ws, base, head, bare = setup
+    pulls = FakePulls(bare)
+    title, body = "[vigil x] add a row", "Closes #3\n\nTest: `pytest -q` fail → pass."
+    publish(
+        ws, repo=REPO, head=head, base_sha=base, branch=BRANCH, base="main",
+        title=title, body=body, pulls=pulls, scope=["docs/feature-map.md"],
+    )  # fmt: skip
+    assert (pulls.prs[0]["title"], pulls.prs[0]["body"]) == (title, body)
+
+
+def test_the_public_commit_message_is_redacted_and_deterministic(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
+    git(clone, "add", "-A")
+    msg = f"quote {SECRETS['sk']}\n\n{SECRETS['pem']}\n\nend"
+    git(clone, "-c", "user.name=w", "-c", "user.email=w@x", "commit", "-q", "-m", msg)
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    a = ws.public_commit(REPO, head, base, BRANCH)
+    b = ws.public_commit(REPO, head, base, BRANCH)
+    assert a == b
+    shown = git(ws.vault(REPO), "log", "-1", "--format=%B", a)
+    assert "[redacted]" in shown and "A1b2C3d4E5f6" not in shown and "MIIEvQ" not in shown
+    assert shown.rstrip().endswith("end")
+
+
+def test_an_earlier_commit_message_with_a_secret_is_never_published(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """Review of #249: a branch whose head message is clean but an EARLIER commit's
+    message holds a key must not be passed through with its history; every message
+    sent to GitHub is redacted."""
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    who = ("-c", "user.name=w", "-c", "user.email=w@x")
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nfirst\n")
+    git(clone, "add", "-A")
+    git(clone, *who, "commit", "-q", "-m", f"wip {SECRETS['sk']}")
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nsecond\n")
+    git(clone, "add", "-A")
+    git(clone, *who, "commit", "-q", "-m", "clean message")
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    sent = ws.public_commit(REPO, head, base, BRANCH)
+    history = git(ws.vault(REPO), "log", "--format=%B", f"{base}..{sent}")
+    assert "A1b2C3d4E5f6" not in history
