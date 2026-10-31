@@ -591,6 +591,9 @@ your Max plan and aren't counted.
     `migration` labels only, never on a path in scope (#61); rules 4 and 6 read
     `Task.has_existing_tests`, which `JobRunner._task` sets at task build from the
     base mirror (an in-scope test file, or a related `tests/test_<stem>*.py`), never None;
+  - `_task` also sets `Task.labels`: a plan worker with no `labels` key inherits the
+    job's labels from vigild's own `intake.json`, so rule 6 sees them (#179); an
+    explicit list, even `[]`, is the worker's own;
   - the private-repo rule (Q2);
   - the decider with Haiku through the gateway, and Jev on fixtures.
 - **Gateway, budgets, metering (P1):**
