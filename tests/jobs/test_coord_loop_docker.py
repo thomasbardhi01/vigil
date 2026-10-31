@@ -93,6 +93,8 @@ def live(
         return mods
 
     sessions = SessionImages(images, claude_mods)
+    # build it under image_prefix(data_dir, 'session')/fixture:<key>; resolve never builds
+    sessions.ensure_fresh(REPO, ws.head_sha(REPO, "main"))
     publisher = BarePublisher(ws)
     runner = JobRunner(
         cfg,
