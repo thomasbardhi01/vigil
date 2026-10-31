@@ -427,14 +427,15 @@ def test_exclusive_create_refuses_a_symlink_that_appears_after_the_precheck(
 ) -> None:
     dest = tmp_path / "dest"
     target = tmp_path / "planted"
-    real = backup._copy_vault
+    real = backup._copy_tree
 
     def plant(*a: object, **k: object) -> list[str]:
         out = real(*a, **k)  # type: ignore[arg-type]
-        (dest / "vigil-20261027T030000Z.marker").symlink_to(target)  # the race
+        if a[1].name == "vault":  # type: ignore[attr-defined]
+            (dest / "vigil-20261027T030000Z.marker").symlink_to(target)  # the race
         return out
 
-    monkeypatch.setattr(backup, "_copy_vault", plant)
+    monkeypatch.setattr(backup, "_copy_tree", plant)
     with pytest.raises(FileExistsError):
         backup.run_backup(data, dest, now=NOW)
     assert not target.exists()
