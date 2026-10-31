@@ -80,7 +80,8 @@ def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route
 def min_cap_problem(cfg: Config, task_id: str, preset: str, cap: float) -> str | None:
     """The one check of a preset's minimum task cap (#79), for the spec gate and for
     dispatch: why a task on `preset` capped at `cap` can't run, or None."""
-    floor = cfg.preset(preset).min_task_usd
+    found = cfg.backends.presets.get(preset)  # a deps task is routed to no preset
+    floor = found.min_task_usd if found else None
     if floor is None or cap >= floor:
         return None
     return (
