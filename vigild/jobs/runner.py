@@ -149,7 +149,14 @@ from vigild.review.replay import (
     resolve_prompt,
     run_set,
 )
-from vigild.router.rules import CoordShape, RoutingError, request_paths, route, route_coord
+from vigild.router.rules import (
+    CoordShape,
+    RoutingError,
+    min_cap_problem,
+    request_paths,
+    route,
+    route_coord,
+)
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
@@ -1106,6 +1113,35 @@ class JobRunner:
              "max_cost_usd, or abandon"},
             resumable=True,
         )  # fmt: skip
+
+    def _under_minimum(self, job_id: str, batch: list[str]) -> bool:
+        """A job approved before a preset had a minimum task cap (#79) may hold a task
+        under it: none of the batch starts, and the job pages once, resumable, to replan
+        or abandon. The same `min_cap_problem` as the spec gate."""
+        found: list[dict[str, Any]] = []
+        for tid in batch:
+            t = self.store.get_task(tid)
+            preset = t.backend_preset or self.cfg.routing.fallback
+            cap = float(t.contract["limits"]["max_cost_usd"])
+            if min_cap_problem(self.cfg, tid, preset, cap):
+                found.append({
+                    "task": tid, "preset": preset, "cap_usd": cap,
+                    "min_task_usd": self.cfg.preset(preset).min_task_usd,
+                })  # fmt: skip
+        if not found:
+            return False
+        self._block(job_id, f"min_task_cap: {found[0]['task']}")
+        self._page(
+            job_id, f"{job_id}: {found[0]['task']} is capped under its preset's minimum",
+            {"kind": "min_task_cap", "tasks": found,
+             "error": "; ".join(
+                 f"{f['task']} on {f['preset']} is capped at ${f['cap_usd']:.2f}, "
+                 f"under the minimum ${f['min_task_usd']:.2f}" for f in found),
+             "actions": ["replan", "abandon"],
+             "next": "replan with max_cost_usd at or above the minimum, or abandon"},
+            resumable=True,
+        )  # fmt: skip
+        return True
 
     def _bench_failure(self, job_id: str, tag: str, **evidence: Any) -> None:
         """A bench run's failure tag, with its evidence (slice 2 puts it in
@@ -2412,6 +2448,30 @@ class JobRunner:
             runner_file_change=self._plan_runner_files(job_id, repo, w),
         )
 
+    def plan_min_cap(
+        self, repo: str, base: str, job_id: str | None, w: WorkerContract
+    ) -> str | None:
+        """The spec gate's check of a plan entry against its preset's minimum task cap
+        (#79): the preset is `route()`'s pick, the check is `min_cap_problem`, the same
+        two the plan stage and dispatch use. A task the router refuses is its own error."""
+        cap = min(w.max_cost_usd or self.cfg.budgets.per_task_usd, self.cfg.budgets.per_task_usd)
+        task = Task(
+            task_id=w.task_id, repo=repo, base=base, why=w.why, value=w.value, risk=w.risk,
+            spec=Spec(
+                goal=w.goal, test_cmd=w.test_cmd, done_when=w.done_when,
+                files_in_scope=w.files_in_scope,
+            ),
+            labels=w.labels if "labels" in w.model_fields_set or not job_id
+            else self._job_labels(job_id),
+            size=w.size,
+            has_existing_tests=self._has_existing_tests(repo, base, w.files_in_scope),
+        )  # fmt: skip
+        try:
+            preset = route(task, self.cfg).preset
+        except RoutingError:
+            return None  # plan time reports it
+        return min_cap_problem(self.cfg, w.task_id, preset, cap)
+
     def _plan_runner_files(self, job_id: str, repo: str, w: WorkerContract) -> list[str]:
         """The task's runner files, counting the approved spec's AC commands (#142)."""
         art = self.store.get_artifact(job_id, "spec.md")
@@ -2503,6 +2563,8 @@ class JobRunner:
 
         def launch(batch: list[str]) -> dict[str, Callable[[], bool]] | None:
             if self._refused_by_visibility(job):
+                return None
+            if self._under_minimum(job_id, batch):
                 return None
             for tid in batch:
                 # the WIP breaker holds only work that would open a new PR: a

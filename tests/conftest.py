@@ -53,6 +53,9 @@ class RecordingRunner:
     def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]:
         return lambda path: None
 
+    def plan_min_cap(self, repo: str, base: str, job_id: str | None, w: Any) -> str | None:
+        return None
+
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         self.created.append(job_id)
 

@@ -4,7 +4,9 @@
 # ~/.config/vigil/env, never a value. `locality` decides the private-repo
 # rule. `live: false` marks a preset whose phase hasn't shipped.
 presets:
-  claude-sonnet: {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-sonnet-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
+  # min_task_usd: set by the owner on 2026-10-31 (#79): a Sonnet worker with a 40-50k-token
+  # context needs $0.15-0.30 of gateway headroom per call, so a task capped under $0.60 is refused.
+  claude-sonnet: {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-sonnet-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic, min_task_usd: 0.60}
   claude-opus:   {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-opus-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
   claude-haiku:  {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-haiku-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
   tower-qwen:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: qwen3.6-35b-a3b, key_ref: TOWER_API_KEY, locality: local, provider: tower}  # llama-server b11739, live 2026-10-28

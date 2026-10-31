@@ -23,7 +23,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from vigild.config import Config, ConfigError
-from vigild.contract.models import BenchInfo, Score, Source, Task
+from vigild.contract.models import BenchInfo, Score, Source, Task, WorkerContract
 from vigild.db import Store
 from vigild.devimage import missing_tools
 from vigild.gateway.firstcall import refusals as first_call_refusals
@@ -54,6 +54,9 @@ class Runner(Protocol):
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
     def base_reader(self, repo: str, base: str) -> Callable[[str], str | None]: ...
+    def plan_min_cap(
+        self, repo: str, base: str, job_id: str | None, w: WorkerContract
+    ) -> str | None: ...
     def owner_republish(self, job_id: str, task_id: str, item_id: int) -> None: ...
     def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
     def fix_check(self, job_id: str, task_id: str) -> str | None: ...
@@ -277,6 +280,8 @@ class JobService:
             is_dir=is_dir or (self.dirs(repo, base) if self.dirs is not None else None),
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
+            # a task's preset is the router's pick, as at plan time (#79)
+            min_cap=lambda w: self.runner.plan_min_cap(repo, base, job_id, w),
         )
 
     def gate_drafts(
