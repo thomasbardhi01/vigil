@@ -38,3 +38,13 @@ def test_the_session_tag_follows_the_same_prefix(cfg: Config, tmp_path: Path) ->
     h = hashlib.sha256(str((tmp_path / "scratch").resolve()).encode()).hexdigest()[:8]
     tag = SessionImages(dev, lambda: tmp_path).tag("o/fixture", KEY)
     assert tag == f"vigil-session-{h}/fixture:{'a' * 16}"
+
+
+def test_the_fixture_session_tag_is_the_session_prefix_slash_fixture_key(
+    cfg: Config, tmp_path: Path
+) -> None:
+    dev = _dev(cfg, tmp_path / "scratch")
+    prefix = image_prefix(cfg.vigild.data_path, "session")
+    assert (
+        SessionImages(dev, lambda: tmp_path).tag("o/fixture", KEY) == f"{prefix}/fixture:{KEY[:16]}"
+    )
