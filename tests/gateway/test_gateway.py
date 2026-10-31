@@ -1229,3 +1229,59 @@ def test_a_transport_error_writes_the_event(
     with pytest.raises(httpx2.ConnectError):
         client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
     assert _events(store, sid) == [{"transport": "ConnectError"}]
+
+
+# --- overlap is not a sick backend (owner, 2026-10-31) -----------------------------------
+
+_OVERFLOW = {"error": {"type": "server_error", "message": "the request exceeds the context size"}}
+
+
+def test_a_context_overflow_500_does_not_count_toward_backend_errors(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    from vigild.breakers import Breakers
+
+    gw.breakers = Breakers(store, cfg)
+    _, tok = _session(store, budget, gw)
+    upstream.status = 500
+    upstream.error_body = _OVERFLOW
+    for _ in range(cfg.vigild.breakers.backend_errors + 2):
+        assert (
+            client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 500
+        )
+    assert gw.breakers.open_breakers() == []
+    events = [e for e in store.events() if e.type == "upstream_error"]
+    assert events and all(e.data["context"] is True for e in events)  # still recorded
+
+
+def test_plain_500s_in_a_row_still_trip_backend_errors(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    from vigild.breakers import Breakers
+
+    gw.breakers = Breakers(store, cfg)
+    _, tok = _session(store, budget, gw)
+    upstream.status = 500
+    upstream.error_body = {"error": {"type": "server_error", "message": "boom"}}
+    for _ in range(cfg.vigild.breakers.backend_errors):
+        client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert len(gw.breakers.open_breakers()) == 1
+
+
+def test_an_overflow_between_plain_500s_neither_trips_nor_resets_the_run(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config,
+) -> None:  # fmt: skip
+    from vigild.breakers import Breakers
+
+    gw.breakers = Breakers(store, cfg)
+    _, tok = _session(store, budget, gw)
+    upstream.status = 500
+    plain = {"error": {"type": "server_error", "message": "boom"}}
+    bodies = [plain, _OVERFLOW, plain, _OVERFLOW, plain]  # three plain ones, two overflows
+    for body in bodies:
+        upstream.error_body = body
+        client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert len(gw.breakers.open_breakers()) == 1

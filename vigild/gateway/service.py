@@ -843,8 +843,23 @@ class Gateway:
             self.release(hold)
             self._release_probe(hold.probe)  # the call never reached upstream
             raise
-        self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}", gs.session_id)
         ctype = resp.headers.get("content-type", "")
+        if resp.status_code >= 500 and "text/event-stream" not in ctype:
+            # a 500 that says the prompt outgrew its slot's context is the session's
+            # own cause, not the backend's health: it neither counts toward the breaker
+            # nor ends a run of failures (owner, 2026-10-31)
+            try:
+                own = bool(self._http_failure(resp.status_code, await resp.aread())["context"])
+            except Exception:
+                own = False
+            if own:
+                self._release_probe(hold.probe)
+            else:
+                self._upstream(gs.preset, False, f"HTTP {resp.status_code}", gs.session_id)
+        else:
+            self._upstream(
+                gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}", gs.session_id
+            )
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:
             data = await resp.aread()
