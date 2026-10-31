@@ -1041,6 +1041,32 @@ def test_a_failing_event_write_never_breaks_the_call(
         client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
 
 
+@pytest.mark.parametrize("body", [b"[" * 4000, b'{"error":' * 1500])
+def test_a_deeply_nested_error_body_never_breaks_the_summary(body: bytes) -> None:
+    """Round-2 review of #209: json.loads on a nested body raises RecursionError."""
+    out = Gateway._http_failure(503, body)
+    assert out["status"] == 503 and "type" not in out and "code" not in out
+
+
+def test_a_failing_error_summary_never_changes_the_status(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid, tok = _session(store, budget, gw)
+
+    def boom(status: int, body: bytes) -> dict[str, Any]:
+        raise RuntimeError("summary failed")
+
+    monkeypatch.setattr(Gateway, "_http_failure", staticmethod(boom))
+    upstream.status = 503
+    assert client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok}).status_code == 503
+    assert _events(store, sid) == [{"status": 503, "context": False, "model": False}]
+
+
 def test_a_transport_error_writes_the_event(
     client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
 ) -> None:

@@ -848,7 +848,11 @@ class Gateway:
             data = await resp.aread()
             await resp.aclose()
             if resp.status_code != 200:
-                self._upstream_error(gs, self._http_failure(resp.status_code, data))
+                try:
+                    failure = self._http_failure(resp.status_code, data)
+                except Exception:  # the summary never changes the status
+                    failure = {"status": resp.status_code, "context": False, "model": False}
+                self._upstream_error(gs, failure)
             if resp.status_code == 200:
                 try:
                     payload = json.loads(data)
