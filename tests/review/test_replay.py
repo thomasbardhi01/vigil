@@ -358,7 +358,7 @@ def _legacy_reviewer_packet(w: World, job_id: str, task_id: str, head: str) -> s
     runner = w.runner
     job, t = w.store.get_job(job_id), w.store.get_task(task_id)
     base_sha = runner.workspace.base_sha(t.id)
-    diff = runner.workspace.full_diff(job.repo, base_sha, head)
+    diff = runner.workspace.published_diff(job.repo, base_sha, head)
     tests = w.store.get_artifact(job.id, "tests.json", t.id)
     spec_md = w.store.get_artifact(job.id, "spec.md")
     report = w.store.get_artifact(job.id, "worker_report.json", t.id)

@@ -189,8 +189,18 @@ CONTEXT_WORDS = ("context size", "context length", "context window", "context_ov
 
 
 class GatewayError(Exception):
-    def __init__(self, status: int, kind: str, message: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        kind: str,
+        message: str,
+        *,
+        reason: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
+        self.reason = reason or message  # what the refusal event records
+        self.extra = extra or {}
         self.status = status
         self.kind = kind
         self.message = message
@@ -669,10 +679,36 @@ class Gateway:
                     out[k] = str(redact(str(v)))[:64]
         return out
 
+    def _is_hosted_model(self, model: str) -> bool:
+        return self.prices.has(model) or any(
+            p.locality == "hosted" and p.model == model for p in self.cfg.backends.presets.values()
+        )
+
+    def _check_locality(self, gs: GatewaySession, preset: Preset, model: object) -> None:
+        """A session on a `locality: local` preset makes no hosted call (#197).
+        Locality is the session's own preset in `configs/backends.yaml`, read here,
+        never from the request; the refusal precedes any hold, so nothing is metered."""
+        if preset.locality != "local" or not isinstance(model, str) or not model:
+            return
+        if not self._is_hosted_model(model) or model == preset.model:
+            return
+        msg = (
+            f"{model} is a hosted model; a session on the local preset {gs.preset} may not call it"
+        )
+        raise GatewayError(
+            403,
+            "permission_error",
+            msg,
+            reason="hosted_model_for_local_session",
+            extra={"model": model, "preset": gs.preset},
+        )
+
     def _refuse(self, gs: GatewaySession, err: GatewayError) -> GatewayError:
         self.store.add_event(
             "gateway_refused",
-            redact({"status": err.status, "reason": err.message}),
+            redact(
+                {"status": err.status, "reason": err.reason, "message": err.message, **err.extra}
+            ),
             Provenance.HUMAN,
             job_id=gs.job_id,
             session_id=gs.session_id,
@@ -694,6 +730,7 @@ class Gateway:
             if not isinstance(body, dict):
                 raise GatewayError(400, "invalid_request_error", "body must be an object")
             self._check_body(body, headers or {})
+            self._check_locality(gs, preset, body.get("model"))
             model = self._check_model(gs.repo, preset, body.get("model"), gs.model or None)
             amount = 0.0
             if path in METERED_PATHS:

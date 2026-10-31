@@ -440,11 +440,14 @@ def stop_hook_event(name: str, subtype: str, data: dict[str, Any]) -> dict[str, 
 def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
     """The SDK's options for this session, as keyword arguments (pure, so
     tested without the SDK)."""
+    # a local preset: vigild sets the local model here so the CLI's own small-model
+    # calls never reach a hosted one (#197)
+    small = os.environ.get("VIGIL_SMALL_FAST_MODEL") or "claude-haiku-5-5"
     child_env = {
         "ANTHROPIC_BASE_URL": os.environ["VIGIL_GATEWAY_URL"],
         "ANTHROPIC_AUTH_TOKEN": token,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
-        "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": small,
+        "ANTHROPIC_SMALL_FAST_MODEL": small,
     }
     if os.environ.get("VIGIL_MAX_OUTPUT_TOKENS", "").isdigit():
         # each call's output cap: the gateway holds a call's worst case against the reservation

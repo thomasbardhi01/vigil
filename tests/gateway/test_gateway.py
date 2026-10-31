@@ -981,6 +981,160 @@ def test_every_upstream_url_is_built_one_way_for_each_kind(cfg: Config) -> None:
     assert Gateway._upstream_url(sonnet, "/v1/messages") == "https://api.anthropic.com/v1/messages"
 
 
+def _local_session(
+    cfg: Config, store: Store, budget: Budget, gw: Gateway, preset: str = "tower-qwen"
+) -> tuple[str, str]:
+    cfg.repos.repos[PA].backends.append(preset)
+    return _session(store, budget, gw, preset=preset)
+
+
+def _gateway_events(store: Store, sid: str) -> list[Any]:
+    return [e for e in store.events(session_id=sid) if e.type == "gateway_refused"]
+
+
+def test_a_local_sessions_hosted_call_is_refused_and_nothing_is_metered(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    """#197: the CLI's own side calls must not reach a hosted model from a local session."""
+    sid, tok = _local_session(cfg, store, budget, gw)
+    before = store.q("SELECT * FROM reservations")
+    for model in ("claude-sonnet-5-5", "claude-haiku-5-5"):
+        r = client.post("/v1/messages", json=_msg(model=model), headers={"x-api-key": tok})
+        assert r.status_code == 403 and "hosted" in r.text
+        (ev,) = _gateway_events(store, sid)[-1:]
+        data = ev.data if isinstance(ev.data, dict) else json.loads(ev.data)
+        assert data["reason"] == "hosted_model_for_local_session"
+        assert (data["model"], data["preset"]) == (model, "tower-qwen")
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    assert store.q("SELECT * FROM reservations") == before
+
+
+def test_a_local_sessions_local_call_still_works_at_zero(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    sid, tok = _local_session(cfg, store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(model="qwen3.6-35b-a3b"), headers={"x-api-key": tok})
+    assert r.status_code == 200 and len(upstream.requests) == 1
+    (row,) = store.q("SELECT * FROM model_calls")
+    assert (row["session_id"], row["cost_usd"]) == (sid, 0)
+    assert _gateway_events(store, sid) == []
+
+
+def test_a_hosted_sessions_hosted_call_is_unchanged(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    sid, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert r.status_code == 200 and len(upstream.requests) == 1
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 1
+    assert _gateway_events(store, sid) == []
+
+
+def test_a_request_cannot_override_the_sessions_locality(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    # Admit a hosted, priced model in the tower provider's allowlist, so only
+    # _check_locality (not _check_model) can refuse it.
+    cfg.backends.presets["tower-fast"].model = "claude-sonnet-5-5"
+    sid, tok = _local_session(cfg, store, budget, gw)
+    cfg.repos.repos[PA].backends.append("tower-fast")
+    r = client.post(
+        "/v1/messages",
+        json=_msg(locality="hosted", metadata={"locality": "hosted", "user_id": "x"}),
+        headers={
+            "x-api-key": tok,
+            "x-vigil-locality": "hosted",
+            "x-vigil-preset": "claude-sonnet",
+        },
+    )
+    assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    # Without the extra body field, the hosted model is admitted by the allowlist
+    # and only _check_locality refuses it.
+    r = client.post(
+        "/v1/messages",
+        json=_msg(),
+        headers={"x-api-key": tok, "x-vigil-locality": "hosted", "x-vigil-preset": "claude-sonnet"},
+    )
+    assert r.status_code == 403
+    data = _gateway_events(store, sid)[-1].data
+    data = data if isinstance(data, dict) else json.loads(data)
+    assert data["reason"] == "hosted_model_for_local_session"
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    _, tok2 = _session(store, budget, gw)  # a hosted session claiming local is still hosted
+    r = client.post(
+        "/v1/messages",
+        json=_msg(),
+        headers={"x-api-key": tok2, "x-vigil-locality": "local"},
+    )
+    assert r.status_code == 200 and len(upstream.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "model", ["Claude-Sonnet-5-5", "anthropic/claude-sonnet-5-5", "no-such-model-9"]
+)
+@pytest.mark.parametrize(
+    ("path", "extra"),
+    [("/v1/messages", {}), ("/v1/messages", {"stream": True}), ("/v1/messages/count_tokens", {})],
+)
+def test_a_local_session_refuses_odd_or_hosted_model_names_fail_closed(
+    client: TestClient,
+    cfg: Config,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    model: str,
+    path: str,
+    extra: dict[str, Any],
+) -> None:
+    """The backstop is `_check_model`'s per-provider allowlist: a case variant, a
+    prefixed or an unknown name is refused even where _check_locality can't tell."""
+    _, tok = _local_session(cfg, store, budget, gw)
+    before = [tuple(x) for x in store.q("SELECT * FROM reservations")]
+    r = client.post(path, json=_msg(model=model, **extra), headers={"x-api-key": tok})
+    assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+    assert [tuple(x) for x in store.q("SELECT * FROM reservations")] == before
+
+
+@pytest.mark.parametrize(
+    ("path", "extra"),
+    [("/v1/messages", {}), ("/v1/messages", {"stream": True}), ("/v1/messages/count_tokens", {})],
+)
+def test_a_local_session_calls_a_hosted_model_on_every_path_and_is_refused(
+    client: TestClient,
+    cfg: Config,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    path: str,
+    extra: dict[str, Any],
+) -> None:
+    _, tok = _local_session(cfg, store, budget, gw)
+    r = client.post(path, json=_msg(**extra), headers={"x-api-key": tok})
+    assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+
+
+def test_a_local_preset_with_no_model_refuses_every_call(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    cfg.backends.presets["tower-qwen"].model = None
+    _, tok = _local_session(cfg, store, budget, gw)
+    for model in ("claude-sonnet-5-5", "qwen3.6-35b-a3b"):
+        r = client.post("/v1/messages", json=_msg(model=model), headers={"x-api-key": tok})
+        assert r.status_code == 403
+    assert upstream.requests == []
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == 0
+
+
 def test_an_upstream_error_leaves_an_event_for_the_page_cause(
     client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
 ) -> None:

@@ -118,6 +118,18 @@ def backup_freshness_check(
     return _safe(name, lambda: freshness(dest, now=now or datetime.now(UTC)))
 
 
+def unowned_containers_check(docker: Any, recorded: set[str]) -> Check:
+    """`unowned containers (N)`: vigil-labelled objects no vigild claims (#166).
+    Fails naming them; kill and the startup reap never remove them."""
+    from vigild.executors.runtime import find_unowned
+
+    try:
+        found = find_unowned(docker, recorded)
+    except Exception as e:  # report the kind of failure, never a value
+        return Check("unowned containers", False, type(e).__name__)
+    return Check(f"unowned containers ({len(found)})", not found, " ".join(u.name for u in found))
+
+
 def stale_image_checks(dev: Any, sessions: Any, repo: str, tip: str) -> list[Check]:
     """Is the newest validated image the one main's tip needs? The key at `tip`,
     computed as `ensure_fresh` does, against the newest validated record; a
@@ -450,6 +462,7 @@ def run_checks(
         from vigild.db import Store
 
         store = Store.open(cfg.vigild.data_path / "vigil.db")
+        out.append(unowned_containers_check(docker, set(store.recorded_container_ids(""))))
         for repo in cfg.repos.repos:
 
             def last_build(r: str = repo) -> tuple[bool, str]:

@@ -230,6 +230,36 @@ def build_executors(cfg: Config, client: Any, store: Any) -> tuple[Any, Any, Any
     return hosts, HostExecutor(hosts), HostTestRunner(hosts)
 
 
+UNOWNED_TITLE = "unowned vigil containers left by the startup reap"
+
+
+def reap_and_page(local: Any, store: Any) -> int:
+    """The startup reap, then one open `unowned_containers` page for what it leaves:
+    kind, name and `dev.vigil.job` label of vigil-labelled objects no vigild claims
+    (#166). Nothing more is removed; a page already open is not repeated; a Docker
+    error while listing is logged and startup carries on."""
+    n = int(local.reap())
+    try:
+        found = local.unowned()
+    except Exception as e:
+        log.error("reap: could not list unowned containers: %s", type(e).__name__)
+        return n
+    log.info("reap: removed %d containers, %d unowned left", n, len(found))
+    if found and not any(i.kind == "unowned_containers" for i in store.list_inbox("open")):
+        store.create_inbox_item(
+            "questions",
+            "unowned_containers",
+            None,
+            UNOWNED_TITLE,
+            {
+                "kind": "unowned_containers",
+                "containers": [{"kind": u.kind, "name": u.name, "job": u.job} for u in found],
+                "actions": ["dismiss"],
+            },
+        )
+    return n
+
+
 def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
@@ -255,6 +285,9 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
     hosts, runtime, tests = build_executors(v.cfg, client, v.store)
     images = DevImages(v.cfg, v.store, DockerImages(client), ws, tests)
+    from vigild.executors.hosts import Placement
+
+    local = hosts.runtime(Placement(v.cfg.sandbox_hosts.local))
     gh = v.cfg.vigild.github
 
     def claude_mods() -> Path:
@@ -273,7 +306,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         v.telemetry,
         images,
         Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
-        reaper=runtime.reap,
+        reaper=lambda: reap_and_page(local, v.store),
         session_images=sessions,
         breakers=v.gateway.breakers,
         deps=DepsExecutor(

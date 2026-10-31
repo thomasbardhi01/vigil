@@ -179,6 +179,18 @@ def parallel_pairs(workers: list[WorkerContract]) -> list[tuple[WorkerContract, 
     ]
 
 
+_VIGIL = r"\.vigil(?![\w-]|\.\w)"  # the path itself, never `.vigil.py` or `.vigilrc`
+VIGIL_FORBIDDEN = re.compile(
+    rf"\b(no|not|never|without|zero|nothing|none|exclud\w*|free of|absent)\b[^.\n]*{_VIGIL}"
+    rf"|{_VIGIL}[^.\n]*\b(absent|excluded|forbidden|not (?:be )?(?:committed|present|included))",
+    re.I,
+)
+VIGIL_OWNED = (
+    "forbids `.vigil/` files, which vigild commits and strips at publish; the worker "
+    "can't satisfy that, so drop the clause"
+)
+
+
 def check_job_spec(
     spec: SpecDoc,
     plan: PlanDoc,
@@ -201,6 +213,9 @@ def check_job_spec(
     for entry in spec.files_in_scope:
         if err := entry_error(entry):
             errors.append(f"spec.md files in scope: {err}")
+    for c in spec.criteria:
+        if VIGIL_FORBIDDEN.search(c.statement):
+            errors.append(f"spec.md {c.ident} {VIGIL_OWNED}")
     for sec in SPEC_SECTIONS:
         if sec not in spec.sections:
             errors.append(f"spec.md is missing the '## {sec}' section")
@@ -228,6 +243,8 @@ def check_job_spec(
             "name every worker in a re-plan with a new task id, never an old one"
         )
     for w in plan.workers:
+        if VIGIL_FORBIDDEN.search(w.done_when):
+            errors.append(f"worker {w.task_id} done_when {VIGIL_OWNED}")
         if why := test_cmd_problem(w.test_cmd, read):
             errors.append(f"worker {w.task_id}: {why}")
         if not w.must_fail_first and not (w.must_fail_first_reason or "").strip():
