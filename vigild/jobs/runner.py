@@ -4683,7 +4683,7 @@ class JobRunner:
         """What a reviewer's (and an auditor's) packet is made of, for a task's head:
         the one place both a real review and a review replay (#47) get it, from
         vigild's own record and the vault. Nothing here reaches GitHub."""
-        diff = self.workspace.full_diff(job.repo, base_sha, head)
+        diff = self.workspace.published_diff(job.repo, base_sha, head)  # as published (#194)
         tests = self.store.get_artifact(job.id, "tests.json", t.id)
         spec_md = self.store.get_artifact(job.id, "spec.md")
         report = self.store.get_artifact(job.id, "worker_report.json", t.id)

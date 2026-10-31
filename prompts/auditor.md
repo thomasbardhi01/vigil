@@ -19,3 +19,4 @@ point cite `spec_section` plus the offending `diff_line`. Example finding:
 checked", "fix": "check it before the call", "matched": null, "evidence": {"kind":
 "diff_line", "ref": "vigild/a.py:40"}, "confidence": 0.9}`. vigild computes the match rate
 from your list. A missed high-severity finding is the most important thing you can report.
+`.vigil/` paths are vigild's own artifacts, stripped before publish; never a finding.
