@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from vigild.gateway.service import Gateway, GatewayError
 
@@ -35,7 +36,16 @@ def create_gateway_app(gw: Gateway) -> FastAPI:
         if isinstance(body, bytes):
             return Response(body, status_code=status, headers=out_headers)
         stream: AsyncIterator[bytes] = body
-        return StreamingResponse(stream, status_code=status, headers=out_headers)
+        # A client that leaves before the first chunk never starts the generator, so its
+        # `finally` never runs: the response's background task books the call and releases
+        # the hold (idempotent with the generator's own).
+        finish = getattr(body, "finish", None)
+        return StreamingResponse(
+            stream,
+            status_code=status,
+            headers=out_headers,
+            background=BackgroundTask(finish) if finish is not None else None,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, bool]:

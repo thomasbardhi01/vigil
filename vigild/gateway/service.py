@@ -28,7 +28,7 @@ import secrets
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -339,6 +339,31 @@ class Hold:
     plain: float | None = None  # the same hold priced as a miss (day, month, metering failure)
     premium: float = 0.0  # plain - amount: held against the day and the month (R23)
     fingerprint: tuple[str, int, int] | None = None  # this input: digest, messages, chars
+
+
+class HeldStream:
+    """A streamed response body whose call is booked and whose hold is released by
+    `finish`, however the stream ends: read to the end, closed part-way, or never read
+    (the client left before the first chunk; the response's background task calls
+    `finish`)."""
+
+    def __init__(self, gen: AsyncIterator[bytes], finish: Callable[[], Awaitable[None]]) -> None:
+        self._gen = gen
+        self.finish = finish
+
+    def __aiter__(self) -> HeldStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        return await self._gen.__anext__()
+
+    async def aclose(self) -> None:
+        close = getattr(self._gen, "aclose", None)
+        try:
+            if close is not None:
+                await close()
+        finally:
+            await self.finish()
 
 
 def _hash(token: str) -> str:
@@ -1314,6 +1339,33 @@ class Gateway:
         if "text/event-stream" in ctype and resp.status_code == 200:
             tap = SSEUsageTap()
 
+            finished = False
+
+            async def finish() -> None:
+                """Book the call, then let go of its hold (review round 2, N7). Once: the
+                generator's `finally`, `HeldStream.aclose` and the response's background task
+                all call it, whichever comes first, so a stream the client leaves before the
+                first chunk still releases its hold and premium."""
+                nonlocal finished
+                if finished:
+                    return
+                finished = True
+                try:
+                    await resp.aclose()
+                    self._record_or_fail_closed(
+                        hold,
+                        gs,
+                        preset_name=gs.preset,
+                        preset=preset,
+                        model=tap.model or body["model"],
+                        usage=tap.usage(),
+                        started=started,
+                        purpose="session",
+                        stop_reason=tap.stop_reason,
+                    )
+                finally:
+                    self.release(hold)
+
             async def gen() -> AsyncIterator[bytes]:
                 try:
                     async for (
@@ -1323,24 +1375,9 @@ class Gateway:
                         self._touch(gs.session_id)
                         yield chunk
                 finally:
-                    # book the call, then let go of its hold (review round 2, N7)
-                    try:
-                        await resp.aclose()
-                        self._record_or_fail_closed(
-                            hold,
-                            gs,
-                            preset_name=gs.preset,
-                            preset=preset,
-                            model=tap.model or body["model"],
-                            usage=tap.usage(),
-                            started=started,
-                            purpose="session",
-                            stop_reason=tap.stop_reason,
-                        )
-                    finally:
-                        self.release(hold)
+                    await finish()
 
-            return resp.status_code, out_headers, gen()
+            return resp.status_code, out_headers, HeldStream(gen(), finish)
         try:
             data = await resp.aread()
             await resp.aclose()

@@ -827,3 +827,78 @@ def test_the_count_has_one_total_deadline(
     assert time.monotonic() - t0 < 1.0
     (ev,) = [e for e in store.events() if e.type == "hold_estimate_fallback"]
     assert ev.data["reason"] == "timeout"
+
+
+# --- a stream the client leaves before reading a byte -------------------------------------
+
+
+async def _call_asgi(gw: Gateway, tok: str, body: dict[str, Any], *, disconnect: bool) -> None:
+    """Drive the gateway app directly: the request, then (if `disconnect`) the client
+    leaving before any response byte is read (`send` never completes)."""
+    from vigild.gateway.app import create_gateway_app
+
+    app = create_gateway_app(gw)
+    payload = json.dumps(body).encode()
+    sent_body = False
+    stuck = asyncio.Event()
+    got: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        if disconnect:
+            await asyncio.sleep(0.2)
+            return {"type": "http.disconnect"}
+        await stuck.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(msg: dict[str, Any]) -> None:
+        got.append(msg)
+        if disconnect:
+            await stuck.wait()  # the client is gone: nothing is read
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+        "path": "/v1/messages", "raw_path": b"/v1/messages", "query_string": b"",
+        "root_path": "", "scheme": "http", "server": ("test", 80), "client": ("c", 1),
+        "headers": [(b"x-api-key", tok.encode()), (b"content-type", b"application/json")],
+    }  # fmt: skip
+    await asyncio.wait_for(app(scope, receive, send), 5)
+
+
+def test_a_stream_the_client_leaves_before_reading_releases_its_hold_and_premium(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.stream = True
+    asyncio.run(_call_asgi(gw, tok, {**_second(), "stream": True}, disconnect=True))
+    assert sid not in gw._inflight and budget.premium_total() == 0
+
+
+def test_a_fully_read_stream_releases_exactly_once(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float], monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    sid, tok = _primed(client, store, budget, gw, upstream, clock)
+    upstream.stream = True
+    calls: list[float] = []
+    real = budget.release_premium
+
+    def counting(session_id: str, amount: float) -> None:
+        calls.append(amount)
+        real(session_id, amount)
+
+    monkeypatch.setattr(budget, "release_premium", counting)
+    rows_before = store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"]
+    r = client.post(
+        "/v1/messages",
+        content=json.dumps({**_second(), "stream": True}),
+        headers={"x-api-key": tok},
+    )
+    assert r.status_code == 200
+    assert len([c for c in calls if c > 0]) == 1  # the premium goes back once
+    assert store.q("SELECT COUNT(*) n FROM model_calls")[0]["n"] == rows_before + 1  # booked once
+    assert sid not in gw._inflight and budget.premium_total() == 0
