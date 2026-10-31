@@ -3,8 +3,8 @@ id: coord-06
 title: "Provenance of coord commits on a worker branch (#210)"
 date: 2026-10-31
 incident: "#210 (vi-0021)"
-prevented_by: ["#172"]
-gate: null
+prevented_by: ["#172", "#243"]
+gate: G1 (p3-09)
 status: open
 ---
 
@@ -24,4 +24,4 @@ output.
 commit's SHA, author and purpose before it's marked ready.
 
 **Prevented by.** #172: vigild rebases in the vault and re-verifies, so no
-non-worker commits. A vigild provenance route for job heads is not filed yet.
+non-worker commits. #243: vigild records provenance for a job head that carries non-worker commits.
