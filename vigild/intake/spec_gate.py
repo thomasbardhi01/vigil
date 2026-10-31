@@ -99,6 +99,38 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
     return None
 
 
+RUNNERS = {"pytest", "vitest"}
+VALUE_OPTS = {
+    "-p", "-c", "-n", "-o", "--maxfail", "--tb", "--rootdir", "--timeout", "-W", "--durations",
+    "--reporter", "--config", "-r",
+}  # fmt: skip
+SELECTORS = ("-k", "-m")
+
+
+def full_suite_run(cmd: str) -> bool:
+    """A pytest or vitest run with no path, node id, `-k` or `-m`: the whole suite."""
+    for c in parse(cmd).commands:
+        words = list(c.words)
+        for i, w in enumerate(words):
+            if w.rsplit("/", 1)[-1] not in RUNNERS:
+                continue
+            rest = words[i + 1 :]
+            if any(a in SELECTORS or a.startswith(("-k=", "-m=", "-k", "-m")) for a in rest):
+                continue
+            positional: list[str] = []
+            skip = False
+            for a in rest:
+                if skip:
+                    skip = False
+                elif a in VALUE_OPTS:
+                    skip = True
+                elif not a.startswith("-") and a != "run":
+                    positional.append(a)
+            if not positional:
+                return True
+    return False
+
+
 MFF_REASON_RULE = (
     "must_fail_first is false, so must_fail_first_reason is required: "
     'say why, for example "tests only, code unchanged"'
@@ -228,6 +260,12 @@ def check_job_spec(
             errors.append(f"spec.md {c.ident} has no test command (`test: \\`cmd\\``)")
         elif why := test_cmd_problem(c.test_cmd, read):
             errors.append(f"spec.md {c.ident}: {why}")
+        elif full_suite_run(c.test_cmd):
+            errors.append(
+                f"spec.md {c.ident}: `{c.test_cmd}` runs the full suite, which can't finish "
+                "inside the verifier's time cap; use a targeted command (a test path, node id, "
+                "`-k` or `-m`)"
+            )
 
     errors.extend(plan.errors)
     if not plan.workers and not plan.errors:

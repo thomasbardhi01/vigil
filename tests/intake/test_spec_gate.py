@@ -603,3 +603,29 @@ def test_kept_task_covers_its_acs() -> None:
     p = parse_plan(PLAN)
     errors = check_job_spec(spec, p, MONEY, kept_texts=["AC1 and AC2 hold"])
     assert not [e for e in errors if "named by no worker" in e], errors
+
+
+@pytest.mark.parametrize(
+    "cmd", ["pytest -q", "uv run pytest", "vitest run", "pnpm exec vitest run"]
+)
+def test_full_suite_ac_is_refused(cmd: str) -> None:
+    spec = SPEC.replace("`pytest -q tests/test_runbook.py`", f"`{cmd}`")
+    errors = check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
+    assert any("AC2" in e and "full suite" in e and "targeted" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pytest -q tests/test_runbook.py",
+        "pytest -q tests/test_a.py::test_b",
+        "pytest -q -k runbook",
+        "pytest -m unit",
+        "vitest run test/a.test.ts",
+        "uv run pytest -q -p no:cacheprovider tests/x.py",
+    ],
+)
+def test_targeted_ac_is_accepted(cmd: str) -> None:
+    spec = SPEC.replace("`pytest -q tests/test_runbook.py`", f"`{cmd}`")
+    errors = check_job_spec(parse_spec(spec), parse_plan(PLAN), MONEY)
+    assert not [e for e in errors if "full suite" in e], errors

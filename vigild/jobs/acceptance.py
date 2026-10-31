@@ -169,7 +169,9 @@ def ac_errors(tests: dict[str, Any]) -> list[str]:
     for run in tests.get("ac") or []:
         who = "/".join(run.get("acs") or []) or "AC"
         cmd = run.get("command")
-        if not run.get("selected") or not run.get("report"):
+        if run.get("outcome") == "timeout":
+            errors.append(f"{who}: `{cmd}` timed out (no report)")
+        elif not run.get("selected") or not run.get("report"):
             errors.append(f"{who}: `{cmd}` selected 0 tests")
         elif run.get("outcome") != "pass":
             errors.append(f"{who}: `{cmd}` did not pass (the verifier saw {run.get('outcome')})")
