@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from vigild.gitsafe import GitError, git, git_bytes
+from vigild.redact import redact
 from vigild.repos import is_bench_repo
 from vigild.safefile import UnsafeFile, safe_read_bytes
 
@@ -746,13 +747,19 @@ class Workspace:
         otherwise a commit of the same tree with that entry replaced by the base's
         (removed if the base has none), on the last commit sent to `branch` (or the
         base), so the branch only moves forward and never carries the job's
-        artifacts. It keeps the head commit's author, committer, dates and message,
+        artifacts. It keeps the head commit's author, committer and dates, and its message
+        with secrets redacted (a head whose message needed that is rebuilt on the base too),
         so the same inputs give the same commit. The vault keeps `head` whole."""
         if not (SHA.match(head) and SHA.match(base_sha)):
             raise WorkspaceError("bad sha")
         vault = self.vault(repo)
         prev = self.published_sha(repo, branch)
-        if prev is None and not self.has_vigil(repo, head, base_sha):
+        try:
+            raw_message = git(vault, "log", "-1", "--format=%B", head, raw=True)
+        except GitError as e:
+            raise WorkspaceError(str(e)) from e
+        message = redact(raw_message)  # the one redactor; deterministic, so a retry is the same
+        if prev is None and message == raw_message and not self.has_vigil(repo, head, base_sha):
             return head
         entries = [
             e
@@ -782,7 +789,6 @@ class Workspace:
             meta, strict=True,
         ))  # fmt: skip
         try:
-            message = git(vault, "log", "-1", "--format=%B", head, raw=True)
             return git(vault, "commit-tree", tree, "-p", parent, stdin=message, env=env)
         except GitError as e:
             raise WorkspaceError(str(e)) from e

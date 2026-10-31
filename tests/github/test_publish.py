@@ -404,3 +404,23 @@ def test_an_ordinary_title_and_body_are_published_unchanged(
         title=title, body=body, pulls=pulls, scope=["docs/feature-map.md"],
     )  # fmt: skip
     assert (pulls.prs[0]["title"], pulls.prs[0]["body"]) == (title, body)
+
+
+def test_the_public_commit_message_is_redacted_and_deterministic(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
+    git(clone, "add", "-A")
+    msg = f"quote {SECRETS['sk']}\n\n{SECRETS['pem']}\n\nend"
+    git(clone, "-c", "user.name=w", "-c", "user.email=w@x", "commit", "-q", "-m", msg)
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    a = ws.public_commit(REPO, head, base, BRANCH)
+    b = ws.public_commit(REPO, head, base, BRANCH)
+    assert a == b
+    shown = git(ws.vault(REPO), "log", "-1", "--format=%B", a)
+    assert "[redacted]" in shown and "A1b2C3d4E5f6" not in shown and "MIIEvQ" not in shown
+    assert shown.rstrip().endswith("end")
