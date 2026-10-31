@@ -12,7 +12,7 @@ Code comments and docstrings cite a decision here by its slug ID, as
 **Rule:** a PR that changes a flow shown here updates the diagram and the
 matching row in `docs/feature-map.md` in the same PR. CI enforces it:
 `scripts/check-docs-same-pr.py` fails a PR that touches a flow's files
-without touching this file.
+without touching this file or a decision row under `docs/decisions/arch/`.
 
 ## Where things run
 
@@ -115,6 +115,18 @@ never renumbered or reused; cite it as ``decision `sqlite-wal` ``.
 `scripts/check-feature-map.py` fails on a duplicate or malformed ID, on a new
 sequential `B<n>` ID, and on a cited slug that is no row here. History: the
 slugs replaced `B1`–`B55` (the mapping is in the PR that introduced them).
+
+Decision rows may also be one file each, `docs/decisions/arch/<slug>.md`
+(issue #96): front matter `id`, `choice`, `picked`, and the "Why" text as the
+body. Feature-map rows likewise live in `docs/features/<slug>.md`. The
+generated tables are never committed (two PRs that add rows would conflict on
+them): `scripts/gen-docs-tables.py [features|decisions]` renders them, sorted
+by ID, from the table rows still in the `.md` files plus the row files, via the
+one loader `vigild/docs_rows.py`. `scripts/check-feature-map.py` validates each
+row file and refuses a slug defined twice; `scripts/check-docs-same-pr.py`
+counts a change under `docs/decisions/arch/` as the architecture update (a
+`docs/features/` row alone does not: it says what a feature does, not how a
+flow works); the coord packet's feature-map index reads both.
 
 | ID | Choice | Picked | Why |
 |---|---|---|---|

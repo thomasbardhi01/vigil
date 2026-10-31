@@ -14,6 +14,15 @@ if the change moves a flow shown there. The owner's decisions are indexed in
   slug; `docs/architecture.md` has a sequential `B<n>` decision ID, or a
   doc cites a decision slug that isn't a decision row there.
 
+**Per-row files (issue #96).** A row may also live in its own file,
+`docs/features/<slug>.md`: front matter with the columns below (`id`,
+`feature`, `phase`, `entry_points`, `core_code`, `guardrails`, `tests`,
+`status`) and the "What it does" text as the body. Rows live there so two PRs
+never edit the same table; render the table with
+`uv run python scripts/gen-docs-tables.py features` (it is never committed).
+Rows still in the tables below and row files are both read, and one slug may
+not be in both. See `docs/features/docs-per-row.md`.
+
 **Columns.**
 - **ID**: a stable slug (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique in its table,
   taken from the feature's name. Never renumbered or reused. Decisions in

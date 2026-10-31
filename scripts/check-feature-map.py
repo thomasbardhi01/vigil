@@ -22,6 +22,11 @@ import re
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from vigild import docs_rows  # noqa: E402
+
 ROUTE_DECL = re.compile(
     r"""\.(get|post|put|delete|patch)\(\s*["'](/(?:api|v1)/[^"']*|/api)["']""", re.IGNORECASE
 )
@@ -126,6 +131,7 @@ def check_ids(name: str, text: str, *, need_column: str | None) -> tuple[list[st
 
 def check_decisions(root: Path, arch_text: str) -> list[str]:
     errors, known = check_ids("docs/architecture.md", arch_text, need_column=None)
+    known |= {r["ID"] for r in docs_rows.file_rows(root, "decisions")[0]}
     for m in SEQUENTIAL_ID.finditer(arch_text):
         errors.append(f"docs/architecture.md: sequential decision ID `{m.group(1)}`; use a slug")
     for md in sorted((root / "docs").rglob("*.md")):
@@ -156,6 +162,13 @@ def code_routes(root: Path, code_dirs: list[str]) -> set[str]:
 def check(root: Path, code_dirs: list[str] | None = None) -> list[str]:
     text = (root / "docs" / "feature-map.md").read_text()
     errors, _ = check_ids("docs/feature-map.md", text, need_column="Feature")
+    for kind in docs_rows.KINDS:
+        errors += docs_rows.file_rows(root, kind)[1]
+        try:
+            docs_rows.merged_rows(root, kind)
+        except docs_rows.DuplicateSlug as e:
+            errors.append(str(e))
+    text += "\n\n" + docs_rows.file_table_text(root, "features")
     arch = root / "docs" / "architecture.md"
     if arch.exists():
         errors += check_decisions(root, arch.read_text())
@@ -178,8 +191,7 @@ def check(root: Path, code_dirs: list[str] | None = None) -> list[str]:
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parents[1]
-    errors = check(root)
+    errors = check(ROOT)
     for e in errors:
         print(f"feature-map: {e}", file=sys.stderr)
     return 1 if errors else 0
