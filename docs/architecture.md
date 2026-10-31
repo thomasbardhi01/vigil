@@ -21,7 +21,7 @@ inference. The tower serves models and nothing else.
 
 | Component | Runs where | How | Job |
 |---|---|---|---|
-| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`), kept alive by a launchd agent (`deploy/launchd/dev.vigil.vigild.plist`); updated by `scripts/deploy.sh` (idle check, ff-only pull of the production clone, then restart, or stop, rebuild images and start when image inputs changed; doctor); at start vigild holds the dispatch of a repo whose session image isn't fresh (`stale_image` breaker) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
+| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`), kept alive by a launchd agent (`deploy/launchd/dev.vigil.vigild.plist`); updated by `scripts/deploy.sh` (refuses a missing, dirty or non-`main` production clone `~/vigil-prod` and never creates it; idle check, ff-only pull, which records `<data dir>/deployed_sha`, then restart, or stop, rebuild images and start when image inputs changed; doctor); at start vigild holds the dispatch of a repo whose session image isn't fresh (`stale_image` breaker) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `uv run python cli/vigil …`; `vigil mcp` runs on stdio under a Claude Code session (decision `vigil-mcp`) | thin clients of the REST API; `doctor` and `dev-image` in phase 1 |
 | Claude executor | Mac mini, one container per session | Docker Desktop, linux/arm64 image | Claude Agent SDK, headless; coord, worker, reviewer and auditor sessions |
 | OpenCode executor (phase 4) | Mac mini, one container per session | Docker Desktop, linux/arm64 image | `opencode serve` (v2) driven over HTTP |
@@ -459,6 +459,11 @@ the secrets directory; that is backed up separately, encrypted, by the owner.
 set (marker, db and vault) is over 36 hours old, none exists or the destination
 is unreachable; the destination is `VIGIL_BACKUP_DIR` or the installed plist's,
 and it skips only while neither exists.
+`vigil doctor` also runs `prod checkout` (#189): the vigild plist's `WorkingDirectory` is the
+production clone (`$VIGIL_PROD_DIR`, else `~/vigil-prod`), which exists, has no uncommitted or
+untracked change, and whose HEAD is the SHA `scripts/deploy.sh` last wrote to
+`<data dir>/deployed_sha`. Until the owner switches the plist it fails naming both
+directories. Code: `vigild/doctor.py`.
 There is no automated restore; the runbook has the manual steps. Code: `vigild/backup.py`.
 
 **Off-machine copy (nightly).** With `--remote` (or `VIGIL_BACKUP_REMOTE`; a host

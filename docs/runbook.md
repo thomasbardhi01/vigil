@@ -890,12 +890,36 @@ In order, stopping at the first failure:
    fresh, holds that repo's dispatch and pages once, "<repo>: image not
    fresh after deploy" (Rebuild or Dismiss); a validated rebuild releases it. Otherwise: fast-forward and
    `launchctl kickstart -k`.
+   Each fast-forward then writes `<data dir>/deployed_sha` (atomically);
+   doctor's `prod checkout` compares it with the clone's HEAD.
 4. **`vigil doctor`.** A fail line makes the exit non-zero; nothing is undone.
 5. (The rebuild is folded into step 3 when image inputs changed.)
 6. **Summary:** `production <old> -> <new>` and the range's log.
 
 `--dry-run` prints the steps and changes nothing. The morning report carries
 a line `production <sha> / main <sha>`; they differ when a deploy is pending.
+
+### Switch production to ~/vigil-prod (one time, owner)
+
+Until this is done `vigil doctor` fails `prod checkout` ("production runs
+from <WorkingDirectory>, not <prod dir>"). The deploy script refuses a
+missing `~/vigil-prod`; it never creates it. The data dir
+(`~/vigil-data`) and `~/.config/vigil/` do not change.
+
+1. Stop vigild: `launchctl bootout gui/$(id -u)/dev.vigil.vigild`.
+2. Clone: `git clone --branch main <origin url> ~/vigil-prod`.
+3. Install the environment: `cd ~/vigil-prod && uv sync --locked`.
+4. Edit `~/Library/LaunchAgents/dev.vigil.vigild.plist`: set
+   `WorkingDirectory` to `/Users/<you>/vigil-prod`, and the `PATH` entry's
+   venv directory from `.../Documents/vigil/.venv/bin` to
+   `.../vigil-prod/.venv/bin`.
+5. Start: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.vigil.vigild.plist`.
+6. Record the deployed SHA and check: run `scripts/deploy.sh` (it writes
+   `<data dir>/deployed_sha` after each fast-forward, even when the clone
+   is already current), then `uv run python cli/vigil doctor` and see
+   `prod checkout` pass.
+
+Coord never runs git in `~/vigil-prod`; only `scripts/deploy.sh` writes there.
 
 ### Start vigild
 

@@ -262,3 +262,36 @@ def test_no_image_change_uses_kickstart_only(tmp_path: Path) -> None:
     assert e.called("launchctl kickstart -k gui/")
     assert not e.called("launchctl bootout")
     assert not e.called("launchctl bootstrap")
+
+
+def test_missing_prod_dir_refuses_with_the_clone_command(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    missing = tmp_path / "nowhere" / "vigil-prod"
+    r = e.run("--dry-run", "--prod-dir", str(missing))
+    assert r.returncode != 0
+    assert "git clone --branch main" in r.stderr and str(missing) in r.stderr
+    assert not missing.exists()
+    assert not e.called("launchctl")
+
+
+def test_prod_dir_off_main_is_refused(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    _git(e.prod, "checkout", "-q", "-b", "other")
+    r = e.run()
+    assert r.returncode != 0 and "main" in r.stderr
+    assert not e.called("launchctl")
+
+
+def test_deploy_records_the_deployed_sha(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    new = e.commit("next", {"a.txt": "a\n"})
+    assert e.run(STUB_CURL_RC="0").returncode == 0
+    assert (e.data / "deployed_sha").read_text().strip() == new
+    assert not list(e.data.glob("deployed_sha.*"))
+
+
+def test_dry_run_does_not_record_a_sha(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    e.commit("next", {"a.txt": "a\n"})
+    assert e.run("--dry-run").returncode == 0
+    assert not (e.data / "deployed_sha").exists()
