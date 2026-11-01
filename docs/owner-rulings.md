@@ -95,6 +95,7 @@ applied.
 - **2026-10-26**: At the round limit the owner may read the final diff in place of a further review (#28).
 
 ## Product decisions (per feature)
+- **2026-11-01** (R27): The Lab: The Lab is Vigil's measurement surface: /learn, evals/, docs/experiments/, docs/research/. An experiment is a first-class row (question, hypothesis, metric from host-side scorers only, slice, arms as factory-config revisions, frozen admitted task set, k, budget line, pins, verdict, and the rule it would change; no rule it could change → refused at proposal). Experiments are proposed as brief cards, approved in the Inbox, run on p3-24-admitted tasks under their own budget line, and end in a card or a draft PR, never a merge or a rung change. No LLM judge. A Lab loop may auto-accept a revision onto its own branch only when all hold: score from the verifier and host-side scorers; metric continuous or yardstick thresholds met; accepted on a held-out split the loop never tuned on (--set heldout, disjoint from --set tune); change surface is one non-trust-path file or config value (skill ≤40 lines, one routing.yaml slice, one cap); revert exists. Verifier, gateway, review.yaml, hidden tests and the ladder never qualify. Paper now; table, runner and page at G4; self-edit and correct as proposers at G5. Vigild stays Python for it; Rust is the Lab's first non-Python subject via p3-63; an optional pure stats CLI may be Rust behind a JSON interface. Model-training curricula stay outside the repo.
 - **2026-10-31** (R3): Page list replacing "nine pages and nothing else". **Ruling:** **Adopt §8's list**: `/` Inbox, `/jobs`, `/job/:id`, `/review`, `/factories` (absorbs `/decider`), `/budget`, `/rulings` (takes `/new`'s slot; `/new` becomes a palette command), `/sessions`, `/talk`, `/watch`; `/learn` planned. Eleven pages; no page merges.
 - **2026-10-31** (R7): Browser oracle. **Ruling:** **Re-check pending** (research): lean is Playwright pinned by digest in the *verifier* image only (never the session image), CDP for traces/heap; decision 15's "no library" rule was about session-image weight.
 - **2026-10-31** (R17): The room is in the UI: `/talk` hosts two lanes on one chat component — the **coord lane** is a Claude Code session vigild launches through the Agent SDK (the session-proxy row; subscription login still applies), so coord leaves the terminal; the **advisor lane** is any model through the gateway (Claude API, OpenRouter, tower) with the facade's tools. LibreChat is dropped. The Claude app stays the ideation surface via the facade (no API exists to mirror app chats). **Ruling:** **Adopt** (owner 10-31: baked into the UI, T3-like).
@@ -120,6 +121,13 @@ applied.
 - **2026-10-28**: The long-term fix for docs table conflicts is #96 (one file per feature, generated tables).
 
 ## Not adopted (don't re-propose)
+- **2026-11-01** (The Lab brief): Self-committing experiment loops onto main.
+- **2026-11-01** (The Lab brief): An LLM judge for experiments.
+- **2026-11-01** (The Lab brief): A home-grown harness as a worker.
+- **2026-11-01** (The Lab brief): nanochat or model-training code in the repo before E9's trace threshold.
+- **2026-11-01** (The Lab brief): A separate forge/ repo.
+- **2026-11-01** (The Lab brief): A calendar for the Lab.
+- **2026-11-01** (The Lab brief): The Lab's orchestration in Rust.
 - **2026-10-31** (R8): ADR-0006 I exceptions. **Ruling:** **None now**; codemap stays an experiment; self-edit stays phase 7; worker-packet additions limited to the landing rules (§7) and one sentence each for `abort` and "fewest tests that fail on main".
 - **2026-10-31** (research, phase-3 plan p3-02): Graphite, Aviator, Trunk or Mergify as the merge queue; vigild's own landing queue gives the invariant at this scale (`docs/research/landing-and-trust-ladder.md`).
 - **2026-10-31** (research, phase-3 plan p3-02): LLM conflict auto-resolution that lands without the full verifier on the rebased SHA (measured ~55-65% agreement with developers).
