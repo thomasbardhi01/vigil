@@ -50,4 +50,4 @@ unknown
 
 ## Rule changed or left unchanged
 
-unknown
+The verifier plug-ins each readiness profile requires per shape (R21), and lite-lane eligibility (R14).

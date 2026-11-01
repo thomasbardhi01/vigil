@@ -50,4 +50,4 @@ unknown
 
 ## Rule changed or left unchanged
 
-unknown
+When coord splits work into a chain, and the chain cap (p3-27, 3).
