@@ -14,7 +14,7 @@ unknown
 
 ## Configuration
 
-unknown
+Two baselines: the by-hand owner workflow AND Strawman v1 (experiment #27), with owner-minutes recorded identically for both.
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 

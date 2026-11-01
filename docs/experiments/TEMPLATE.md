@@ -9,6 +9,8 @@ proposal.
 - **Status:** proposed | approved | running | done (verdict) | refused
 - **Item / ruling:** <p3-nn, Rnn>
 - **Budget line:** <the experiment line in `configs/budgets.yaml`, cap>
+- **Claim tested:** <C1–C5 in `docs/research/README.md`, or none>
+- **n_required:** <runs per arm; blank until set>
 
 ## Question
 

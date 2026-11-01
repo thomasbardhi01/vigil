@@ -8,4 +8,4 @@ guardrails: 'Tier pinned; one MIGRATIONS step under the schema lease. No LLM jud
 tests: '—'
 status: planned
 ---
-Experiments as first-class rows (R27): question, hypothesis, metric from host-side scorers only, slice, arms as factory-config revisions, frozen admitted task set, k, budget line, pins, verdict, and the rule it would change; a proposal that names no rule it could change is refused. Plan item p3-65.
+Experiments as first-class rows (R27): question, hypothesis, metric from host-side scorers only, slice, arms as factory-config revisions, frozen admitted task set, k, budget line, pins, verdict, and the rule it would change; a proposal that names no rule it could change is refused. Its first claims-register entries are experiments #27–#31 (p3-69). Plan item p3-65.
