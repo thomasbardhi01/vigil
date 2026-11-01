@@ -82,6 +82,10 @@ cache write / cache read / output.
 - Haiku 5.5 (`claude-haiku-5-5`), prompts up to 100k: $0.10 / $0.125 / $0.20 / $0.01 / $0.50
 - Haiku 5.5, prompts over 100k: $0.50 / $0.625 / $1 / $0.05 / $2.50
 
+**Server-side web search** (`web_search_20260209`): $10 per 1,000 searches (one search is one use, whatever the number of results; a failed search is not billed), plus its results as input tokens in that turn and every later turn. Code execution is free alongside it.
+
+Checked against the live pricing page on 2026-11-01 for UI-3a: the Opus 5.5 and Sonnet 5.5 rows above are unchanged (cache reads are 0.05× base input on both).
+
 Sources: https://platform.claude.com/docs/en/about-claude/models/overview · https://platform.claude.com/docs/en/about-claude/pricing
 
 ## Facts the architecture relies on
