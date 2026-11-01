@@ -197,27 +197,6 @@ def _strip_cache_control(x: Any) -> Any:
     return x
 
 
-def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
-    """Hash and length (UTF-8 bytes, which `chars / 3` estimates tokens from) of the
-    request's input up to its first `n`
-    messages: the model and `thinking` setting (a change of either misses the
-    provider's cache), tools, then system, then those messages, as compact sorted JSON without
-    cache markers. This is the prefix the provider can cache, in its own order."""
-    msgs = body.get("messages")
-    part = [
-        body.get("model"),
-        body.get("thinking"),
-        body.get("tools"),
-        body.get("system"),
-        msgs[:n] if isinstance(msgs, list) else [],
-    ]
-    text = json.dumps(
-        _strip_cache_control(part), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-    data = text.encode()
-    return hashlib.sha256(data).hexdigest(), len(data)
-
-
 def _h(x: Any) -> str:
     text = json.dumps(_strip_cache_control(x), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)  # fmt: skip
