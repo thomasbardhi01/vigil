@@ -1,4 +1,6 @@
 """#79 (a): a session's cached prefix is priced at the cache-read rate in the worst case.
+(Superseded in part by `test_precise_holds.py`, owner ruling R23, 2026-10-31 (#1): what
+is left here is the settling and re-reservation of a cache miss.)
 
 The previous call of the same session wrote the prefix (the provider's usage said so),
 this call resends it byte for byte (compared by hash, `cache_control` markers ignored)
@@ -12,7 +14,6 @@ session's next call must re-reserve first.
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
 
 import httpx2
@@ -24,9 +25,8 @@ from vigild.breakers import GLOBAL, Breakers, Kind
 from vigild.budget import Budget
 from vigild.config import Config
 from vigild.db import Store
-from vigild.gateway.service import CHARS_PER_TOKEN, Gateway, worst_case_usd
+from vigild.gateway.service import Gateway, worst_case_usd
 from vigild.jobs.model import Role
-from vigild.metering.calls import CallUsage
 
 MODEL = "claude-sonnet-5-5"
 BIG = "x" * 30_000
@@ -141,82 +141,23 @@ def _plain(gw: Gateway, raw_len: int) -> float:
     return worst_case_usd(gw.prices, MODEL, raw_len, 4096)
 
 
-def test_a_resent_prefix_is_priced_at_the_cache_read_rate(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 10 * MIN
-    second = _second()
-    amount, raw_len = _hold(gw, tok, second)
-    est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
-    prefix = math.ceil(_canon_chars(_first(), 1) / CHARS_PER_TOKEN)
-    expect = gw.prices.cost(
-        MODEL,
-        CallUsage(tokens_cache_read=prefix, tokens_cache_write_1h=est_in - prefix, tokens_out=4096),
-    )
-    assert amount == pytest.approx(expect)
-    assert amount < _plain(gw, raw_len)
-
-
-def test_cache_writes_never_earn_the_read_rate(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    """G1: only tokens the provider reported as cache reads count, not its writes."""
-    _sid, tok = _session(store, budget, gw)
-    _wrote(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    amount, raw_len = _hold(gw, tok, _second())
-    assert amount == pytest.approx(_plain(gw, raw_len))
-
-
-def test_a_prefix_older_than_fifty_minutes_is_priced_as_before(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 49 * MIN
-    assert _hold(gw, tok, _second())[0] < _plain(gw, len(json.dumps(_second())))
-    clock[0] += 2 * MIN  # 51 minutes
-    amount, raw_len = _hold(gw, tok, _second())
-    assert amount == pytest.approx(_plain(gw, raw_len))
-
-
-def test_a_changed_earlier_message_is_priced_as_before(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    amount, raw_len = _hold(gw, tok, _second("z" + BIG[1:]))
-    assert amount == pytest.approx(_plain(gw, raw_len))
-
-
-def test_another_sessions_prefix_is_no_help(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    _a, tok_a = _session(store, budget, gw)
-    _b, tok_b = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok_a, _first()).status_code == 200
-    amount, raw_len = _hold(gw, tok_b, _second())
-    assert amount == pytest.approx(_plain(gw, raw_len))
-
-
 def _miss(client: TestClient, gw: Gateway, tok: str, up: Upstream, clock: list[float]) -> None:
     _read(up)
     assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 10 * MIN
+    clock[0] += 4 * MIN
     # the provider did not have the prefix: it wrote everything again
     up.usage = {"input_tokens": 5, "cache_creation": {"ephemeral_1h_input_tokens": 14_000}}
     assert _post(client, tok, _second()).status_code == 200
+
+
+def _no_room_at_the_miss(budget: Budget, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The caps refuse the excess's immediate reservation (`_learn`): the session owes it."""
+
+    def refused(sid: str, premium: float, **kw: Any) -> bool:
+        budget.release_premium(sid, premium)
+        return False
+
+    monkeypatch.setattr(budget, "swap_premium", refused)
 
 
 def test_a_cache_miss_settles_its_real_cost_and_the_next_call_re_reserves(
@@ -244,7 +185,9 @@ def test_a_cache_miss_settles_its_real_cost_and_the_next_call_re_reserves(
 def test_after_a_miss_the_next_call_is_refused_until_it_re_reserves(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     (ev,) = [e for e in store.events() if e.type == "settle_excess"]
@@ -284,92 +227,12 @@ def _plain_hold(gw: Gateway, raw_len: int, out: int = 4096) -> float:
     return worst_case_usd(gw.prices, MODEL, raw_len, out)
 
 
-def test_only_the_reported_read_tokens_get_the_read_rate(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    """A partial read: the provider read 5,000 of a prefix of about 10,000 tokens."""
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream, 5_000)
-    assert _post(client, tok, _first()).status_code == 200
-    amount, raw_len = _hold(gw, tok, _second())
-    est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
-    expect = gw.prices.cost(
-        MODEL,
-        CallUsage(tokens_cache_read=5_000, tokens_cache_write_1h=est_in - 5_000, tokens_out=4096),
-    )
-    assert amount == pytest.approx(expect)
-
-
-def test_a_call_in_flight_makes_the_next_one_plain(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    """Parallel calls, and a previous call whose stream is not booked yet: only a
-    session with nothing in flight can have a hit."""
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    raw = json.dumps(_second()).encode()
-    gs = gw.authorize(tok)
-    first = gw.preflight(gs, "/v1/messages", raw)
-    second = gw.preflight(gs, "/v1/messages", raw)  # the first is still in flight
-    assert first.amount < _plain(gw, len(raw))
-    assert second.amount == pytest.approx(_plain(gw, len(raw)))
-    assert second.cached_tokens == 0
-    gw.release(first)
-    gw.release(second)
-    third = gw.preflight(gs, "/v1/messages", raw)  # nothing in flight again
-    assert third.amount == pytest.approx(first.amount)
-    gw.release(third)
-
-
-def test_a_failed_metering_books_the_plain_worst_case(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    raw = json.dumps(_second()).encode()
-    assert _hold(gw, tok, _second())[0] < _plain(gw, len(raw))
-
-    def boom(**kw: Any) -> float:
-        raise RuntimeError("db down")
-
-    gw._record = boom  # type: ignore[method-assign]
-    assert _post(client, tok, _second()).status_code == 200
-    (row,) = store.q(
-        "SELECT amount_usd FROM ledger WHERE session_id=? AND reservation_id IS NULL", (sid,)
-    )
-    assert float(row["amount_usd"]) == pytest.approx(_plain(gw, len(raw)))
-
-
-def test_a_changed_model_or_thinking_is_priced_as_before(
-    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
-    clock: list[float],
-) -> None:  # fmt: skip
-    _sid, tok = _session(store, budget, gw)
-    _read(upstream)
-    assert _post(client, tok, _first()).status_code == 200
-    other = {**_second(), "model": "claude-haiku-5-5"}
-    raw = json.dumps(other).encode()
-    amount, _ = _hold(gw, tok, other)
-    assert amount == pytest.approx(worst_case_usd(gw.prices, "claude-haiku-5-5", len(raw), 4096))
-    thinking = {
-        **_second(),
-        "max_tokens": 8192,
-        "thinking": {"type": "enabled", "budget_tokens": 2000},
-    }
-    raw = json.dumps(thinking).encode()
-    amount, _ = _hold(gw, tok, thinking)
-    assert amount == pytest.approx(_plain_hold(gw, len(raw), 8192))
-
-
 def test_revoking_a_session_drops_what_a_miss_owes(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     assert gw._rereserve.get(sid, 0) > 0
@@ -399,7 +262,9 @@ def test_a_re_reservation_the_task_cap_cannot_take_is_refused(
 def test_a_re_reservation_the_month_cannot_take_is_refused(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    _no_room_at_the_miss(budget, monkeypatch)
     _sid, tok = _session(store, budget, gw)
     _miss(client, gw, tok, upstream, clock)
     budget.cfg.monthly_usd = budget.spent_month() + budget.open_month()

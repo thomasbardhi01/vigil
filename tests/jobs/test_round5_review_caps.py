@@ -196,9 +196,12 @@ MODEL = "claude-sonnet-5-5"
 def _hold(gw: Any, sid: str, usd: float) -> float:
     """Hold a call whose worst case is at least `usd`: the input sized to it, with
     the output at the session cap (the gateway clamps max_tokens to that)."""
+    from vigild.metering.calls import CallUsage
+
     body = {"model": MODEL, "max_tokens": 16384}
     n = 0
-    while gw.worst_case(MODEL, body, n) < usd:
+    # the input is held at the 5-minute write rate: no `cache_control` asks for more
+    while gw.prices.cost(MODEL, CallUsage(tokens_cache_write_5m=n // 3, tokens_out=16384)) < usd:
         n += 1000
     amount, _body, _raw = gw._hold_clamped(sid, MODEL, body, b"x" * n)
     return float(amount)

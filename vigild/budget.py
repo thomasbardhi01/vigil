@@ -22,6 +22,9 @@ is refused, never queued. Every reservation and ledger row says which pool it
 belongs to (`ops` or `experiment`), worked out here from the session, task or job
 it is for, so a caller can't forget it.
 
+A hold priced below its worst case (a prefix the provider has cached) also holds its
+miss premium against the day and the month (`hold_premium`), so those stay hard.
+
 Settling turns a reservation into metered spend (the sum of the
 session's model_calls rows). The gateway refuses any call whose worst case
 would take its session past the reservation, so metered spend can't pass a
@@ -54,6 +57,12 @@ class Budget:
         self.store = store
         self.cfg = cfg
         self.clock = clock
+        # Miss premiums (owner ruling R23, 2026-10-31 (#1)): a call held at its precise
+        # price could cost its all-miss price. The session's reservation covers the
+        # precise part; the premium (all-miss minus precise) is held here, in memory
+        # (a crash ends the calls it covers), against the day and the month, and every
+        # reserve() sees it. session -> premium of its calls in flight.
+        self._premiums: dict[str, float] = {}
 
     def _day(self) -> str:
         return self.clock().strftime("%Y-%m-%d")
@@ -153,27 +162,7 @@ class Budget:
                     f"task {task_id} has {self.task_total(task_id):.2f} of "
                     f"{task_cap:.2f}; {amount:.2f} more doesn't fit",
                 )
-            if bench:
-                used = self.spent_experiment_month() + self.open_experiment()
-                if used + amount > self.cfg.experiment_monthly_usd + EPS:
-                    raise BudgetExceeded(
-                        "experiment",
-                        f"{used:.2f} of {self.cfg.experiment_monthly_usd:.2f} used this month; "
-                        f"{amount:.2f} more",
-                    )
-            else:
-                day_used = self.spent_today() + self.open_today()
-                if day_used + amount > self.cfg.daily_usd + EPS:
-                    raise BudgetExceeded(
-                        "daily",
-                        f"{day_used:.2f} of {self.cfg.daily_usd:.2f} used; {amount:.2f} more",
-                    )
-            month_used = self.spent_month() + self.open_month()
-            if month_used + amount > self.cfg.monthly_usd + EPS:
-                raise BudgetExceeded(
-                    "monthly",
-                    f"{month_used:.2f} of {self.cfg.monthly_usd:.2f} used; {amount:.2f} more",
-                )
+            self._check_pool(pool, amount)
             cur = c.execute(
                 "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status, day,"
                 " month, created_at, pool) VALUES (?,?,?,?, 'open', ?,?,?,?)",
@@ -189,6 +178,72 @@ class Budget:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def premium_total(self) -> float:
+        with self.store.lock:
+            return sum(self._premiums.values())
+
+    def _check_pool(self, pool: str, amount: float) -> None:
+        """The pool's own cap (the day, or the experiment line) and the month, counting
+        the premiums in flight. Raises BudgetExceeded."""
+        held = self.premium_total()
+        if pool == EXPERIMENT:
+            used = self.spent_experiment_month() + self.open_experiment() + held
+            if used + amount > self.cfg.experiment_monthly_usd + EPS:
+                raise BudgetExceeded(
+                    "experiment",
+                    f"{used:.2f} of {self.cfg.experiment_monthly_usd:.2f} used this month; "
+                    f"{amount:.2f} more",
+                )
+        else:
+            day_used = self.spent_today() + self.open_today() + held
+            if day_used + amount > self.cfg.daily_usd + EPS:
+                raise BudgetExceeded(
+                    "daily",
+                    f"{day_used:.2f} of {self.cfg.daily_usd:.2f} used; {amount:.2f} more",
+                )
+        month_used = self.spent_month() + self.open_month() + held
+        if month_used + amount > self.cfg.monthly_usd + EPS:
+            raise BudgetExceeded(
+                "monthly",
+                f"{month_used:.2f} of {self.cfg.monthly_usd:.2f} used; {amount:.2f} more",
+            )
+
+    def hold_premium(self, session_id: str, amount: float) -> None:
+        """Hold `amount` (a call's miss premium) against the day (or the experiment line)
+        and the month, on top of every open reservation and every premium in flight.
+        Raises BudgetExceeded and holds nothing if it does not fit."""
+        if amount <= EPS:
+            return
+        with self.store.lock:
+            self._check_pool(self.pool_of(session_id=session_id), amount)
+            self._premiums[session_id] = self._premiums.get(session_id, 0.0) + amount
+
+    def swap_premium(
+        self, session_id: str, premium: float, *, task_id: str | None, excess: float,
+        purpose: str,
+    ) -> bool:  # fmt: skip
+        """Give back a call's premium and reserve its overshoot in one step (under the
+        store lock, so no other reservation sees the day between the two). False if the
+        caps refuse the reservation: the premium is still given back, and the caller owes
+        the excess."""
+        with self.store.lock:
+            self.release_premium(session_id, premium)
+            try:
+                self.reserve(session_id=session_id, task_id=task_id, amount=excess, purpose=purpose)
+            except BudgetExceeded:
+                return False
+            return True
+
+    def release_premium(self, session_id: str, amount: float) -> None:
+        if amount <= EPS:
+            return
+        with self.store.lock:
+            left = self._premiums.get(session_id, 0.0) - amount
+            if left > 1e-12:
+                self._premiums[session_id] = left
+            else:
+                self._premiums.pop(session_id, None)
 
     def _refuse_abandoned(
         self, *, session_id: str | None, task_id: str | None, job_id: str | None
