@@ -89,6 +89,17 @@ def test_context_pack_is_capped_and_drops_are_recorded(clone: Path) -> None:
     assert any("docs/feature-map.md" in d for d in p.dropped)
 
 
+def test_research_reports_reach_no_packet_layer(clone: Path) -> None:
+    # R11: docs/research/ holds unverified sources; no layer reads it.
+    (clone / "docs" / "research").mkdir(parents=True)
+    (clone / "docs" / "research" / "report.md").write_text("UNVERIFIED-RESEARCH-SENTINEL\n")
+    worker = assemble_worker(clone, _contract(), untrusted={})
+    request = {"job_id": "fx-0001", "repo": "o/fixture", "base": "main", "request": "r"}
+    coord = assemble_coord(clone, request, untrusted={})
+    assert "UNVERIFIED-RESEARCH-SENTINEL" not in worker.text
+    assert "UNVERIFIED-RESEARCH-SENTINEL" not in coord.text
+
+
 def test_contract_restates_done_when_as_a_checklist(clone: Path) -> None:
     p = assemble_worker(clone, _contract(), untrusted={})
     assert "- [ ] the feature map lists the rate limit" in p.parts["contract"]

@@ -46,6 +46,18 @@ Stack, pinned at build time (`docs/sources.md`):
 - **Tracing:** OpenTelemetry, through a collector, into self-hosted Arize Phoenix.
 - **Networking:** Tailscale.
 
+## Philosophy: the gate is verification, not review
+
+(Phase-3 plan §1; adapted from `docs/research/amp-and-warp-philosophy.md` and `verification-bottleneck.md`. Every figure below is per research note, unverified.)
+
+Two public positions bracket Vigil. Amp pushes to `main` with no pull requests and no mandatory review; its agents produce the proof that their code works. Warp runs a cloud factory where agents never merge and a human touches every PR, with quality measured by a model reading the agent's own transcript. Vigil takes neither, because both let the thing that wrote the code produce the signal that it is good.
+
+- **The gate is verification, not review.** A change lands when a process the worker cannot touch says it does: the verifier re-runs the contract's tests in a fresh single-commit checkout from the base's runner files, with hidden tests the worker never saw, and compares base, before and after. Review is a second signal with its own ladder, and it sees the verifier's evidence. A worker's report, self-check and test claims weigh nothing.
+- **The branch is an implementation detail of the gate.** A `vigil/*` branch lives from dispatch to verdict and landing; the PR carries the verified commit and its record. The tree the verifier passed is the tree that lands; a rebase re-verifies (p3-09).
+- **Autonomy is earned per change class** (ruling R4): measured on planted defects with a sequential test, never by default, and never for money, auth, consent, migrations or pinned paths. Human merges are the floor Vigil starts from.
+- **The factory is code and runs where the code lives.** Routing, budgets, egress and schedules are files in `configs/`, changed by PR; workers have no egress and no secrets; inference is the only hosted thing, metered through one gateway under hard caps.
+- **What the field measures.** Under high AI adoption, review time and defects rise, not CI time: Faros 2026 reports median time in review +441.5%, bugs per developer +54% and PRs merged with no review +31.3%; agent PRs conflict with their base 27.67% of the time (AgenticFlict). The "CI is the bottleneck" claim is argued, not measured; inside Vigil the verifier is the machine bottleneck to watch (p3-08). "Specs for tests that AI codes and runs" is Proton CEO Andy Yen's line, the inversion this design forbids.
+
 ## What an expert would insist on
 
 These eight choices are where fleets fail or pay off. Each is a design constraint below, not advice.
@@ -358,7 +370,7 @@ A local backend is still allowed only on shapes at trust rung 3.
 - **Single writer by default.** A job has one writing worker unless the plan says otherwise.
 - **Subagents are read-only.** A worker's subagents search and read; they never edit.
 - **Parallel writers only with disjoint files and pinned interfaces in `spec.md`.** The spec gate checks the disjointness: two workers with no `depends_on` path between them may not share a file, and parallel workers need a `## Interfaces` section.
-- **Escalation forks full context.** An escalated attempt starts from the failed attempt's whole context, not a summary (phase 2, with escalation).
+- **Escalation starts fresh** (ADR-0005, ruling R6). An escalated attempt, a replan and a fix round start from a new context holding `spec.md`, `plan.md`, the changelog, the owner's note and the failure (the verifier's summary, and for a fix round the findings and the prior diff), not from the failed attempt's transcript. Fork versus fresh is experiment #13.
 - **A per-repo knowledge base** (code map, lessons store, search subagent): phase 2.
 - **A dev image per repo, built by vigild from the repo's lockfiles when they change and validated by running its suites offline, with dispatch refused on a stale or failed image: phase 1** (owner direction, review round 2; this replaced the nightly validation).
 - **KPIs drive the ladder, routing and the cost model:** first-pass merge rate, findings per PR by severity, revert + fix-job rate, cost per merged PR, median spec→merge. They are defined now and their raw data is stored now; each is computed where data exists.
@@ -379,7 +391,7 @@ This is how a job runs, written the way a release process is written at a compan
 | 0 Intake | issue, label, or `vigil run` text; your rough ideas | decider | `intake.json`: value, risk, size, touches\_money, duplicate\_of, confidences | confidences above act threshold; not a duplicate; WIP free | wait in inbox or page you |
 | 1 Spec | intake + repo docs + your notes | coord (Claude). **Learning (planned):** a second, fresh-context session writes the hidden tests from the spec and the product model only. It is never the worker's session, and it uses local models only on a private repo | `spec.md`: goal, non-goals, acceptance criteria as testable statements, `test_cmd` per criterion, files in/out of scope, money paths, interfaces (when workers run in parallel), risks, rollback; `plan.md`: worker split with a contract per worker, dependency order, estimated size, each criterion's verification level. **Learning (planned):** `hidden_tests`, stored by vigild and never on the branch (the one stage artifact not committed under `.vigil/`); `reward_schema` (which graded signals apply to the shape); a difficulty estimate; `plan.md` must cite the product-model invariants each worker touches, and the citations are the retrieval key for matching recovery playbooks into the packet | spec gate: every criterion has a test command; every worker contract validates against the schema; money paths flagged match the path rules; parallel workers have disjoint files and pinned interfaces; every criterion has a verify entry, and one left at level 0 says why. **Learning (planned):** the hidden tests fail on base (in their own verifier run); every touched invariant is cited, and every citation resolves in `docs/product/` | coord revises up to 2×, then pages you |
 | 2 Approve | spec + plan | you (inbox) | approval record with your edits, or **replan with a note** (the coord amends the approved spec and the item shows a diff; never an approval). **Learning (planned):** the inbox item also shows the hidden tests' names and categories | signed by you | job stays `spec_pending` |
-| 3 Build | one worker contract | worker, then vigild | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions; a draft PR that **vigild** pushes and opens from the host (P2, owner 2026-10-22), never the worker. **Learning (planned):** each attempt is its own episode span with its own reward | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits; all checked on the host before the push | retry with findings appended (attempt 2), then escalate tier. **Learning (planned):** the retry stays the owner's, from the inbox. It forks full context and adds the verifier's category-level feedback ("hidden 3/7 pass; failing: concurrency, empty-input"). It shares the task's $2 cap and the `attempt` counter, and nothing is reset |
+| 3 Build | one worker contract | worker, then vigild | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions; a draft PR that **vigild** pushes and opens from the host (P2, owner 2026-10-22), never the worker. **Learning (planned):** each attempt is its own episode span with its own reward | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits; all checked on the host before the push | retry with findings appended (attempt 2), then escalate tier. **Learning (planned):** the retry stays the owner's, from the inbox. It starts fresh (ADR-0005, R6) with the prior diff and the verifier's category-level feedback ("hidden 3/7 pass; failing: concurrency, empty-input"). It shares the task's $2 cap and the `attempt` counter, and nothing is reset |
 | 4 Verify | branch | CI (GitHub Actions). **Learning (planned):** vigild's verifier computes the gate tier; vigild assembles the rest | CI run; coverage delta; flake status. **Learning (planned):** `gate.json` from the verifier, covering hidden tests (a separate run with its own base/head comparison), the executed-set superset, tampering, the product-model check and the visual baseline. vigild then assembles quality (opt-in mutation runs in their own slot and timeout, changed-line coverage, level-1 property and stateful results, and the audit's findings) and cost (gateway metering), and signs `reward.json` on the host | all required checks green on a clean runner, not the worker's shell; flaky tests quarantined, not counted. **Learning (planned):** the spec's `test_cmd` run and its superset and fails-first checks are unchanged; the worker's own claim is logged at zero weight; the reward's inputs are hashed onto the Phoenix span; no key in any container | back to build with the CI log attached. **Learning (planned):** the worker sees only its visible tests plus category-level feedback |
 | 5 Review | PR diff + issue + spec. **Learning (planned):** unchanged; reviewers never see `reward.json` | reviewer (fresh context) | `review.json`: findings\[\] {severity, file, line, claim, fix}, verdict. **Learning (planned):** each finding labelled (type, severity) | zero findings of severity ≥ medium; checklist complete | findings become a fix task on the same branch; two rounds, then escalate |
 | 6 Audit | review + diff | auditor (Opus, sampled by rung). **Learning (planned):** plus a separate top-reward sample | `audit.json`: findings the reviewer missed, match rate. **Learning (planned):** the missed rate is computed before the auditor sees `reward.json`; then the auditor sees it, tags review findings real or false, and records reward–audit agreement per component | match rate feeds the trust ladder; no missed high finding. **Learning (planned):** ladder statistics come from the random sample only; a reward component whose agreement falls below its threshold is frozen out of the reward until recalibrated | demote shape; findings become a fix task |
@@ -404,7 +416,7 @@ The worker packet also explains `ask_coord` (owner decisions 2026-10-22, phase 1
 
 **Learning (planned):**
 - The context pack also carries the recovery playbooks that the plan's product-model citations match.
-- A retried attempt forks the failed attempt's full context and adds the category-level verifier feedback. It never carries the hidden tests.
+- A retried attempt starts fresh (ADR-0005, R6) with the prior diff and the category-level verifier feedback. It never carries the hidden tests.
 - Every packet carries a provenance tag. A packet with Claude-written text never becomes training data.
 - Packet templates may evolve (GEPA/DSPy style), but only in phase 7, with the verifier as the metric, re-run per model. Each change is a PR for your approval.
 
@@ -496,7 +508,7 @@ How Vigil gets better from its own jobs.
 **The loops.**
 - **Inner, per job: the attempt protocol is the existing retry.** It runs inside the current rules:
   - **Retry.** It is the owner-only retry from the inbox (architecture decision `worker-failure`).
-  - **Context.** The retried attempt forks the failed attempt's full context ("Escalation forks full context") and adds the verifier's category-level feedback. Nothing is reset.
+  - **Context.** The retried attempt starts fresh (ADR-0005, R6) with the prior diff and the verifier's category-level feedback; the worker's own transcript does not re-enter. Fork versus fresh is experiment #13.
   - **Cap and counter.** It shares the task's $2 cap and the contract's `attempt` counter.
   - **Spans.** Each attempt is its own episode span with its own reward, so credit never leaks from a recovery to a failed first attempt.
 - **Middle, per incident: PROBE's shape.**
@@ -633,7 +645,7 @@ Metrics, in priority order:
 
 **Decisions (owner, 2026-10-23).** These settle the 22 questions the first draft raised, plus #8 and #9:
 1. The product model is the `docs/product/` documentation layer; product-model PRs get their own intake rule.
-2. The attempt protocol is the existing owner-only retry: it forks full context, adds category feedback, shares the $2 cap and the `attempt` counter, and never resets.
+2. The attempt protocol is the existing owner-only retry: it starts fresh (ADR-0005, R6), adds category feedback, shares the $2 cap and the `attempt` counter, and never resets.
 3. The outer loop merges into phase 7 "Eval"; there is one eval.
 4. Replay produces evidence rows only, and promotion stays on the audit path. Parameter and prompt changes are PRs for the owner. The rung-0 lock and the `deps` cap are enforced in `review.yaml`.
 5. `budgets.yaml` gets a line for replay and one per experiment, in #8's shape; #11's line lifts the per-task cap for that run only.
@@ -787,12 +799,12 @@ The SDK runs the Claude Code CLI as a child process and exports spans, metrics a
 
 **Self-maintenance.** After phase 2, Vigil may run tasks on its own repo, under the same rules and WIP limit, with the vigil-worker App installed on vigil.
 
-**Four ways to spawn, one API.** `vigild` exposes a REST API on the Tailscale interface. The CLI, the MCP server and the web UI are clients of it, so you can dispatch from wherever you are. The web UI (phase 3) is specified in `docs/ui.md`.
+**Four ways to spawn, one API.** The MCP row lists the tools that shipped. `vigild` exposes a REST API on the Tailscale interface. The CLI, the MCP server and the web UI are clients of it, so you can dispatch from wherever you are. The web UI (phase 3) is specified in `docs/ui.md`.
 
 | From | How | Example |
 | --- | --- | --- |
 | Terminal | `vigil` CLI (Python, `uv tool install`, on the Mac mini) | `vigil run parkagent#142 --tier auto`, `vigil batch parkagent-batch.yaml`, `vigil ls --live`, `vigil trace pa-0142`, `vigil kill pa-0142` |
-| Claude Code session (your Mac) | `vigil` MCP server added to `.mcp.json`; tools `vigil_run`, `vigil_status`, `vigil_trace`, `vigil_kill`, plus the bridge's `vigil_talk`, `vigil_listen`, `vigil_jobs`, `vigil_approve` (`vigil_approve` files your decision into the inbox; it is not a second decision surface) | "Dispatch the three test tasks from the batch file to the tower and tell me when PRs are open" |
+| Claude Code session (your Mac) | `vigil` MCP server added to `.mcp.json`; tools `submit_job`, `job_status`, `list_inbox`, `inbox_act`, `kill`, `submit_batch`, `batch_status`, `approve_all` (`approve_all` needs the admin token and files a decision into the inbox; it is not a second decision surface). Planned (p3-04): `propose_brief` and `wait_for` | "Dispatch the three test tasks from the batch file to the tower and tell me when PRs are open" |
 | Browser | web UI served by `vigild`, Tailscale only (`docs/ui.md`) | `/new`: repo, base, backend preset or custom endpoint, spec, limits |
 | GitHub | label `vigil:ready` on an issue; `vigild` polls or receives a webhook | coord labels issues; the fleet picks them up |
 
@@ -887,11 +899,12 @@ At a 20% escalation rate the local tier saves about a third. At 50% escalation i
 The eval is a replay of closed ParkAgent issues with the merged PR hidden, scored by the same CI and the same reviewer. It runs before the routing rules go live and again whenever a model or rule changes.
 
 1. Pick 10 closed issues: 4 tests-from-spec, 2 docs, 2 dependency bumps, 2 small UI/copy. Write the spec for each the way the spec gate requires (Claude does this once; the specs are reused for every candidate).
-2. Run all 10 as `local` tasks from the same base commit, for each candidate. Workers: Qwen3.8-27B Q3 (dense, on GPU, short context), Qwen3.6-35B-A3B Q4 (MoE, experts in RAM), gpt-oss-20b (on GPU); DeepSeek V4.1 Flash via a hosted API (eval only, ParkAgent is public). Ceilings: Claude Sonnet and Claude Haiku, so you see where each local model lands between them. Reviewers: the same list, scored against Claude Opus as the auditor.
+2. Run all 10 as `local` tasks from the same base commit, for each candidate. Workers: Qwen3.8-27B Q3 (dense, on GPU, short context), Qwen3.6-35B-A3B Q4 (MoE, experts in RAM), gpt-oss-20b (on GPU); DeepSeek V4.1 Flash via a hosted API (eval only, while ParkAgent is public; after it goes private it is tower-only, ruling R10). Ceilings: Claude Sonnet and Claude Haiku, so you see where each local model lands between them. Reviewers: the same list, scored against Claude Opus as the auditor.
 3. Decider: Jev (via Cloudflare or OpenRouter), Haiku with constrained JSON, and a Liquid AI LFM 1–3B on the tower, each answering the launch question set over the 10 specs plus 20 past issues, judged against your own labels. Score agreement, calibration (does 0.85 confidence mean 85% right), latency and cost per decision.
 4. Score each run: CI pass on first PR, reviewer findings count, turns, wall time, cost (Claude) or GPU-seconds (tower), and "would a human merge this unchanged" (you, 2 minutes each). For reviewers: findings matched against the auditor, false findings per PR.
 5. Decide per task shape, not per model: a shape stays `local` only if the chosen model passes CI first try on ≥ 70% and averages ≤ 1 finding; a reviewer enters rung 1 only if it matches ≥ 80% of the auditor's findings on the eval set; a decider backend is the default only if its agreement with your labels is ≥ 90% at the act threshold.
-6. Store the matrix in `evals/2026-10/results.csv` and link it from the routing section of the repo's docs. Re-run quarterly or on any model swap.
+6. Every eval and replay checkout is a single commit at base (`verifier-checkout-without-history`), so no fix is reachable through history.
+7. Store the matrix in `evals/2026-10/results.csv` and link it from the routing section of the repo's docs. Re-run quarterly or on any model swap.
 
 The eval also decides the GPU question: if DeepSeek V4.1 Flash passes shapes the tower fails, a RunPod serverless adapter is worth building; if not, it isn't.
 
@@ -1270,7 +1283,7 @@ These settle every question the first draft of this section raised. One line eac
 17. **Host-policy keys** (`ui_paths`, the module definition) as written; links are opaque `vigil:` references.
 18. **`statuses:read`** is granted with a ceiling entry (planned: the owner grants it in GitHub); tests per transition.
 19. **The auto-merge race** belongs to the phase 6 watcher; noted in the phase 6 plan.
-20. **The experiment line** is a sub-cap inside the $100 month; the month ceiling does not move.
+20. **The experiment line** is a sub-cap inside the $200 month; the month ceiling does not move.
 21. **The validator** is the one authoring session for a mined task, and the never-reused condition is enforced in code: session role recorded, checked at dispatch.
 22. **`eval-only`** is a flag beside the three provenance values, not a fourth; "any hosted provider", not xAI.
 23. **"Owner merges only"** for improvement proposals.
@@ -1311,7 +1324,7 @@ The per-phase detail (deliverables, credentials, spend) is in `docs/architecture
 | Phase | Delivers | Done when |
 | --- | --- | --- |
 | 1. Core | `vigild`, task contract, spec gate, intake scoring, jobs as trees with the state machine and the inbox, the coord loop, backends and presets, the model gateway, budgets (hard stops), per-call metering, Claude executor image with the guard plugin, per-task clone + container + egress proxy, host-side publish, GitHub App tokens, pinned dev images, OTel → Phoenix, CI (lint, types, tests) | an approved spec on ParkAgent produces a coord that writes `spec.md` and `plan.md`; you approve from the inbox; two workers build in their own containers; both open draft PRs through vigil-worker, each with `worker_report.json`; the job tree is readable from one endpoint |
-| 2. Review ladder + fleet + CLI/MCP + session proxy | reviewer + auditor, rung-0 audit of 100%, scheduler, WIP limit, escalation (forking full context), `vigil` CLI + MCP server, label intake, the session proxy (read and join a live session), the bridge's bus, MCP tools and `vigil-bridge`, documentation layers 4, 5, 7, verification level 1 | 3 batch tasks run in parallel, reviewed and audited; `vigil kill` works; dispatched once from a Claude Code session |
+| 2. Review ladder + fleet + CLI/MCP + session proxy | reviewer + auditor, rung-0 audit of 100%, scheduler, WIP limit, escalation (fresh context, ADR-0005), `vigil` CLI + MCP server, label intake, the session proxy (read and join a live session), the bridge's bus, MCP tools and `vigil-bridge`, documentation layers 4, 5, 7, verification level 1 | 3 batch tasks run in parallel, reviewed and audited; `vigil kill` works; dispatched once from a Claude Code session |
 | 3. Web UI + metering | the web UI in `docs/ui.md` (with `/talk`); metering as JSON and Prometheus `/metrics` | a session started from `/new` shows live on the board; per-call costs sum to the session total; `/metrics` shows it; a screenshot of each page |
 | 4. OpenCode executor | OpenCode v2 executor image on Claude through the gateway; both executors pass the same contract tests | the same docs task passes through both executors with identical results and traces |
 | 5. Tower | llama-server (router mode), models.lock, tower exporter, GPU metering, tower presets, LFM decider | `tower/check.sh` passes; one local task opens a PR; tokens/s and J/token recorded and shown |

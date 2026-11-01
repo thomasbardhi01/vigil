@@ -7,11 +7,15 @@ is `docs/design.md`; how it is built is `docs/architecture.md`; every
 feature's code, tests and status is `docs/feature-map.md`; decisions after
 phase 1 are ADRs in `docs/decisions/`; the owner's rulings are indexed in
 `docs/owner-rulings.md`. Read the feature map before exploring.
+Phase 3 is sequenced by gates in `docs/plans/phase-3.md`; the reports in
+`docs/research/` are unverified sources.
 `AGENTS.md` is a symlink to this file.
 
 ## Rules
 - **A human merges.** A Claude session never merges, approves, pushes to
   `main`, runs `gh workflow run`, or calls a write endpoint of `gh api`.
+  One exception (owner, 2026-10-31): coord may `gh run rerun <id> --failed`
+  a PR's own failed check, at most twice per PR, after posting the evidence.
   Work on a `feat/*` branch and open a draft PR. Merge tiers: docs- or
   tests-only with green CI, the owner enables auto-merge on sight; code,
   after a read; pinned paths, the owner reads the diff. One feature slice
