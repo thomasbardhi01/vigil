@@ -257,7 +257,8 @@ stateDiagram-v2
   building --> in_review: every task of the current plan has an open draft PR + worker_report.json
   in_review --> building: a finding of medium+ (fix round, same worker)
   ready --> building: owner, inbox only (fix with findings; back through in_review)
-  in_review --> ready: reviews clean, sampled audits clean, no PR head with .vigil/
+  in_review --> ready: reviews clean, sampled audits clean, no PR head with .vigil/, every PR landed (p3-09)
+  in_review --> building: landing REWORK (vigild only; a logic conflict or red on the rebased head; at most 2 per task)
   ready --> merged: every PR merged (vigild's PR poll)
   merged --> verifying
   verifying --> done: clean verify record (phase 6)
@@ -273,6 +274,26 @@ stateDiagram-v2
   acceptance in code, and writes a `state` event with its actor, channel
   and evidence. The owner's override (`force`) is logged and never skips
   approval.
+- **Landing (p3-09, #172, #221).** Before the ready card, vigild lands every live task's PR
+  (`Runner._land_prs`, `vigild/github/landing.py`): it applies the task's change onto the
+  remote's current main in its vault (`git merge-tree`, no work tree), runs the verifier on
+  that rebased head (`landing_tests.json`), sends the commit (no `.vigil/`) with a lease,
+  rewrites the PR's title and body from it, and records it as the task's `verified_sha`
+  (with `verified_main`), named on the ready card. A conflict in a non-generated file, or a
+  red verdict, is a **REWORK**: `in_review -> building` with `action: rework` (vigild only,
+  from the landing step, the reason and the files or failing tests on the event, at most 2
+  per task), the task to `fix` with the context in its next worker's packet (a fenced
+  `landing_rework.md`), a `landing_rework` card; the fresh worker reserves from the task's
+  own cap. The REWORK's worker starts from the current main (its old diff in the packet);
+  its publish **replaces** the branch only over the tip vigild itself last sent, keeping that
+  tip as `refs/vigil/rework/<task>/<n>` and recording old and new SHAs (`rework_published`);
+  every other publish only fast-forwards (owner, 2026-11-01). A change already on main
+  closes the task as landed by main (`landed_by_main`), with no worker; outside-scope and
+  generated-file conflicts have their own reasons. The third REWORK is refused: the job is
+  blocked and the owner paged
+  (`landing_rework_limit`). **The merge binding:** the PR poll records a task merged only if
+  the PR's head is its `verified_sha`; otherwise it pages (`merge_unverified`) and records
+  nothing. No model resolves a conflict on this path.
 - **`in_review` invariant (phase 1 run, finding #4).** A job enters
   `in_review` only if every task in its **current plan** (the latest
   `plan.md`) has an open PR for that plan's work: the task exists, is

@@ -55,6 +55,9 @@ class LandResult:
     conflicts: list[str] = field(default_factory=list)
     reason: str = ""
     pr_url: str | None = None
+    # why it is not landed: logic_conflict, generated_conflict, outside_scope,
+    # red_on_rebased or already_on_main
+    cause: str = ""
 
 
 def merge_allowed(*, pr_head: str | None, verified_sha: str | None) -> bool:
@@ -267,6 +270,7 @@ def land(
                         main_sha=main,
                         conflicts=conflicts,
                         reason=f"conflict with main in {logic}",
+                        cause="logic_conflict",
                     )
                 if attempt == RETRIES:
                     return LandResult(
@@ -274,6 +278,7 @@ def land(
                         main_sha=main,
                         conflicts=conflicts,
                         reason="generated files still conflict after one retry",
+                        cause="generated_conflict",
                     )
                 tree = _with_main_side(ws, repo, tree, main, conflicts)
                 tree = _regenerate(ws, repo, tree, conflicts, regenerate)
@@ -285,6 +290,7 @@ def land(
                 return LandResult(
                     "rework", main_sha=main, vault_head=rebased,
                     reason="the change is already on main: landing it changes nothing",
+                    cause="already_on_main",
                 )  # fmt: skip
             outside = out_of_scope(
                 [p for p in sent_paths if p.lower().split("/")[0] != VIGIL_DIR],
@@ -296,6 +302,8 @@ def land(
                     main_sha=main,
                     vault_head=rebased,
                     reason=f"the rebased head changes files outside the scope: {outside}",
+                    conflicts=outside,
+                    cause="outside_scope",
                 )
             ws._git(ws.vault(repo), "update-ref", f"refs/vigil/{task_id}-landed", rebased)
             if not verify(rebased):
@@ -304,6 +312,7 @@ def land(
                     main_sha=main,
                     vault_head=rebased,
                     reason="the verifier is red on the rebased head",
+                    cause="red_on_rebased",
                 )
             send = _commit(ws, repo, _public_tree(ws, repo, rebased, main), main, rebased)
             tip = ws.remote_tip(repo, branch, token)

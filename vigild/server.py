@@ -321,6 +321,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
             v.cfg.vigild.data_path / "deps",
         ),
         pr_state=GitHubPRs(app).state if app else None,
+        pr_head=GitHubPRs(app).head if app else None,
         capacity=Capacity(v.cfg, v.secrets, v.store),
     )
     runner.closers.append(client.close)
