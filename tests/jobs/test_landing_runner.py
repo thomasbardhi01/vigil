@@ -20,6 +20,7 @@ from tests.jobs.test_coord_loop import (  # noqa: F401
     REPO,
     World,
     _approve,
+    _work,
     auth,
     world,
 )
@@ -119,7 +120,6 @@ def test_rework_a_logic_conflict_at_landing_dispatches_a_fresh_worker_and_files_
     assert cards and path in json.dumps(cards[0]["body"])
     assert git(w.bare, "rev-parse", "refs/heads/main") == main  # main untouched
     assert git(w.bare, "rev-parse", f"refs/heads/{branch}") != "" and sent  # no force over it
-    assert w.store.q("SELECT verified_sha FROM tasks WHERE id=?", (tid,))[0]["verified_sha"] is None
 
 
 def test_a_merge_whose_head_is_not_the_verified_sha_is_refused_and_paged(world: World) -> None:
@@ -142,13 +142,22 @@ def test_a_merge_whose_head_is_not_the_verified_sha_is_refused_and_paged(world: 
 
 
 def test_a_third_rework_blocks_the_job_and_pages_the_owner(world: World) -> None:
-    """Guard 2 (owner, 2026-11-01): at most 2 REWORKs per task. Here the fresh workers make
-    the same change again, so it conflicts with main every time: two REWORKs, then the job
-    is blocked and the owner paged."""
+    """Guard 2 (owner, 2026-11-01): at most 2 REWORKs per task. Here main keeps moving under
+    the task (every worker session, someone else changes the same file on main), so every
+    landing conflicts: two REWORKs, then the job is blocked and the owner paged."""
     w = world
     job = _held_in_review(w)
     tid = f"{job}-w1"
     (path, *_) = _changed(w, tid)
+    racing = [0]
+
+    def edit(spec: Any, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])  # the stand-in's honest work
+        if str(spec.task_id) == tid:
+            racing[0] += 1
+            _main_edit(w, path, f"someone else's content {racing[0]}\n")
+
+    w.standin.worker_edit = edit
     _main_edit(w, path, "someone else's whole new content\n")
     w.runner.review(job)
     assert w.store.get_job(job).state is S.BLOCKED
@@ -158,12 +167,63 @@ def test_a_third_rework_blocks_the_job_and_pages_the_owner(world: World) -> None
     limit = [
         q for q in qs if q["job_id"] == job and q["body"].get("kind") == "landing_rework_limit"
     ]
-    assert len(reworks) == 2 and len(limit) == 1
+    kinds = [(q["body"].get("kind"), q["title"]) for q in qs if q["job_id"] == job]
+    assert len(reworks) == 2 and len(limit) == 1, kinds
     assert path in json.dumps(limit[0]["body"])
     rows = w.store.q("SELECT data FROM events WHERE job_id=? AND type='state' ORDER BY id", (job,))
     evs = [json.loads(r["data"])["evidence"] for r in rows]
     rw = [e for e in evs if e.get("action") == "rework" and e.get("task") == tid]
     assert len(rw) == 2 and all(e["reason"] == "logic_conflict" and path in e["files"] for e in rw)
+
+
+def test_a_rework_rebuilds_on_main_replaces_the_branch_under_lease_and_runs_the_full_gate(
+    world: World,
+) -> None:
+    """Guards 1 and 2 (owner, 2026-11-01): the REWORK's worker starts from the current
+    main; its publish replaces the branch only after the old tip is kept as
+    refs/vigil/rework/<task>/<n>, and an event names the old and new SHAs; the new head then
+    runs the full gate (the verifier with its record for the new head, review, landing), and
+    the PR's title and body are rebuilt from it (#221)."""
+    w = world
+    job = _held_in_review(w)
+    tid = f"{job}-w1"
+    (path, *_) = _changed(w, tid)
+    branch = _pr(w, tid)["branch"]
+    old_tip = git(w.bare, "rev-parse", f"refs/heads/{branch}")
+    main = _main_edit(w, path, "someone else's whole new content\n")
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.READY
+    (ev,) = [
+        json.loads(r["data"]) for r in w.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='rework_published'", (tid,))
+    ]  # fmt: skip
+    assert ev["old_sha"] == old_tip and ev["new_sha"] and ev["new_sha"] != old_tip
+    vault = w.runner.workspace.vault(REPO)
+    assert git(vault, "rev-parse", f"refs/vigil/rework/{ev['rework']}") == old_tip
+    head = _pr(w, tid)["head"]
+    assert w.runner.workspace.is_ancestor(REPO, main, head)  # rebuilt on main
+    tests = w.store.get_artifact(job, "tests.json", tid)
+    assert tests is not None and json.loads(tests.content)["after"]["sha"]
+    assert w.store.get_artifact(job, "review.json", tid) is not None
+    row = w.store.q("SELECT verified_sha FROM tasks WHERE id=?", (tid,))[0]
+    assert git(w.bare, "rev-parse", f"refs/heads/{branch}") == row["verified_sha"]
+    assert w.publisher.updates  # the PR's title and body were rebuilt
+
+
+def test_a_change_already_on_main_closes_the_task_as_landed_by_main(world: World) -> None:
+    """Owner, 2026-11-01: no worker; the task is closed as landed by main."""
+    w = world
+    job = _held_in_review(w)
+    tid = f"{job}-w1"
+    vault = w.runner.workspace.vault(REPO)
+    pr = _pr(w, tid)
+    for path in _changed(w, tid):  # main gets exactly the task's change
+        _main_edit(w, path, git(vault, "show", f"{pr['head']}:{path}") + "\n")
+    before = len(_workers(w, tid))
+    w.runner.review(job)
+    assert w.store.get_task(tid).state == "merged"
+    assert w.store.q("SELECT 1 FROM events WHERE task_id=? AND type='landed_by_main'", (tid,))
+    assert len(_workers(w, tid)) == before  # no worker
 
 
 def test_a_rework_spends_from_the_same_task_cap(world: World) -> None:

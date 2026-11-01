@@ -819,3 +819,72 @@ def test_the_landing_queue_orders_approval_times_as_instants() -> None:
     q.add("o/a", "later", approved_at="2026-11-01T10:30:00+00:00")
     q.add("o/a", "earlier", approved_at="2026-11-01T06:00:00-04:00")  # 10:00 UTC
     assert q.take("o/a") == "earlier"
+
+
+# --- REWORK publish (owner, 2026-11-01): same branch, lease on vigild's own send --------
+
+
+def _rebuilt_on_new_main(
+    ws: Workspace, tmp_path: Path, fixture_repo: dict[str, Path]
+) -> tuple[str, str]:
+    """A REWORK worker's head: main moved, the task rebuilt from the new main."""
+    seed, bare = fixture_repo["seed"], fixture_repo["bare"]
+    _main_commit(seed, bare, "docs/runbook.md", "# Runbook\nnew main\n", "main moved")
+    clone = ws.clone(REPO, f"{TID}-r", branch=BRANCH, base="main")
+    base2 = ws.base_sha(f"{TID}-r")
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nrate limit, again\n")
+    r = finish_session(clone, tmp_path / "out2", branch=BRANCH, base_sha=base2)
+    head2 = ws.import_result(REPO, f"{TID}-r", tmp_path / "out2", BRANCH, base2, head=r["head"])
+    return base2, head2
+
+
+def test_rework_replace_keeps_the_old_tip_and_sends_the_rebuilt_head(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path
+) -> None:
+    """Guard 1: before the force-with-lease, the old tip is kept in the vault as
+    refs/vigil/rework/<task>/<n>; the branch then holds the rebuilt head, on the new main."""
+    ws, base, head, bare = setup
+    pulls = EditablePulls(bare)
+    url = _pub(ws, base, head, pulls)
+    old = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    publish(ws, repo=REPO, head=head2, base_sha=base2, branch=BRANCH, base="main",
+            title="t2", body="rebuilt", pulls=pulls, scope=["docs/feature-map.md"],
+            existing=url, replace=f"{TID}/1")  # fmt: skip
+    new = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert new != old and ws.is_ancestor(REPO, base2, new)
+    assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
+    assert pulls.updates and "rebuilt" in pulls.updates[-1]["body"]  # #221
+
+
+def test_rework_replace_over_a_tip_vigild_did_not_send_is_branch_moved(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path
+) -> None:
+    """Guard 3: a REWORK replaces only vigild's own send."""
+    ws, base, head, bare = setup
+    url = _pub(ws, base, head, FakePulls(bare))
+    outside = _other_commit(bare, git(bare, "rev-parse", f"refs/heads/{BRANCH}"), "a hand push")
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", outside)
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    with pytest.raises(PublishError) as raised:
+        publish(ws, repo=REPO, head=head2, base_sha=base2, branch=BRANCH, base="main",
+                title="t", body="b", pulls=FakePulls(bare), scope=["docs/feature-map.md"],
+                existing=url, replace=f"{TID}/1")  # fmt: skip
+    assert type(raised.value).__name__ == "BranchMoved"
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == outside
+
+
+def test_a_plain_publish_of_a_rebuilt_head_still_only_fast_forwards(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path
+) -> None:
+    """Guard 3: without `replace`, a head on a new base can't replace vigild's own send:
+    every path but landing and REWORK stays fast-forward-only."""
+    ws, base, head, bare = setup
+    url = _pub(ws, base, head, FakePulls(bare))
+    sent = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    publish(ws, repo=REPO, head=head2, base_sha=base2, branch=BRANCH, base="main",
+            title="t", body="b", pulls=FakePulls(bare), scope=["docs/feature-map.md"],
+            existing=url)  # fmt: skip
+    tip = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert ws.is_ancestor(REPO, sent, tip)  # chained on the last send: a fast-forward

@@ -310,7 +310,7 @@ def _verified(c: Ctx) -> list[str]:
     return []
 
 
-REWORK_REASONS = ("logic_conflict", "red_on_rebased")
+REWORK_REASONS = ("logic_conflict", "red_on_rebased", "outside_scope", "generated_conflict")
 MAX_REWORKS = 2  # per task (owner, 2026-11-01); the third blocks the job and pages
 
 
@@ -327,13 +327,15 @@ def _rework(c: Ctx) -> list[str]:
     reason = ev.get("reason")
     if reason not in REWORK_REASONS:
         errs.append(f"a REWORK names its reason, one of {list(REWORK_REASONS)}")
-    if reason == "logic_conflict" and not ev.get("files"):
+    if reason in ("logic_conflict", "outside_scope", "generated_conflict") and not ev.get("files"):
         errs.append("a logic-conflict REWORK names the conflicting files")
     if reason == "red_on_rebased" and not ev.get("failing"):
         errs.append("a red-on-rebased REWORK names the failing tests")
     task = ev.get("task")
     if not task:
         errs.append("a REWORK names its task")
+    elif task not in {t.id for t in c.store.list_tasks(c.job.id)}:
+        errs.append(f"{task} is not a task of {c.job.id}")
     else:
         done = sum(
             1

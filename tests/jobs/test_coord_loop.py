@@ -351,10 +351,11 @@ class BarePublisher:
         scope: list[str],
         existing: str | None = None,
         job_id: str | None = None,
+        replace: str | None = None,
     ) -> str:
         from vigild.github.publish import publish
 
-        prs = self.prs
+        prs, updates = self.prs, self.updates
 
         class Pulls:
             def create_pull(
@@ -364,6 +365,9 @@ class BarePublisher:
                     {"head": head, "base": base, "title": title, "draft": draft, "body": body}
                 )
                 return f"https://github.com/{repo}/pull/{len(prs)}"
+
+            def update_pull(self, repo: str, url: str, *, title: str, body: str) -> None:
+                updates.append({"url": url, "title": title, "body": body})
 
         assert self.ws is not None
         return publish(
@@ -378,6 +382,7 @@ class BarePublisher:
             pulls=Pulls(),
             scope=scope,
             existing=existing,
+            replace=replace,
         )
 
     updates: list[dict[str, Any]] = field(default_factory=list)

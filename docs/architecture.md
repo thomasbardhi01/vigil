@@ -284,7 +284,13 @@ stateDiagram-v2
   from the landing step, the reason and the files or failing tests on the event, at most 2
   per task), the task to `fix` with the context in its next worker's packet (a fenced
   `landing_rework.md`), a `landing_rework` card; the fresh worker reserves from the task's
-  own cap. The third REWORK is refused: the job is blocked and the owner paged
+  own cap. The REWORK's worker starts from the current main (its old diff in the packet);
+  its publish **replaces** the branch only over the tip vigild itself last sent, keeping that
+  tip as `refs/vigil/rework/<task>/<n>` and recording old and new SHAs (`rework_published`);
+  every other publish only fast-forwards (owner, 2026-11-01). A change already on main
+  closes the task as landed by main (`landed_by_main`), with no worker; outside-scope and
+  generated-file conflicts have their own reasons. The third REWORK is refused: the job is
+  blocked and the owner paged
   (`landing_rework_limit`). **The merge binding:** the PR poll records a task merged only if
   the PR's head is its `verified_sha`; otherwise it pages (`merge_unverified`) and records
   nothing. No model resolves a conflict on this path.
