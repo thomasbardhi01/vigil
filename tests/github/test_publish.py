@@ -1020,6 +1020,11 @@ def test_hold_by_the_same_job_from_two_threads_lands_both_in_turn() -> None:
         threading.Event().wait(0.01)
     b = threading.Thread(target=land, args=("b",))
     b.start()
+    for _ in range(200):  # b is parked on the slot before a lets go
+        if q._turn._waiters:  # type: ignore[attr-defined]
+            break
+        threading.Event().wait(0.01)
+    assert q._turn._waiters  # type: ignore[attr-defined]
     gate.set()
     a.join(timeout=5)
     b.join(timeout=5)
