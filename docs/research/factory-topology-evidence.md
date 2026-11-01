@@ -1,6 +1,6 @@
 # Factory topology: in-house evidence (read-only, gathered 2026-11-01)
 
-In-house evidence for the factory topology and advisor seats research (owner, 2026-11-01; the research plan is `claude/research/factory-topology-research-plan.md` in the owner's project, not in this repo). Feeds experiment #37. Facts only; every number has its query or file beside it.
+In-house evidence for the factory topology and advisor seats research (owner, 2026-11-01; the research plan is `claude/research/factory-topology-research-plan.md` in the owner's project, not in this repo). Feeds experiments #37a and #37b (baselines) and R32 (the advisor reservation's size). Facts only; every number has its query or file beside it.
 
 Sources: `~/vigil-data/vigil.db` (sqlite3 -readonly), `git show origin/main:configs/*.yaml`, `git log origin/main`.
 
