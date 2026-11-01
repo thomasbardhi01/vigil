@@ -232,6 +232,7 @@ class PrefixRecord:
     cached_tokens: int
     at: float
     prompt_tokens: int = 0
+    ttl: str = "5m"  # the TTL its writes asked for: how long the provider keeps them
 
 
 UPSTREAM_READ_S = 600.0  # the longest an upstream call waits for its next bytes
@@ -597,7 +598,8 @@ class Gateway:
         thinking, tools, system, messages) is by hash the start of this one's. Nothing the
         request claims about caching is read. Takes no lock."""
         rec = self._prefix.get(session_id)
-        valid = PREFIX_TTL_5M_S if write_ttl(body) == "5m" else PREFIX_TTL_S  # 1h: 60 min, capped
+        # the window follows the write that made the entry, not this request (owner, 2026-11-01)
+        valid = PREFIX_TTL_5M_S if rec is None or rec.ttl == "5m" else PREFIX_TTL_S  # 1h, capped
         if rec is None or rec.prompt_tokens <= 0 or self._now() - rec.at > valid:
             return None
         msgs = body.get("messages")
@@ -749,7 +751,7 @@ class Gateway:
         fp = hold.fingerprint
         if fp is not None and prompt > 0:
             self._prefix[gs.session_id] = PrefixRecord(
-                fp[0], fp[1], fp[2], cached, self._now(), prompt
+                fp[0], fp[1], fp[2], cached, self._now(), prompt, write_ttl(hold.body)
             )
         else:
             self._prefix.pop(gs.session_id, None)

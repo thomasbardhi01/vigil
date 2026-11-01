@@ -457,30 +457,56 @@ def test_a_cache_write_earns_the_read_rate_on_the_next_call(
     assert h.premium > 0
 
 
-def test_a_1h_prefix_is_valid_for_fifty_minutes_and_a_5m_one_for_five(
+def test_a_prefixs_validity_follows_the_ttl_of_the_write_that_made_it(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
 ) -> None:  # fmt: skip
-    """The record's validity follows the TTL the request asks for (5m: 5 minutes, 1h: 60
-    minutes, capped by the 50-minute ceiling)."""
+    """Owner, 2026-11-01 (follow-up to #256): a cached prefix is valid for the TTL its
+    write asked for (5m: 5 minutes; 1h: 60 minutes, capped by the 50-minute ceiling), not
+    the TTL the next request asks for."""
     _reads(upstream, 20_000)
-    _sid, tok = _sess(store, budget, gw, 1.0)
     upstream.count = 9_999
     miss = _usd(gw, tokens_cache_write_5m=9_999, tokens_out=OUT)
     miss_1h = _usd(gw, tokens_cache_write_1h=9_999, tokens_out=OUT)
-    assert _post(client, tok, _first()).status_code == 200
-    clock[0] += 4 * MIN
-    assert _pre(gw, tok, _second()).premium > 0  # a hit after 4 minutes on a 5m request
-    clock[0] += 2 * MIN  # 6 minutes
-    h = _pre(gw, tok, _second())
-    assert h.amount == pytest.approx(miss) and h.premium == 0
+    # a 1h write: valid for 50 minutes, whatever the next request asks for
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, _with_ttl(_first(), "1h")).status_code == 200
+    clock[0] += 6 * MIN
+    assert _pre(gw, tok, _second()).premium > 0  # a 5m request at 6 minutes: still a hit
     one_h = _with_ttl(_second(), "1h")
-    assert _pre(gw, tok, one_h).premium > 0  # still a hit at 6 minutes on a 1h request
     clock[0] += 43 * MIN  # 49 minutes
     assert _pre(gw, tok, one_h).premium > 0
     clock[0] += 2 * MIN  # 51 minutes
     h = _pre(gw, tok, one_h)
     assert h.amount == pytest.approx(miss_1h) and h.premium == 0
+    # a 5m write: valid for 5 minutes
+    _sid2, tok2 = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok2, _first()).status_code == 200
+    clock[0] += 4 * MIN
+    assert _pre(gw, tok2, _second()).premium > 0  # a hit after 4 minutes
+    clock[0] += 2 * MIN  # 6 minutes
+    h = _pre(gw, tok2, _second())
+    assert h.amount == pytest.approx(miss) and h.premium == 0
+
+
+def test_a_5m_write_then_a_1h_request_is_a_hit_for_at_most_five_minutes(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The case the #256 reviews flagged: the previous call wrote at 5m, the next asks for
+    1h. The provider's entry expired at 5 minutes, so at 6 minutes the call is counted
+    again at the 1h write rate, not priced as a hit."""
+    _reads(upstream, 20_000)
+    upstream.count = 9_999
+    miss_1h = _usd(gw, tokens_cache_write_1h=9_999, tokens_out=OUT)
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, _first()).status_code == 200  # a 5m write
+    one_h = _with_ttl(_second(), "1h")
+    clock[0] += 4 * MIN
+    assert _pre(gw, tok, one_h).premium > 0  # within 5 minutes: a hit
+    clock[0] += 2 * MIN  # 6 minutes
+    h = _pre(gw, tok, one_h)
+    assert h.amount == pytest.approx(miss_1h) and h.premium == 0 and h.reason == "count"
 
 
 def test_a_changed_model_or_thinking_is_counted_again(
