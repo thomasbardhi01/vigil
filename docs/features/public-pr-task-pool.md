@@ -9,3 +9,4 @@ tests: '—'
 status: planned
 ---
 At least 200 admitted tasks from public PRs. Plan item p3-12.
+Each task's `metadata.json` gains `horizon_min`: the owner's unaided time for the task, a METR-style stratum (the Lab brief, 2026-11-01).

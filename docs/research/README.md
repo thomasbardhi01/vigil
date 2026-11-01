@@ -24,7 +24,36 @@ reviewer, auditor or coord packet includes them
 | `model-auto-routing.md` | Route on verifier outcomes, not on prompts | 2026-10-30 | §10, R13, p3-36–p3-40, p3-49 |
 | `landing-and-trust-ladder.md` | Conflict-free landing, Lauren Tan's trust ladder, the one-app question, and Vigil as a service | 2026-10-31 | §7, R15–R21, p3-09, p3-05, p3-47, p3-48 |
 | `rust-and-retrieval.md` | Vigil and Rust: code-retrieval evidence, Rust AI infrastructure, and a Rust target stack | 2026-11-01 | R26, p3-63, experiment #17's design |
+| `the-lab-assessment.md` | "The Lab" inside Vigil: assessment of the ChatGPT research-lab proposal | 2026-11-01 | R27, p3-64–p3-68, experiments #25–#26 (an advisor assessment of an owner-supplied report with unverified citations) |
 
 Paths inside the reports (`/home/claude/reports/…`, `/home/claude/vigil/…`)
 are the research environment's, not this repo's; the report each one names is
 the file above with that title.
+
+## Claims under test
+
+The claims register (p3-69). The claim text is the owner's.
+
+| # | Claim | Falsified if | Vigil item that measures it |
+|---|---|---|---|
+| C1 | One person with a gate lands verified software faster per owner-minute than the same person with the best free pipeline | the strawman baseline (§3, brief B) matches Vigil on owner-min/PR and 30-day revert rate. A falsifier only fires at n_required (Brief E); below it the result is inconclusive. | p3-41, experiment #20 + new #27 |
+| C2 | Hidden tests in a fresh checkout catch defects that visible tests and review miss, at a cost worth paying | post-merge revert and CI-at-48h rates do not differ between hidden-test and visible-test arms on Vigil's repos. A falsifier only fires at n_required (Brief E); below it the result is inconclusive. | p3-44 + new #28 |
+| C3 | Autonomy earned per shape by SPRT is safer and cheaper than uniform human review | ladder promotions do not reduce owner-minutes, or promoted shapes revert more than rung-0 shapes. A falsifier only fires at n_required (Brief E); below it the result is inconclusive. | p3-31 + new #29 |
+| C4 | The gate transfers: it holds on repos, stacks and machines that are not the owner's | the first non-owner repo at `mvp` profile needs a gate property removed to land anything | R21, p3-63, Track F; experiment entry pending Brief G |
+| C5 | Vigil's verified, cost-labelled trajectories are an asset in their own right | no buyer, no benchmark and no training recipe wants real-repo traces with provenance beyond what SWE-Gym-class synthetic sets already give. Falsification step: one real conversation with a data buyer or eval-pool maintainer (owner) | R20, E9, p3-14 |
+
+## Research briefs
+
+Each brief's report lands as `docs/research/<brief-id>-<slug>.md`, under the
+unverified notice above.
+
+| Brief | Subject | Status | Tier | Would change |
+|---|---|---|---|---|
+| A | The claim and the counterfactual | planned | 2 | the `docs/design.md` thesis paragraph and the G3 brand card |
+| B | The cheap strawman | planned | 1 | #20 (new arm #27) and C1's wording; its property table is descriptive; C1's outcome measures (owner-min/PR, 30-day reverts) decide any rewrite of the `docs/design.md` thesis |
+| C | Prior art per gate property | planned | 2 | this README's prior-art section and the claim wording; anything found to be standard leaves the "edge" list |
+| D | Falsifiers | planned | 2 | entries #28–#31 and the kill criteria, one line per property |
+| E | The numbers nobody has | planned | 1 | the order of the Lab's first five experiments and the n_required field; drops any closed gap, citing the paper that closed it; reports search coverage (venues, queries, date range) beside every "open" verdict |
+| F | The asset thesis | planned | 1 | p3-12/p3-24 priority, the trajectory exporter schema, and plan B's wording in the kill criterion |
+| G | Transfer | planned | 2 | R21's mvp row, Track F's `vigil init`, and the first non-owner repo's acceptance criteria |
+| H | The abstract | planned (owner work, not assigned) | 3 | — |

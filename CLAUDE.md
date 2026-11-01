@@ -157,8 +157,8 @@ Regenerate `schemas/*.json` after changing a contract model:
   `uv.lock` committed and `--locked` green.
 - `starlette.testclient` uses `httpx2`; don't add `httpx`.
 - The job FSM (`vigild/jobs/fsm.py`) is the only place a job's state
-  changes. Inbox approval by the owner is the only exit from
-  `spec_pending`; every transition writes an `events` row.
+  changes. Inbox approval (owner, or coord within owner-rulings.md) is
+  the only exit from `spec_pending`; every transition writes an `events` row.
 - Detection globs are guard's and route's: a glob without `/` matches the
   basename anywhere; with `/` it matches the path's tail;
   case-insensitive (`vigild/intake/paths.py`).
