@@ -201,11 +201,12 @@ def test_a1s_refused_call_is_admitted_and_its_input_hold_is_a_cent_or_two(
     clock[0] += 2 * MIN
     second = _second(n_first, 4_500)
     tail = _tail_tokens(_first(n_first), second)
-    expect_in = _usd(gw, tokens_cache_read=76_059, tokens_cache_write_5m=2 + 1_126 + tail)
+    # owner, 2026-11-01: the 1,126 the previous call wrote are cached too, at the read rate
+    expect_in = _usd(gw, tokens_cache_read=76_059 + 1_126, tokens_cache_write_5m=2 + tail)
     h = _pre(gw, tok, second, keep=True)
     try:
         assert h.amount == pytest.approx(expect_in + _usd(gw, tokens_out=OUT))
-        assert h.amount - _usd(gw, tokens_out=OUT) == pytest.approx(0.014, abs=0.002)
+        assert h.amount - _usd(gw, tokens_out=OUT) == pytest.approx(0.011, abs=0.002)
     finally:
         gw.release(h)
     assert _post(client, tok, second).status_code == 200  # admitted
@@ -410,10 +411,13 @@ def test_openrouter_has_no_count_endpoint_so_it_is_a_third_of_the_bytes(
 # --- the guards kept from #215 ------------------------------------------------------------
 
 
-def test_a_call_in_flight_makes_the_next_a_miss_counted_exactly(
+def test_a_call_in_flight_does_not_make_the_next_a_miss(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
 ) -> None:  # fmt: skip
+    """Owner, 2026-11-01 (vi-0019 A1, step a): the prefix the last *completed* call reported
+    is held at the read rate whether or not another call of the session is in flight; what
+    the call in flight is still writing is in the tail, at the write rate."""
     reads = 20_000
     _reads(upstream, reads)
     _sid, tok = _sess(store, budget, gw, 1.0)
@@ -423,29 +427,34 @@ def test_a_call_in_flight_makes_the_next_a_miss_counted_exactly(
     b = _pre(gw, tok, _second(), keep=True)  # the first is still in flight
     try:
         tail = _tail_tokens(_first(), _second())
-        assert a.amount == pytest.approx(
-            _usd(gw, tokens_cache_read=reads, tokens_cache_write_5m=5 + tail, tokens_out=OUT)
-        )
-        assert b.cached_tokens == 0 and b.premium == 0
-        assert b.amount > a.amount
+        expect = _usd(gw, tokens_cache_read=reads, tokens_cache_write_5m=5 + tail, tokens_out=OUT)
+        assert a.amount == pytest.approx(expect)
+        assert b.amount == pytest.approx(expect)
+        assert b.cached_tokens == reads and b.premium > 0
+        assert "/v1/messages/count_tokens" not in upstream.paths()[1:]  # a match is never counted
     finally:
         gw.release(a)
         gw.release(b)
 
 
-def test_a_cache_write_never_earns_the_read_rate(
+def test_a_cache_write_earns_the_read_rate_on_the_next_call(
     client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
     clock: list[float],
 ) -> None:  # fmt: skip
-    """G1: tokens the previous call wrote are held at the write rate, not the read rate;
-    its prompt total is still known from usage, not estimated."""
+    """Owner, 2026-11-01 (vi-0019 A1, step a): tokens the previous completed call reported
+    as cached, reads and writes alike, are held at the read rate on the next call; a miss
+    goes through the overshoot path."""
     upstream.usage = {"input_tokens": 5, "cache_creation": {"ephemeral_5m_input_tokens": 20_000}}
+    upstream.count = 20_005  # the first call's exact count, so it is no overshoot
     _sid, tok = _sess(store, budget, gw, 1.0)
     assert _post(client, tok, _first()).status_code == 200
     tail = _tail_tokens(_first(), _second())
     h = _pre(gw, tok, _second())
-    assert h.amount == pytest.approx(_usd(gw, tokens_cache_write_5m=20_005 + tail, tokens_out=OUT))
-    assert h.premium == 0
+    assert h.cached_tokens == 20_000
+    assert h.amount == pytest.approx(
+        _usd(gw, tokens_cache_read=20_000, tokens_cache_write_5m=5 + tail, tokens_out=OUT)
+    )
+    assert h.premium > 0
 
 
 def test_a_1h_prefix_is_valid_for_fifty_minutes_and_a_5m_one_for_five(
@@ -1049,3 +1058,136 @@ def test_a_send_that_fails_before_the_response_starts_still_releases_exactly_onc
     asyncio.run(run())
     assert sid not in gw._inflight and budget.premium_total() == 0
     assert len([a for a in released if a > 0]) == 1
+
+
+# --- vi-0019 A1, step (a): the last completed call's prefix, and recorded holds --------
+#
+# s-c6578bd1c4 (2026-11-01, 13:23:49-13:24:26 UTC): call 3 (id 1922) reported
+# 2 / 50,029 read / 2,088 written (5m); call 4 (id 1923) was in flight when call 5 was
+# issued, and call 5 was refused: held as a full miss, $0.1672 left, under the floor.
+
+A1_IN, A1_READ, A1_WRITE = 2, 50_029, 2_088
+A1_LEFT = 0.1672  # the session's reservation left after call 4's hold (the refusal's figure)
+
+
+def _third(n: int = 30_000) -> dict[str, Any]:
+    """Call 5: call 4's messages, call 4's answer, and a new tail."""
+    body = _second(n)
+    return {
+        **body,
+        "messages": [
+            *body["messages"],
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [{"type": "text", "text": "z" * 3_000}]},
+        ],
+    }
+
+
+def test_a1s_fifth_call_while_the_fourth_is_in_flight_holds_the_prefix_at_the_read_rate(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Call 5 is held at the read rate for the prefix call 3 reported as cached (its
+    50,029 reads and 2,088 writes, which is what call 4 then read: 52,117), not as a full
+    miss, so A1's $0.1672 admits it above the output floor."""
+    up = upstream
+    up.usage = {
+        "input_tokens": A1_IN,
+        "cache_read_input_tokens": A1_READ,
+        "cache_creation": {"ephemeral_5m_input_tokens": A1_WRITE},
+    }
+    first_cost = _usd(
+        gw, tokens_in=A1_IN, tokens_cache_read=A1_READ, tokens_cache_write_5m=A1_WRITE,
+        tokens_out=up.usage_out,
+    )  # fmt: skip
+    tail4 = _tail_tokens(_first(), _second())
+    hold4 = _usd(
+        gw, tokens_cache_read=A1_READ + A1_WRITE, tokens_cache_write_5m=A1_IN + tail4,
+        tokens_out=OUT,
+    )  # fmt: skip
+    up.count = A1_IN + A1_READ + A1_WRITE  # call 3's exact count: no overshoot
+    _sid, tok = _sess(store, budget, gw, first_cost + hold4 + A1_LEFT)
+    assert _post(client, tok, _first()).status_code == 200
+    clock[0] += 3
+    four = _pre(gw, tok, _second(), keep=True)  # call 4, in flight
+    try:
+        assert four.amount == pytest.approx(hold4)
+        five = _pre(gw, tok, _third(), keep=True)  # call 5, issued while call 4 is in flight
+        try:
+            tail5 = _tail_tokens(_first(), _third())
+            assert five.cached_tokens == A1_READ + A1_WRITE == 52_117
+            assert five.body["max_tokens"] >= 4096  # admitted above the floor
+            assert five.amount == pytest.approx(
+                _usd(
+                    gw, tokens_cache_read=52_117, tokens_cache_write_5m=A1_IN + tail5,
+                    tokens_out=five.body["max_tokens"],
+                )
+            )  # fmt: skip
+            assert five.amount <= A1_LEFT + 1e-9
+            assert five.reason == "prefix"
+        finally:
+            gw.release(five)
+    finally:
+        gw.release(four)
+
+
+def test_a1s_fifth_call_forced_to_miss_overshoots_by_at_most_its_premium_and_pages(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The same call 5, but the provider had lost the prefix and wrote all of it again:
+    the excess over its task hold is at most its miss premium, it is `settle_excess`
+    (`cache_miss`), it pages, and the task's later calls are held as misses."""
+    up = upstream
+    up.usage = {
+        "input_tokens": A1_IN,
+        "cache_read_input_tokens": A1_READ,
+        "cache_creation": {"ephemeral_5m_input_tokens": A1_WRITE},
+    }
+    up.count = A1_IN + A1_READ + A1_WRITE  # call 3's exact count: no overshoot
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, _first()).status_code == 200
+    clock[0] += 3
+    four = _pre(gw, tok, _second(), keep=True)  # call 4, in flight
+    try:
+        five = _pre(gw, tok, _third())
+        premium = five.premium
+        assert premium > 0
+        tail5 = _tail_tokens(_first(), _third())
+        up.usage = {
+            "input_tokens": A1_IN,
+            "cache_creation": {"ephemeral_5m_input_tokens": A1_READ + A1_WRITE + tail5},
+        }
+        assert _post(client, tok, _third()).status_code == 200  # call 5, a miss
+    finally:
+        gw.release(four)
+    (ev,) = [e for e in store.events() if e.type == "settle_excess"]
+    assert ev.data["reason"] == "cache_miss"
+    assert 0 < ev.data["excess_usd"] <= premium + 1e-9
+    (page,) = [i for i in store.list_inbox() if i.kind == "page"]
+    assert "overshoot" in page.title
+    h = _pre(gw, tok, _third())
+    assert h.cached_tokens == 0 and h.premium == 0 and h.reason == "task_miss"
+
+
+def test_every_metered_call_records_its_hold_and_why(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """`model_calls.hold_usd` and `hold_reason`: a first call counted by the provider is
+    `count`; a call whose prefix matched is `prefix`; a call whose count failed is
+    `estimate`; each row's hold_usd is the hold placed for it."""
+    _reads(upstream, 20_000)
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    first_hold = _pre(gw, tok, _first()).amount
+    assert _post(client, tok, _first()).status_code == 200
+    second_hold = _pre(gw, tok, _second()).amount
+    assert _post(client, tok, _second()).status_code == 200
+    upstream.count_status = 500
+    _sid2, tok2 = _sess(store, budget, gw, 1.0)
+    third_hold = _pre(gw, tok2, _first()).amount
+    assert _post(client, tok2, _first()).status_code == 200
+    rows = store.q("SELECT session_id, hold_usd, hold_reason FROM model_calls ORDER BY id")
+    assert [r["hold_reason"] for r in rows] == ["count", "prefix", "estimate"]
+    for r, held in zip(rows, (first_hold, second_hold, third_hold), strict=True):
+        assert r["hold_usd"] == pytest.approx(held)
