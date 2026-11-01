@@ -1388,3 +1388,54 @@ def test_a_miss_records_no_role_it_does_not_know_and_nothing_without_a_record(
     (ev,) = [e for e in store.events() if e.type == "prefix_miss"]
     assert ev.data["index"] == 1 and ev.data["role"] is None
     assert "SECRET" not in json.dumps(ev.data)
+
+
+# --- the provider must read what the hold prices at the read rate (owner, 2026-11-01) ----
+
+
+def _guard_session(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, up: Upstream,
+    clock: list[float],
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:  # fmt: skip
+    """The previous call: marker on message 4 (a tool result); 9 rounds of turns to follow."""
+    turns = _cc_turns(9)
+    n = _cc(turns[:5], marker_at=4)
+    tok = _cc_session(client, gw, store, budget, up, n)
+    clock[0] += 10
+    return tok, turns, n
+
+
+def test_the_same_prefix_without_a_marker_on_the_new_request_is_held_as_a_miss(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """No breakpoint at or after the matched prefix's end: the provider will not read it."""
+    tok, turns, _n = _guard_session(client, gw, store, budget, upstream, clock)
+    h = _pre(gw, tok, _cc(turns[:7], marker_at=-1))
+    assert h.reason == "count" and h.cached_tokens == 0
+    (ev,) = [e for e in store.events() if e.type == "prefix_miss"]
+    assert ev.data["part"] == "no_marker"
+
+
+def test_a_new_marker_21_blocks_past_the_old_one_is_held_as_a_miss(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The provider looks back 20 blocks from a breakpoint: 21 blocks past the previous
+    marker (7 rounds of 3 blocks) it does not find the cached prefix."""
+    tok, turns, _n = _guard_session(client, gw, store, budget, upstream, clock)
+    h = _pre(gw, tok, _cc(turns, marker_at=18))
+    assert h.reason == "count" and h.cached_tokens == 0
+    (ev,) = [e for e in store.events() if e.type == "prefix_miss"]
+    assert ev.data["part"] == "lookback"
+
+
+def test_a_new_marker_3_blocks_past_the_old_one_is_held_as_a_prefix(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """One round later (3 blocks), well within the lookback: read-rate pricing."""
+    tok, turns, _n = _guard_session(client, gw, store, budget, upstream, clock)
+    h = _pre(gw, tok, _cc(turns[:7], marker_at=6))
+    assert h.reason == "prefix" and h.cached_tokens == 9_000
+    assert not [e for e in store.events() if e.type == "prefix_miss"]

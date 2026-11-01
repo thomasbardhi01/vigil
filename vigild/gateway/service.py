@@ -221,12 +221,23 @@ class PrefixShape:
     """A request's input as the prefix match sees it (owner, 2026-11-01): the head
     (model, thinking, tools, system), one hash per message, all with cache markers stripped;
     the index of the last message that carries a marker (-1 if none), and the UTF-8 bytes
-    of the head plus each message so far. Hashes and lengths only, never content."""
+    of the head plus each message so far; and, in the provider's order (tools, system,
+    messages), where each content block ends and which blocks carry a marker. Hashes,
+    lengths and positions only, never content."""
 
     head: tuple[str, str, str, str]
     messages: tuple[str, ...]
     marker: int
     cum: tuple[int, ...]  # cum[i]: bytes of the head and messages 0..i
+    head_blocks: int = 0  # tools and system blocks
+    ends: tuple[int, ...] = ()  # ends[i]: blocks of the head and messages 0..i
+    marks: tuple[int, ...] = ()  # the positions of the blocks that carry a marker
+
+    def prefix_end(self) -> int:
+        """The position of the last block of the prefix a later call can match: through
+        the last marked message, or all of them without one."""
+        upto = self.marker if self.marker >= 0 else len(self.messages) - 1
+        return (self.ends[upto] if upto >= 0 else self.head_blocks) - 1
 
     @property
     def chars(self) -> int:
@@ -247,12 +258,47 @@ def prefix_shape(body: dict[str, Any]) -> PrefixShape:
                             ensure_ascii=False).encode())  # fmt: skip
         cum.append(n)
     marker = max((i for i, m in enumerate(msgs) if _has_marker(m)), default=-1)
+    marks: list[int] = []
+    pos = 0
+    for group in (body.get("tools"), body.get("system")):
+        for b in group if isinstance(group, list) else [] if group is None else [group]:
+            if isinstance(b, dict) and "cache_control" in b:
+                marks.append(pos)
+            pos += 1
+    head_blocks, ends = pos, []
+    for m in msgs:
+        blocks = m.get("content") if isinstance(m, dict) else None
+        blocks = blocks if isinstance(blocks, list) and blocks else [blocks]
+        for b in blocks:
+            if isinstance(b, dict) and "cache_control" in b:
+                marks.append(pos)
+            pos += 1
+        if isinstance(m, dict) and "cache_control" in m:
+            marks.append(pos - 1)  # a message's own marker sits on its last block
+        ends.append(pos)
     return PrefixShape(
         head=(_h(parts[0]), _h(parts[1]), _h(parts[2]), _h(parts[3])),
         messages=tuple(_h(m) for m in msgs),
         marker=marker,
         cum=tuple(cum) if cum else (head_bytes,),
+        head_blocks=head_blocks,
+        ends=tuple(ends),
+        marks=tuple(sorted(set(marks))),
     )
+
+
+LOOKBACK_BLOCKS = 20  # how far back from a breakpoint the provider looks for a cache entry
+
+
+def read_guard(prev: PrefixShape, new: PrefixShape) -> str:
+    """Whether the provider will read the matched prefix (owner, 2026-11-01): the new
+    request must carry a marker at or after the prefix's end, within `LOOKBACK_BLOCKS`
+    blocks of it. "none" if so, else "no_marker" or "lookback"."""
+    end = prev.prefix_end()
+    after = [m - end for m in new.marks if m >= end]
+    if not after:
+        return "no_marker"
+    return "none" if min(after) <= LOOKBACK_BLOCKS else "lookback"
 
 
 def miss_part(prev: PrefixShape, new: PrefixShape, body: dict[str, Any]) -> dict[str, Any]:
@@ -663,7 +709,11 @@ class Gateway:
             return None
         where = miss_part(rec.shape, new, body)
         if where["part"] == "none":
-            return rec
+            # priced at the read rate only if the provider will read it (owner, 2026-11-01)
+            guard = read_guard(rec.shape, new)
+            if guard == "none":
+                return rec
+            where = {"part": guard, "index": None}
         self._prefix_miss(session_id, rec.shape, new, where)
         return None
 
@@ -720,8 +770,9 @@ class Gateway:
         s = rec.shape
         if s.marker >= 0 and s.marker < len(s.messages) - 1:
             # matched up to the previous call's last marker: what follows it is estimated anew
-            # the previous call's uncached input (its post-marker messages included) is held
-            # at the write rate too, so a prefix the provider did not cache is never free
+            # the previous call's uncached input is held at the write rate too, so a prefix
+            # the provider did not cache is never free. Its post-marker messages are counted
+            # twice (in prompt_tokens - read and again in rest): deliberately conservative
             base = s.cum[s.marker]
             read = min(rec.cached_tokens, rec.prompt_tokens)
             rest = math.ceil(max(0, chars - base) / CHARS_PER_TOKEN)
