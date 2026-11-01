@@ -310,12 +310,54 @@ def _verified(c: Ctx) -> list[str]:
     return []
 
 
+REWORK_REASONS = ("logic_conflict", "red_on_rebased")
+MAX_REWORKS = 2  # per task (owner, 2026-11-01); the third blocks the job and pages
+
+
+def _rework(c: Ctx) -> list[str]:
+    """p3-09 (owner, 2026-11-01): landing sends a job back for a fresh worker. Only vigild,
+    only from the landing step, with the reason and what failed on record (the event
+    carries this evidence), and at most twice per task."""
+    errs: list[str] = []
+    ev = c.evidence
+    if c.actor is not Actor.VIGILD:
+        errs.append("only vigild sends a job back for REWORK")
+    if ev.get("step") != "landing":
+        errs.append("a REWORK comes only from the landing step")
+    reason = ev.get("reason")
+    if reason not in REWORK_REASONS:
+        errs.append(f"a REWORK names its reason, one of {list(REWORK_REASONS)}")
+    if reason == "logic_conflict" and not ev.get("files"):
+        errs.append("a logic-conflict REWORK names the conflicting files")
+    if reason == "red_on_rebased" and not ev.get("failing"):
+        errs.append("a red-on-rebased REWORK names the failing tests")
+    task = ev.get("task")
+    if not task:
+        errs.append("a REWORK names its task")
+    else:
+        done = sum(
+            1
+            for e in c.store.events(job_id=c.job.id)
+            if e.type == "state"
+            and (e.data.get("evidence") or {}).get("action") == "rework"
+            and (e.data.get("evidence") or {}).get("task") == task
+        )
+        if done >= MAX_REWORKS:
+            errs.append(f"at most {MAX_REWORKS} REWORKs per task: {task} has had {done}")
+    return errs
+
+
+def _findings_or_rework(c: Ctx) -> list[str]:
+    """in_review -> building: a fix round on review findings, or landing's REWORK."""
+    return _rework(c) if c.evidence.get("action") == "rework" else _findings(c)
+
+
 EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.SPEC_PENDING, S.APPROVED): _approval_or_bench,
     (S.APPROVED, S.PLANNING): _none,
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,
-    (S.IN_REVIEW, S.BUILDING): _findings,
+    (S.IN_REVIEW, S.BUILDING): _findings_or_rework,
     (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c), *_pr_trees_clean(c)],
     (S.READY, S.MERGED): _merged,
     (S.READY, S.BUILDING): _owner_fix,

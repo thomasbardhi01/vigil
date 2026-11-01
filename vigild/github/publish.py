@@ -107,6 +107,37 @@ class RestPulls:
         if r.status_code != 200:
             raise PublishError(f"closing {repo}#{number} failed (HTTP {r.status_code})")
 
+    def update_pull(self, repo: str, url: str, *, title: str, body: str) -> None:
+        """Rewrite a PR's title and body from the head vigild landed (#221)."""
+        number = int(url.rstrip("/").rsplit("/", 1)[-1])
+        r = self.http.patch(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"title": redact(title), "body": redact(body)},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"updating {repo}#{number} failed (HTTP {r.status_code})")
+
+    def head(self, repo: str, number: int) -> str:
+        """A PR's head commit (the merge binding: it must be the verified SHA)."""
+        r = self.http.get(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"reading {repo}#{number} failed (HTTP {r.status_code})")
+        return str(r.json()["head"]["sha"])
+
     def state(self, repo: str, number: int) -> str:
         """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
         r = self.http.get(

@@ -381,3 +381,54 @@ def test_a_pre_105_review_and_audit_still_pass_the_ready_gate(store: Store) -> N
     assert (
         transition(store, jid, S.READY, Actor.VIGILD, evidence={"pr_heads": heads}).state is S.READY
     )
+
+
+# --- p3-09: REWORK from the landing step (owner, 2026-11-01) --------------------------
+
+
+def _rework(tid: str, **over: object) -> dict[str, object]:
+    ev: dict[str, object] = {
+        "action": "rework", "step": "landing", "task": tid,
+        "reason": "logic_conflict", "files": ["docs/feature-map.md"],
+    }  # fmt: skip
+    ev.update(over)
+    return ev
+
+
+def test_rework_is_vigilds_alone_from_the_landing_step_and_records_why(store: Store) -> None:
+    """Guard 1: only vigild takes in_review -> building for a REWORK, only from the landing
+    step, and the events row carries the reason (a logic conflict, or red on the rebased
+    SHA) and the conflicting files or the failing tests."""
+    jid = _job(store, S.IN_REVIEW)
+    tid = _worker(store, jid, pr=True, report=True)
+    for actor, channel in ((Actor.OWNER, "inbox"), (Actor.COORD, None)):
+        with pytest.raises(TransitionError, match="only vigild"):
+            transition(store, jid, S.BUILDING, actor, channel=channel, evidence=_rework(tid))
+    with pytest.raises(TransitionError, match="landing step"):
+        transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid, step="review"))
+    with pytest.raises(TransitionError, match="reason"):
+        transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid, reason="other"))
+    with pytest.raises(TransitionError, match="files"):
+        transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid, files=[]))
+    with pytest.raises(TransitionError, match="failing tests"):
+        transition(store, jid, S.BUILDING, Actor.VIGILD,
+                   evidence=_rework(tid, reason="red_on_rebased", files=[]))  # fmt: skip
+    transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid))
+    (ev,) = [e for e in store.events(job_id=jid) if e.type == "state"][-1:]
+    assert ev.data["evidence"]["reason"] == "logic_conflict"
+    assert ev.data["evidence"]["files"] == ["docs/feature-map.md"]
+    store._force_state(jid, S.IN_REVIEW)
+    red = _rework(tid, reason="red_on_rebased", files=[], failing=["tests/test_x.py::test_y"])
+    assert transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=red).state is S.BUILDING
+
+
+def test_a_third_rework_of_a_task_is_refused(store: Store) -> None:
+    """Guard 2: at most 2 REWORKs per task; the third is refused (the runner then blocks the
+    job and pages the owner)."""
+    jid = _job(store, S.IN_REVIEW)
+    tid = _worker(store, jid, pr=True, report=True)
+    for _ in range(2):
+        transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid))
+        store._force_state(jid, S.IN_REVIEW)
+    with pytest.raises(TransitionError, match="at most 2"):
+        transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid))

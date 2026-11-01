@@ -83,6 +83,7 @@ from vigild.gateway.service import (
     Gateway,
     worst_case_usd,
 )
+from vigild.github.landing import LandResult, merge_allowed
 from vigild.github.publish import (
     BranchMoved,
     LegacyBranch,
@@ -112,7 +113,7 @@ from vigild.jobs.cause import local_failure
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.evidence import executor_block, failure_diagnostic, without_executor
 from vigild.jobs.fixfindings import selectable
-from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
+from vigild.jobs.fsm import HAS_OPEN_PR, MAX_REWORKS, Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.integrity import Finding, finding_id
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
@@ -240,6 +241,24 @@ class Publisher(Protocol):
 
     def close(self, repo: str, url: str, job_id: str | None = None) -> None: ...
 
+    def land(
+        self,
+        *,
+        repo: str,
+        task_id: str,
+        head: str,
+        base_sha: str,
+        branch: str,
+        base: str,
+        title: str,
+        body: str,
+        scope: list[str],
+        generated: list[str],
+        verify: Callable[[str], bool],
+        existing: str | None,
+        job_id: str | None = None,
+    ) -> LandResult: ...
+
 
 class Pager(Protocol):
     def page(
@@ -326,6 +345,7 @@ class JobRunner:
         breakers: Breakers | None = None,
         deps: Any = None,
         pr_state: Callable[[str, str], str] | None = None,
+        pr_head: Callable[[str, str], str] | None = None,
         capacity: Capacity | None = None,
     ) -> None:
         self.cfg = cfg
@@ -367,6 +387,7 @@ class JobRunner:
         self.ladder = Ladder(store, cfg)
         self.deps = deps  # the deps executor (item 5); None: deps jobs fail
         self.pr_state = pr_state  # (repo, pr url) -> open | merged | closed
+        self.pr_head = pr_head  # (repo, pr url) -> the PR's head SHA (p3-09 merge binding)
         # one set of breakers, shared with the gateway (item 4)
         self.breakers = breakers or Breakers(store, cfg)
         self.breakers.pager = self._breaker_page
@@ -3373,9 +3394,18 @@ class JobRunner:
             }
             if escalated or attempt >= self.cfg.routing.escalate_attempt:
                 fresh_fix["history"] = self._findings_history(t, fix_round)
+        rework = contract.get("rework")
+        rework_note = (
+            {"landing_rework.md": self._rework_note(rework)} if isinstance(rework, dict) else {}
+        )
+        if rework_note:  # told once: this session's packet carries it, no later one does
+            self.store.update_task(
+                task_id, contract={k: v for k, v in contract.items() if k != "rework"}
+            )
         packet = assemble_worker(
             clone, contract,
-            untrusted=decisions.section(self.store, job_id) | self._answer(job_id, task_id),
+            untrusted=decisions.section(self.store, job_id) | self._answer(job_id, task_id)
+            | rework_note,
             approval_edits=edits, fix_round=fix_round, fresh_fix=fresh_fix,
         )  # fmt: skip
         resume = self._resume_from(prev.id) if prev and forks else None
@@ -4146,6 +4176,8 @@ class JobRunner:
                 except Exception:
                     log.warning("pr poll: %s failed", url)
                     continue
+                if st == "merged" and not self._merge_bound(job, t.id, url):
+                    continue  # merged with a head vigild did not verify: paged, not merged
                 states[t.id] = st
                 if st in ("merged", "closed"):
                     self.store.update_task(t.id, state=st)
@@ -4186,6 +4218,42 @@ class JobRunner:
             merged_jobs.append(job.id)
             self._resume_dependents(job.id)
         return merged_jobs
+
+    def _verified(self, task_id: str) -> tuple[str | None, str | None]:
+        """The task's `verified_sha` and the main it was verified on (p3-09)."""
+        rows = self.store.q("SELECT verified_sha, verified_main FROM tasks WHERE id=?", (task_id,))
+        return (rows[0]["verified_sha"], rows[0]["verified_main"]) if rows else (None, None)
+
+    def _merge_bound(self, job: Job, task_id: str, url: str) -> bool:
+        """p3-09 merge binding: a landed task's merge counts only if the PR's head is the
+        `verified_sha` vigild sent. Otherwise the owner is paged once and the task stays
+        unmerged. A task landed before p3-09 (no `verified_sha`) is not bound."""
+        verified, _ = self._verified(task_id)
+        if not verified or self.pr_head is None:
+            return True
+        try:
+            head = self.pr_head(job.repo, url)
+        except Exception:
+            log.warning("pr poll: reading the head of %s failed", url)
+            return False
+        if merge_allowed(pr_head=head, verified_sha=verified):
+            return True
+        if not any(
+            i.job_id == job.id and i.body.get("kind") == "merge_unverified"
+            and i.body.get("task") == task_id
+            for i in self.store.list_inbox()
+        ):  # fmt: skip
+            self._page(
+                job.id,
+                f"{task_id}: merged with a head vigild did not verify",
+                {"kind": "merge_unverified", "task": task_id, "pr_url": url,
+                 "pr_head": head, "verified_sha": verified,
+                 "next": "the PR head is not the commit vigild verified and sent; nothing "
+                         "is recorded as merged. Revert or re-land it.",
+                 "actions": ["abandon"]},
+                resumable=False,
+            )  # fmt: skip
+        return False
 
     def _build_after_deps(self, job: Job) -> None:
         """The deps PR changed the lockfiles, so the parent's base has a new image
@@ -4647,6 +4715,9 @@ class JobRunner:
                 resumable=not legacy,
             )
             return "done"
+        landed = self._land_prs(job_id)  # p3-09: rebase, re-verify, bind, before the card
+        if landed != "landed":
+            return "dispatch" if landed == "rework" else "done"
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
             return "done"
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
@@ -4752,6 +4823,161 @@ class JobRunner:
         )  # fmt: skip
         return False
 
+    def _land_prs(self, job_id: str) -> str:
+        """p3-09: land every live task's PR before the ready card (#172, #221). Each is
+        rebased in the vault on the remote's main and re-verified there; the commit sent is
+        recorded as the task's `verified_sha`. Returns "landed", "rework" (a fresh worker is
+        owed: the job went back to building) or "done" (paged)."""
+        job = self.store.get_job(job_id)
+        if job.source == "bench":
+            return "landed"  # nothing was published; nothing lands
+        for t in self.store.list_tasks(job_id):
+            if t.state in DEAD_TASK:
+                continue
+            pub = self._landing_inputs(t.id)
+            if pub is None:
+                continue  # no PR on record: the ready guard says why
+            contract = t.contract
+            scope = [
+                *(contract["spec"].get("files_in_scope") or []),
+                *artifact_paths(job_id, t.id),
+            ]
+
+            def verify(sha: str, _t: Any = t, _pub: dict[str, Any] = pub) -> bool:
+                return self._landing_green(job, _t, sha)
+
+            try:
+                res = self.publisher.land(
+                    repo=job.repo, task_id=t.id, head=pub["head"], base_sha=pub["base_sha"],
+                    branch=pub["branch"], base=job.base, title=pub.get("title") or job.title,
+                    body=pub.get("body") or "", scope=scope, generated=[], verify=verify,
+                    existing=pub.get("pr_url"), job_id=job_id,
+                )  # fmt: skip
+            except Exception as e:  # git, GitHub or the verifier: no verdict, nothing landed
+                log.exception("landing %s failed", t.id)
+                self._block(job_id, f"landing {t.id} failed: {e}")
+                self._page(
+                    job_id, f"{t.id}: landing failed",
+                    {"kind": "landing_failed", "task": t.id, "error": str(e)[:600],
+                     "actions": ["retry", "abandon"]},
+                    resumable=True,
+                )  # fmt: skip
+                return "done"
+            if res.outcome == "rework":
+                return self._rework(job_id, t.id, res)
+            self.store.x(
+                "UPDATE tasks SET verified_sha=?, verified_main=? WHERE id=?",
+                (res.verified_sha, res.main_sha, t.id),
+            )
+            # the PR's record names the commit sent now, so the ready guard reads it current
+            self.store.add_event(
+                "pr_open",
+                {**pub, "published": res.verified_sha, "vigil_in_pr": False,
+                 "landed_on": res.main_sha},
+                Provenance.HUMAN, job_id=job_id, task_id=t.id,
+            )  # fmt: skip
+            self.store.add_event(
+                "landed",
+                {"task": t.id, "verified_sha": res.verified_sha, "main": res.main_sha,
+                 "vault_head": res.vault_head},
+                Provenance.HUMAN, job_id=job_id, task_id=t.id,
+            )  # fmt: skip
+        return "landed"
+
+    @staticmethod
+    def _rework_note(rework: dict[str, Any]) -> str:
+        """What a REWORK's fresh worker is told (p3-09): why landing sent the task back, and
+        the files that conflicted with main or the tests that failed on the rebased head."""
+        lines = [
+            "REWORK (landing): your task's change did not land on the current main.",
+            f"Reason: {str(rework.get('reason') or '').replace('_', ' ')}.",
+            f"Main is now at {str(rework.get('main') or '')[:12]}; rebuild the change on it.",
+        ]
+        if rework.get("files"):
+            lines.append("Conflicting files: " + ", ".join(map(str, rework["files"])))
+        if rework.get("failing"):
+            lines.append("Failing on the rebased head: " + ", ".join(map(str, rework["failing"])))
+        return "\n".join(lines)
+
+    def _landing_inputs(self, task_id: str) -> dict[str, Any] | None:
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        if not rows:
+            return None
+        pub: dict[str, Any] = json.loads(rows[0]["data"])
+        return pub if pub.get("head") and pub.get("base_sha") and pub.get("branch") else None
+
+    def _landing_green(self, job: Job, t: Any, sha: str) -> bool:
+        """The verifier on the rebased head, on the base it was rebased onto: green when
+        the after run passes, every acceptance command passes, and hidden tests (when they
+        ran) pass. The result is kept as the task's `landing_tests.json`."""
+        contract = t.contract
+        main = self.workspace._git(
+            self.workspace.vault(job.repo), "rev-parse", f"{sha}^"
+        )  # the rebased head's parent is the main it was rebased on
+        image = self.dev_images.resolve(job.repo, main)
+        ac_runs, ac_refused = self._ac_commands(job.id, job.repo, main, contract)
+        overlap = self._overlap(job.repo, contract, ac_runs)
+        tests = self.verifier.verify(
+            repo=job.repo, image=image, task_id=t.id, base_sha=main, head=sha,
+            test_cmd=contract["spec"]["test_cmd"], must_fail_first=False,
+            runner_config=self.cfg.repo(job.repo).runner_config, runner_overlap=overlap,
+            hidden=None, scope=list(contract["spec"].get("files_in_scope") or []),
+            ac_commands=ac_runs,
+        )  # fmt: skip
+        self.store.add_artifact(
+            job.id, "landing_tests.json", json.dumps(redact(tests)), Provenance.HUMAN,
+            task_id=t.id,
+        )  # fmt: skip
+        after = (tests.get("after") or {}).get("outcome")
+        acs = tests.get("ac") or []
+        ac_ok = not ac_refused and all((a or {}).get("outcome") == "pass" for a in acs)
+        return after == "pass" and ac_ok
+
+    def _rework(self, job_id: str, task_id: str, res: LandResult) -> str:
+        """p3-09 REWORK (owner, 2026-11-01): the job goes back to building through the FSM
+        (vigild only, from the landing step, the reason and what failed on the event, at
+        most twice per task) and the task gets a fresh worker from its own cap, with the
+        conflict or the failing tests in its packet. The third is refused: blocked, paged."""
+        files = list(res.conflicts)
+        failing: list[str] = []
+        reason = "logic_conflict" if files else "red_on_rebased"
+        if not files:
+            art = self.store.get_artifact(job_id, "landing_tests.json", task_id)
+            failing = [res.reason or "the verifier is red on the rebased head"]
+            if art is not None:
+                after = json.loads(art.content).get("after") or {}
+                failing = [str(f) for f in (after.get("failed") or [])] or failing
+        evidence = {"action": "rework", "step": "landing", "task": task_id, "reason": reason,
+                    "files": files, "failing": failing, "main": res.main_sha}  # fmt: skip
+        try:
+            transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD, evidence=evidence)
+        except TransitionError as e:
+            self._block(job_id, f"landing REWORK refused for {task_id}: {e}")
+            self._page(
+                job_id, f"{task_id}: landing failed again after {MAX_REWORKS} REWORKs",
+                {"kind": "landing_rework_limit", "task": task_id, "reason": reason,
+                 "files": files, "failing": failing, "error": str(e)[:600],
+                 "actions": ["replan", "abandon"]},
+                resumable=False,
+            )  # fmt: skip
+            return "done"
+        t = self.store.get_task(task_id)
+        contract = {**t.contract, "rework": {"reason": reason, "files": files,
+                                             "failing": failing, "main": res.main_sha}}  # fmt: skip
+        self.store.update_task(task_id, state="fix", contract=contract)
+        self.store.create_inbox_item(
+            "questions", "landing_rework", job_id,
+            f"{task_id}: REWORK at landing ({reason.replace('_', ' ')})",
+            {"kind": "landing_rework", "task": task_id, "reason": reason, "files": files,
+             "failing": failing, "main": res.main_sha,
+             "next": "a fresh worker is rebuilding the task on current main, from its own cap"},
+            own_job=True,
+        )  # fmt: skip
+        return "rework"
+
     def _ready(self, job_id: str) -> None:
         """Stage 8's queue: the job's PRs, each with its review and audit."""
         job = self.store.get_job(job_id)
@@ -4784,6 +5010,9 @@ class JobRunner:
                     "selectable": selectable(self.store, job_id, t.id),
                     "audited": audit is not None,
                     "match_rate": round(audit.match_rate(), 3) if audit else None,
+                    # p3-09: the only head a merge is accepted for, and the main it was on
+                    "verified_sha": self._verified(t.id)[0],
+                    "verified_main": self._verified(t.id)[1],
                 }
             )
         self.store.create_inbox_item(
@@ -5564,6 +5793,13 @@ class JobRunner:
 # --- wiring for the real daemon ------------------------------------------------------------
 
 
+def regenerate_docs_tables(checkout: Path, paths: list[str]) -> None:
+    """The repo's generator for a generated-only landing conflict (p3-09): the docs tables
+    are rendered on demand and never committed (#96), so a conflicting generated file is
+    left as main's side. Anything else is not generated and never reaches here."""
+    del checkout, paths
+
+
 class GitHubPublisher:
     """Mints a one-hour, one-repo token for each publish and revokes it after."""
 
@@ -5616,6 +5852,37 @@ class GitHubPublisher:
         with self.app.lease(repo, {"pull_requests": "write"}, job_id=job_id) as tok:
             RestPulls(self.http, tok.token).close(repo, int(url[len(prefix) :]))
 
+    def land(
+        self,
+        *,
+        repo: str,
+        task_id: str,
+        head: str,
+        base_sha: str,
+        branch: str,
+        base: str,
+        title: str,
+        body: str,
+        scope: list[str],
+        generated: list[str],
+        verify: Callable[[str], bool],
+        existing: str | None,
+        job_id: str | None = None,
+    ) -> LandResult:
+        """p3-09: land a task's PR (`vigild.github.landing.land`) with a one-hour, one-repo
+        token, revoked after."""
+        from vigild.github.app import WORKER_PERMISSIONS
+        from vigild.github.landing import land
+        from vigild.github.publish import RestPulls
+
+        with self.app.lease(repo, WORKER_PERMISSIONS, job_id=job_id) as tok:
+            return land(
+                self.workspace, repo=repo, task_id=task_id, branch=branch, head=head,
+                base_sha=base_sha, base=base, scope=scope, generated=generated, verify=verify,
+                regenerate=regenerate_docs_tables, pulls=RestPulls(self.http, tok.token),
+                title=title, body=body, existing=existing, token=tok.token,
+            )  # fmt: skip
+
 
 class GitHubPRs:
     """vigild's PR poll (item 5): a PR's state, read with a one-repo,
@@ -5632,6 +5899,16 @@ class GitHubPRs:
             raise PublishError(f"{url} isn't a PR of {repo}")
         with self.app.lease(repo, {"pull_requests": "read"}) as tok:
             return RestPulls(self.app.http, tok.token).state(repo, int(url[len(prefix) :]))
+
+    def head(self, repo: str, url: str) -> str:
+        """A PR's head commit, for the merge binding (p3-09)."""
+        from vigild.github.publish import RestPulls
+
+        prefix = f"https://github.com/{repo}/pull/"
+        if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
+            raise PublishError(f"{url} isn't a PR of {repo}")
+        with self.app.lease(repo, {"pull_requests": "read"}) as tok:
+            return RestPulls(self.app.http, tok.token).head(repo, int(url[len(prefix) :]))
 
 
 class NoPublisher:
@@ -5652,4 +5929,23 @@ class NoPublisher:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
 
     def close(self, repo: str, url: str, job_id: str | None = None) -> None:
+        raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
+
+    def land(
+        self,
+        *,
+        repo: str,
+        task_id: str,
+        head: str,
+        base_sha: str,
+        branch: str,
+        base: str,
+        title: str,
+        body: str,
+        scope: list[str],
+        generated: list[str],
+        verify: Callable[[str], bool],
+        existing: str | None,
+        job_id: str | None = None,
+    ) -> LandResult:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

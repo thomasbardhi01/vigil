@@ -380,6 +380,31 @@ class BarePublisher:
             existing=existing,
         )
 
+    updates: list[dict[str, Any]] = field(default_factory=list)
+
+    def land(self, **kw: Any) -> Any:
+        """vigild's real landing (p3-09), against the local bare repo."""
+        from vigild.github.landing import land
+
+        prs, updates = self.prs, self.updates
+
+        class Pulls:
+            def create_pull(
+                self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
+            ) -> str:
+                prs.append(
+                    {"head": head, "base": base, "title": title, "draft": draft, "body": body}
+                )
+                return f"https://github.com/{repo}/pull/{len(prs)}"
+
+            def update_pull(self, repo: str, url: str, *, title: str, body: str) -> None:
+                updates.append({"url": url, "title": title, "body": body})
+
+        assert self.ws is not None
+        kw.pop("job_id", None)
+        return land(self.ws, regenerate=lambda checkout, paths: None, pulls=Pulls(),
+                    token=None, **kw)  # fmt: skip
+
 
 def build_first(images: DevImages, sessions: SessionImages) -> None:
     """Stand in for the explicit build step (ADR-0004 §5; `vigil dev-image`),
