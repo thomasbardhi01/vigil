@@ -234,7 +234,11 @@ def publish(
             if not re.fullmatch(r"[A-Za-z0-9._-]+/[0-9]+", replace):
                 raise PublishError(f"bad REWORK id {replace!r}")
             tip = ws.remote_tip(repo, branch, token)
-            if tip is not None and tip != ws.published_sha(repo, branch):
+            if tip is not None and tip == send:
+                # a crash after the push, before the record: the remote already holds
+                # exactly this commit, so it is recorded below and nothing is pushed again
+                pass
+            elif tip is not None and tip != ws.published_sha(repo, branch):
                 raise BranchMoved(
                     f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
                     "last sent, and a REWORK replaces only vigild's own send"
@@ -249,7 +253,8 @@ def publish(
                 # (a crash after the push) never overwrites it with the new tip
                 ws._git(ws.vault(repo), "update-ref", ref, tip)
             try:
-                ws.push(repo, send, branch, token, tip)
+                if tip != send:
+                    ws.push(repo, send, branch, token, tip)
             except WorkspaceError as e:
                 if "stale info" in str(e):
                     raise BranchMoved(

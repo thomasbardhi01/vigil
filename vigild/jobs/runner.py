@@ -83,7 +83,7 @@ from vigild.gateway.service import (
     Gateway,
     worst_case_usd,
 )
-from vigild.github.landing import LandResult, merge_allowed
+from vigild.github.landing import LandingQueue, LandResult, is_stale, merge_allowed
 from vigild.github.publish import (
     BranchMoved,
     LegacyBranch,
@@ -359,6 +359,7 @@ class JobRunner:
             self.gateway.stop_session = stop
         self.workspace = workspace
         self.publisher = publisher
+        self.landing_queue = LandingQueue()  # one lander per repo (p3-09 PR 3)
         self.bench_publisher = BenchPublisher(workspace)  # a bench job never gets `publisher`
         self.telemetry = telemetry
         self.dev_images = dev_images
@@ -4223,6 +4224,8 @@ class JobRunner:
                 if gaps:
                     self._hold_without_pr(job.id, gaps, f"PR closed: {sorted(closed_tasks)}")
                 continue
+            if self.store.get_job(job.id).state is JobState.READY:
+                self._sweep_stale(self.store.get_job(job.id))
             live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
             if not live or any(t.state != "merged" for t in live):
                 continue
@@ -4245,6 +4248,55 @@ class JobRunner:
             merged_jobs.append(job.id)
             self._resume_dependents(job.id)
         return merged_jobs
+
+    def _sweep_stale(self, job: Job) -> None:
+        """p3-09 PR 3, the staleness sweep (owner, 2026-11-01, tier A): a ready job whose leased
+        paths changed on main since a task's `verified_main` is landed again before its card
+        stands. A clean re-landing re-issues the ready card naming the new `verified_sha` and
+        asks the owner nothing (a `relanded` event for the morning report); a conflict or a
+        red verdict is a REWORK, which pages as from in_review."""
+        if job.source == "bench":
+            return
+        stale = False
+        for t in self.store.list_tasks(job.id):
+            if t.state in DEAD_TASK or t.state in ("merged", "closed"):
+                continue
+            verified, main = self._verified(t.id)
+            if not verified:
+                continue  # landed before p3-09: nothing bound, nothing to re-land
+            scope = [*(t.contract["spec"].get("files_in_scope") or []),
+                     *artifact_paths(job.id, t.id)]  # fmt: skip
+            try:
+                if is_stale(self.workspace, repo=job.repo, verified_on=main, scope=scope,
+                            token=None):  # fmt: skip
+                    stale = True
+                    break
+            except Exception:
+                log.warning("staleness check of %s failed", t.id, exc_info=True)
+                return
+        if not stale:
+            return
+        before = {t.id: self._verified(t.id)[0] for t in self.store.list_tasks(job.id)}
+        with self.landing_queue.hold(job.repo, job.id, approved_at=self._approved_at(job.id)):
+            if self.store.get_job(job.id).state is not JobState.READY:
+                return  # merged, fixed or killed while it waited for the slot
+            landed = self._land_prs(job.id)
+        if landed == "rework":
+            self.dispatch(job.id)
+            return
+        if landed != "landed":
+            return  # paged by the landing step
+        after = {t: self._verified(t)[0] for t in before}
+        for item in self.store.list_inbox():
+            if item.job_id == job.id and item.kind == "ready_to_merge":
+                self.store.resolve_inbox_item(item.id, "vigild")
+        self.store.add_event(
+            "relanded",
+            {"tasks": {t: {"old": before[t], "new": after[t]} for t in before
+                       if before[t] != after[t]}},
+            Provenance.HUMAN, job_id=job.id,
+        )  # fmt: skip
+        self._ready(job.id)
 
     def _verified(self, task_id: str) -> tuple[str | None, str | None]:
         """The task's `verified_sha` and the main it was verified on (p3-09)."""
@@ -4760,7 +4812,10 @@ class JobRunner:
                 resumable=not legacy,
             )
             return "done"
-        landed = self._land_prs(job_id)  # p3-09: rebase, re-verify, bind, before the card
+        # p3-09: rebase, re-verify, bind, before the card; one lander per repo, first
+        # approved first (PR 3)
+        with self.landing_queue.hold(job.repo, job_id, approved_at=self._approved_at(job_id)):
+            landed = self._land_prs(job_id)
         if landed != "landed":
             return "dispatch" if landed == "rework" else "done"
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
@@ -4868,6 +4923,16 @@ class JobRunner:
         )  # fmt: skip
         return False
 
+    def _approved_at(self, job_id: str) -> str:
+        """When the job was last approved (its last move to approved), else when it was
+        made: the landing queue's order."""
+        rows = self.store.q(
+            "SELECT ts FROM events WHERE job_id=? AND type='state'"
+            " AND json_extract(data, '$.to')='approved' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        )
+        return str(rows[0]["ts"]) if rows else self.store.get_job(job_id).created_at
+
     def _land_prs(self, job_id: str) -> str:
         """p3-09: land every live task's PR before the ready card (#172, #221). Each is
         rebased in the vault on the remote's main and re-verified there; the commit sent is
@@ -4912,6 +4977,7 @@ class JobRunner:
                          "vault_head": pub["head"], "unchanged_main": True},
                         Provenance.HUMAN, job_id=job_id, task_id=t.id,
                     )  # fmt: skip
+                self._mark_verified(job, t.id, published, main_now)
                 continue
 
             def verify(sha: str, _t: Any = t, _pub: dict[str, Any] = pub) -> bool:
@@ -4965,7 +5031,27 @@ class JobRunner:
                      "vault_head": res.vault_head},
                     Provenance.HUMAN, job_id=job_id, task_id=t.id,
                 )  # fmt: skip
+            if res.verified_sha and res.main_sha:
+                self._mark_verified(job, t.id, res.verified_sha, res.main_sha)
         return "landed"
+
+    def _mark_verified(self, job: Job, task_id: str, sha: str, main: str) -> None:
+        """Owner ruling (p3-09 PR 3, option B): post `vigil/verified` on the commit landing
+        sent, naming the main it was verified on. The main ruleset does not require it yet,
+        so a refused post (the App without `statuses: write`, GitHub down) is recorded as
+        `status_failed` and landing goes on."""
+        mark = getattr(self.publisher, "mark_verified", None)
+        if mark is None:
+            return
+        try:
+            mark(job.repo, sha, main=main, job_id=job.id)
+        except Exception as e:
+            log.warning("vigil/verified for %s failed: %s", task_id, e)
+            self.store.add_event(
+                "status_failed",
+                {"task": task_id, "sha": sha, "main": main, "error": redact(str(e))[:300]},
+                Provenance.HUMAN, job_id=job.id, task_id=task_id,
+            )  # fmt: skip
 
     @staticmethod
     def _rework_note(rework: dict[str, Any]) -> str:
@@ -5069,8 +5155,26 @@ class JobRunner:
                 failing = [str(f) for f in (after.get("failed") or [])] or failing
         evidence = {"action": "rework", "step": "landing", "task": task_id, "reason": reason,
                     "files": files, "failing": failing, "main": res.main_sha}  # fmt: skip
+        pub = self._landing_inputs(task_id) or {}
         try:
-            transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD, evidence=evidence)
+            # one transaction (owner, 2026-11-01): the job is never in building without its
+            # rework record, and a refused transition writes neither
+            with self.store.tx():
+                transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD, evidence=evidence)
+                n = sum(
+                    1 for e in self.store.events(job_id=job_id)
+                    if e.type == "state"
+                    and (e.data.get("evidence") or {}).get("action") == "rework"
+                    and (e.data.get("evidence") or {}).get("task") == task_id
+                )  # fmt: skip
+                rework = {"reason": reason, "files": files, "failing": failing,
+                          "main": res.main_sha, "old_base": pub.get("base_sha"),
+                          "old_head": pub.get("head"), "n": n, "publish": f"{task_id}/{n}",
+                          "done": False}  # fmt: skip
+                self.store.add_artifact(
+                    job_id, "rework.json", json.dumps(rework), Provenance.HUMAN, task_id=task_id
+                )
+                self.store.update_task(task_id, state="fix")
         except TransitionError as e:
             self._block(job_id, f"landing REWORK refused for {task_id}: {e}")
             self._page(
@@ -5081,20 +5185,9 @@ class JobRunner:
                 resumable=False,
             )  # fmt: skip
             return "done"
-        pub = self._landing_inputs(task_id) or {}
-        n = sum(
-            1 for e in self.store.events(job_id=job_id)
-            if e.type == "state" and (e.data.get("evidence") or {}).get("action") == "rework"
-            and (e.data.get("evidence") or {}).get("task") == task_id
-        )  # fmt: skip
-        rework = {"reason": reason, "files": files, "failing": failing, "main": res.main_sha,
-                  "old_base": pub.get("base_sha"), "old_head": pub.get("head"), "n": n,
-                  "publish": f"{task_id}/{n}", "done": False}  # fmt: skip
-        with self.store.tx():
-            self.store.add_artifact(
-                job_id, "rework.json", json.dumps(rework), Provenance.HUMAN, task_id=task_id
-            )
-            self.store.update_task(task_id, state="fix")
+        for item in self.store.list_inbox():
+            if item.job_id == job_id and item.kind == "ready_to_merge":
+                self.store.resolve_inbox_item(item.id, "vigild")  # the job is back in building
         self.store.create_inbox_item(
             "questions", "landing_rework", job_id,
             f"{task_id}: REWORK at landing ({reason.replace('_', ' ')})",
@@ -6012,6 +6105,15 @@ class GitHubPublisher:
                 regenerate=regenerate_docs_tables, pulls=RestPulls(self.http, tok.token),
                 title=title, body=body, existing=existing, token=tok.token,
             )  # fmt: skip
+
+    def mark_verified(self, repo: str, sha: str, *, main: str, job_id: str | None = None) -> None:
+        """p3-09 PR 3: `vigil/verified` on `sha`, with a `statuses: write` token minted on its
+        own (never in a worker's), revoked after."""
+        from vigild.github.app import STATUS_PERMISSIONS
+        from vigild.github.status import post_verified
+
+        with self.app.lease(repo, STATUS_PERMISSIONS, job_id=job_id) as tok:
+            post_verified(self.http, tok.token, repo, sha, main=main)
 
 
 class GitHubPRs:

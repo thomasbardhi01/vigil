@@ -30,6 +30,19 @@ WORKER_PERMISSIONS: Mapping[str, str] = {
     "metadata": "read",
 }
 READ_ONLY: Mapping[str, str] = {"contents": "read"}
+# p3-09 PR 3: vigild's `vigil/verified` commit status on a verified SHA, and nothing else
+STATUS_PERMISSIONS: Mapping[str, str] = {"statuses": "write"}
+# What the App's installation holds, exactly (`vigil doctor` checks it): the set above plus
+# statuses:write, the one addition for `vigil/verified` (owner ruling card, 2026-11-01)
+APP_PERMISSIONS: Mapping[str, str] = {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "checks": "read",
+    "metadata": "read",
+    "artifact_metadata": "read",
+    "statuses": "write",
+}
 # The most each permission may ever be minted at. Nothing else is minted.
 ALLOWED: Mapping[str, set[str]] = {
     "contents": {"read", "write"},
@@ -37,6 +50,7 @@ ALLOWED: Mapping[str, set[str]] = {
     "metadata": {"read"},
     "issues": {"read"},
     "checks": {"read"},  # CI's result for a commit (ci_test_result); never in a worker's token
+    "statuses": {"write"},  # `vigil/verified` on a verified SHA (p3-09 PR 3); never a worker's
 }
 TIMEOUT = 20.0
 

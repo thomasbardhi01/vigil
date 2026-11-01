@@ -905,3 +905,127 @@ def test_rework_replace_retried_after_a_crash_keeps_the_first_old_tip(
                 title="t2", body="rebuilt", pulls=pulls, scope=["docs/feature-map.md"],
                 existing=url, replace=f"{TID}/1")  # fmt: skip
     assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
+
+
+def test_rework_replace_after_a_crash_before_the_record_is_recorded_not_pushed_again(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Owner, 2026-11-01: vigild pushed the rebuilt head and died before recording it. The
+    retry finds the remote tip already equal to what it would send: it records it and goes
+    on. No BranchMoved, no second push, and the kept ref is still the old tip."""
+    ws, base, head, bare = setup
+    pulls = EditablePulls(bare)
+    url = _pub(ws, base, head, pulls)
+    old = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    kw: dict[str, Any] = dict(repo=REPO, head=head2, base_sha=base2, branch=BRANCH,
+                              base="main", title="t2", body="rebuilt", pulls=pulls,
+                              scope=["docs/feature-map.md"], existing=url,
+                              replace=f"{TID}/1")  # fmt: skip
+    record = ws.record_published
+
+    def crash(*a: Any) -> None:
+        raise SystemExit("vigild died after the push")
+
+    monkeypatch.setattr(ws, "record_published", crash)
+    with pytest.raises(SystemExit):
+        publish(ws, **kw)
+    sent = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert sent != old
+    monkeypatch.setattr(ws, "record_published", record)
+    pushes: list[Any] = []
+    real_push = ws.push
+    monkeypatch.setattr(ws, "push", lambda *a, **k: (pushes.append(a), real_push(*a, **k)))
+    publish(ws, **kw)
+    assert pushes == []
+    assert ws.published_sha(REPO, BRANCH) == sent
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == sent
+    assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
+
+
+def test_hold_lands_one_job_per_repo_and_the_earliest_approved_waiter_goes_next() -> None:
+    """p3-09 PR 3: a lander holds its repo; waiters go in approval order once it lets go;
+    another repo is never held up."""
+    import threading
+
+    q = _landing().LandingQueue()
+    order: list[str] = []
+    first = q.hold("o/a", "j0", approved_at="2026-11-01T09:00:00+00:00")
+    first.__enter__()
+
+    def lander(job: str, at: str, repo: str = "o/a") -> threading.Thread:
+        def run() -> None:
+            with q.hold(repo, job, approved_at=at):
+                order.append(job)
+
+        th = threading.Thread(target=run)
+        th.start()
+        return th
+
+    late = lander("j2", "2026-11-01T10:05:00+00:00")
+    early = lander("j1", "2026-11-01T10:00:00+00:00")
+    other = lander("k1", "2026-11-01T11:00:00+00:00", repo="o/b")
+    other.join(timeout=5)
+    assert order == ["k1"]  # o/b did not wait on o/a
+    for _ in range(100):  # both o/a waiters are queued before the holder lets go
+        if len(q._waiting.get("o/a", [])) == 2:
+            break
+        threading.Event().wait(0.01)
+    first.__exit__(None, None, None)
+    late.join(timeout=5)
+    early.join(timeout=5)
+    assert order == ["k1", "j1", "j2"]
+
+
+def test_hold_lets_go_when_the_landing_raises() -> None:
+    q = _landing().LandingQueue()
+    with pytest.raises(RuntimeError), q.hold("o/a", "j1", approved_at="2026-11-01T10:00:00+00:00"):
+        raise RuntimeError("the verifier failed")
+    with q.hold("o/a", "j2", approved_at="2026-11-01T10:05:00+00:00"):
+        pass  # not held forever by j1
+
+
+def test_hold_refuses_a_job_that_already_holds_its_repo() -> None:
+    """Round 1: re-entering the slot a job holds would wait forever; it raises instead."""
+    q = _landing().LandingQueue()
+    at = "2026-11-01T10:00:00+00:00"
+    with (
+        q.hold("o/a", "j1", approved_at=at),
+        pytest.raises(RuntimeError, match="already holds"),
+        q.hold("o/a", "j1", approved_at=at),
+    ):
+        pass
+
+
+def test_hold_by_the_same_job_from_two_threads_lands_both_in_turn() -> None:
+    """Round 1: the second caller for the same job waits for the first and then goes;
+    neither raises on an empty queue."""
+    import threading
+
+    q = _landing().LandingQueue()
+    done: list[str] = []
+    gate = threading.Event()
+
+    def land(tag: str) -> None:
+        with q.hold("o/a", "j1", approved_at="2026-11-01T10:00:00+00:00"):
+            gate.wait(timeout=5)
+            done.append(tag)
+
+    a = threading.Thread(target=land, args=("a",))
+    a.start()
+    for _ in range(100):
+        if q._landing.get("o/a") == "j1":
+            break
+        threading.Event().wait(0.01)
+    b = threading.Thread(target=land, args=("b",))
+    b.start()
+    for _ in range(200):  # b is parked on the slot before a lets go
+        if q._turn._waiters:  # type: ignore[attr-defined]
+            break
+        threading.Event().wait(0.01)
+    assert q._turn._waiters  # type: ignore[attr-defined]
+    gate.set()
+    a.join(timeout=5)
+    b.join(timeout=5)
+    assert sorted(done) == ["a", "b"]

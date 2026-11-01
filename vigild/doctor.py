@@ -261,7 +261,7 @@ def run_checks(
 
     app_id, key_path = secrets.get("GITHUB_APP_ID"), secrets.get("GITHUB_APP_KEY_PATH")
     if app_id and key_path:
-        from vigild.github.app import READ_ONLY, WORKER_PERMISSIONS, GitHubApp
+        from vigild.github.app import APP_PERMISSIONS, READ_ONLY, WORKER_PERMISSIONS, GitHubApp
 
         app = GitHubApp(
             app_id,
@@ -295,6 +295,20 @@ def run_checks(
                 ),
             )
         )
+
+        def app_permissions() -> tuple[bool, str]:
+            """The installation holds exactly APP_PERMISSIONS (p3-09 PR 3: statuses:write is
+            the one addition); names only, any extra or missing permission fails."""
+            got = http.get(f"{app.api}/app/installations", headers=hdr(), timeout=TIMEOUT).json()
+            perms = dict((got[0] if got else {}).get("permissions") or {})
+            want = dict(APP_PERMISSIONS)
+            extra = sorted(f"{k}:{v}" for k, v in perms.items() if want.get(k) != v)
+            missing = sorted(f"{k}:{v}" for k, v in want.items() if perms.get(k) != v)
+            if extra or missing:
+                return False, f"extra {extra}, missing {missing}"
+            return True, "exactly the expected set"
+
+        out.append(_safe("vigil-worker: permissions", app_permissions))
 
         def mint_revoke(repo: str, perms: dict[str, str]) -> tuple[bool, str]:
             tok = app.mint(repo, perms)

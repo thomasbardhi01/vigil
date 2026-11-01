@@ -28,6 +28,8 @@ def _pem() -> bytes:
 
 
 PRIVATE: dict[str, bool] = {}
+# what the App's installation grants (the doctor's exact-set check reads it)
+INSTALLATION: dict[str, str] = {}
 TOWER_MODEL = "qwen3.6-35b-a3b"
 
 
@@ -39,7 +41,7 @@ def _handler(req: httpx2.Request) -> httpx2.Response:
     if p == "/app":
         return httpx2.Response(200, json={"slug": "vigil-worker"})
     if p == "/app/installations":
-        return httpx2.Response(200, json=[{"id": 42}])
+        return httpx2.Response(200, json=[{"id": 42, "permissions": dict(INSTALLATION)}])
     if p.endswith("/installation") and req.method == "GET":
         return httpx2.Response(200, json={"id": 42})
     if p == "/app/installations/42/access_tokens":
@@ -397,3 +399,32 @@ def test_unowned_containers_check_reports_a_daemon_error_by_kind() -> None:
 
     c = doctor.unowned_containers_check(Boom(), set())
     assert c.ok is False and c.note == "OSError"
+
+
+def _app_checks(cfg: Config, tmp_path: object, perms: dict[str, str]) -> dict[str, Check]:
+    from vigild.github.app import APP_PERMISSIONS
+
+    INSTALLATION.clear()
+    INSTALLATION.update(perms if perms is not None else APP_PERMISSIONS)
+    pem = Path(str(tmp_path)) / "app.pem"
+    pem.write_bytes(_pem())
+    secrets = Secrets({"GITHUB_APP_ID": "123456", "GITHUB_APP_KEY_PATH": str(pem)})
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    checks = run_checks(cfg, secrets, http=http, docker=None, repos=[])
+    return {c.name: c for c in checks}
+
+
+def test_doctor_checks_the_app_holds_exactly_its_permissions(cfg: Config, tmp_path: object) -> None:
+    """p3-09 PR 3 (owner, 2026-11-01): the App's installation holds exactly the expected
+    set, `statuses: write` being the one addition for `vigil/verified`; any extra or missing
+    permission fails, named."""
+    from vigild.github.app import APP_PERMISSIONS
+
+    assert APP_PERMISSIONS["statuses"] == "write"
+    name = "vigil-worker: permissions"
+    assert _app_checks(cfg, tmp_path, dict(APP_PERMISSIONS))[name].ok
+    extra = _app_checks(cfg, tmp_path, {**APP_PERMISSIONS, "administration": "write"})[name]
+    assert extra.ok is False and "administration" in extra.note
+    missing = {k: v for k, v in APP_PERMISSIONS.items() if k != "statuses"}
+    gone = _app_checks(cfg, tmp_path, missing)[name]
+    assert gone.ok is False and "statuses" in gone.note

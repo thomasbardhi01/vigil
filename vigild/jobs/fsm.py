@@ -328,7 +328,7 @@ def _rework(c: Ctx) -> list[str]:
     if reason not in REWORK_REASONS:
         errs.append(f"a REWORK names its reason, one of {list(REWORK_REASONS)}")
     if reason in ("logic_conflict", "outside_scope", "generated_conflict") and not ev.get("files"):
-        errs.append("a logic-conflict REWORK names the conflicting files")
+        errs.append(f"a {reason.replace('_', '-')} REWORK names the conflicting files")
     if reason == "red_on_rebased" and not ev.get("failing"):
         errs.append("a red-on-rebased REWORK names the failing tests")
     task = ev.get("task")
@@ -362,7 +362,10 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.IN_REVIEW, S.BUILDING): _findings_or_rework,
     (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c), *_pr_trees_clean(c)],
     (S.READY, S.MERGED): _merged,
-    (S.READY, S.BUILDING): _owner_fix,
+    # the owner's fix, or a stale ready job's REWORK at re-landing (p3-09 PR 3)
+    (S.READY, S.BUILDING): lambda c: (
+        _rework(c) if c.evidence.get("action") == "rework" else _owner_fix(c)
+    ),
     (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,
