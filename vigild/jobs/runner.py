@@ -4263,7 +4263,13 @@ class JobRunner:
                 "SELECT 1 FROM events WHERE task_id=? AND type='landed' LIMIT 1", (task_id,),
             )  # fmt: skip
             if not landed:
-                return True  # never went through landing: merged by hand (B7) or before p3-09
+                # never went through landing: merged by hand (B7) or before p3-09. Recorded,
+                # counted in the KPIs (owner, 2026-11-01: G1's exit reads it), never paged
+                self.store.add_event(
+                    "merged_unverified", {"task": task_id, "pr_url": url},
+                    Provenance.HUMAN, job_id=job.id, task_id=task_id,
+                )  # fmt: skip
+                return True
             return self._unverified_merge(job, task_id, url, "never landed", None)
         try:
             head = self.pr_head(job.repo, url)
@@ -5915,10 +5921,11 @@ class JobRunner:
 
 
 def regenerate_docs_tables(checkout: Path, paths: list[str]) -> None:
-    """The repo's generator for a generated-only landing conflict (p3-09): the docs tables
-    are rendered on demand and never committed (#96), so a conflicting generated file is
-    left as main's side. Anything else is not generated and never reaches here."""
-    del checkout, paths
+    """No generator ever runs on the host (owner, 2026-11-01): regeneration will run
+    main's copy of the repo's generator in its dev image with no network. Until that
+    exists no repo declares generated files, so landing never calls this; if it did, it
+    refuses, and the conflict is a REWORK."""
+    raise PublishError(f"no sandboxed generator yet: {sorted(paths)} not regenerated in {checkout}")
 
 
 class GitHubPublisher:

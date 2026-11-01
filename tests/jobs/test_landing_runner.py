@@ -13,6 +13,7 @@ the task's `verified_sha` is refused and paged.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from tests.conftest import git
@@ -301,3 +302,24 @@ def test_a_pr_merged_by_hand_before_any_landing_is_recorded_merged(world: World)
     w.runner.pr_head = lambda repo, url: "e" * 40  # type: ignore[attr-defined]
     w.runner.poll_prs()
     assert w.store.get_job(job).state is S.MERGED
+    # owner, 2026-11-01: recorded and counted, never paged
+    assert w.store.q("SELECT 1 FROM events WHERE job_id=? AND type='merged_unverified'", (job,))
+    from vigild.kpis import compute
+
+    assert compute(w.store)["merged_unverified"] >= 1
+    pages = [q for q in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+             if q["job_id"] == job and q["body"].get("kind") == "merge_unverified"]  # fmt: skip
+    assert pages == []
+
+
+def test_landing_never_runs_a_generator_on_the_host() -> None:
+    """Owner, 2026-11-01: regeneration runs main's generator in the repo's dev image with no
+    network, never on the host. Until that sandboxed path exists, the runner's generator
+    refuses outright, so a generated-only conflict can only be a REWORK."""
+    import pytest
+
+    from vigild.github.publish import PublishError
+    from vigild.jobs.runner import regenerate_docs_tables
+
+    with pytest.raises(PublishError, match="no sandboxed generator"):
+        regenerate_docs_tables(Path("/nonexistent"), ["docs/table.md"])

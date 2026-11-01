@@ -16,7 +16,7 @@ def _state(store: Store, job: str, frm: str, to: str) -> None:
 
 
 def test_nothing_merged_means_no_numbers(store: Store) -> None:
-    assert compute(store) == dict.fromkeys(KPIS)
+    assert compute(store) == {**dict.fromkeys(KPIS), "merged_unverified": 0}
 
 
 def test_kpis_from_raw_data(store: Store) -> None:
