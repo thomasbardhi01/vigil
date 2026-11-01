@@ -4912,6 +4912,7 @@ class JobRunner:
                          "vault_head": pub["head"], "unchanged_main": True},
                         Provenance.HUMAN, job_id=job_id, task_id=t.id,
                     )  # fmt: skip
+                self._mark_verified(job, t.id, published, main_now)
                 continue
 
             def verify(sha: str, _t: Any = t, _pub: dict[str, Any] = pub) -> bool:
@@ -4965,7 +4966,27 @@ class JobRunner:
                      "vault_head": res.vault_head},
                     Provenance.HUMAN, job_id=job_id, task_id=t.id,
                 )  # fmt: skip
+            if res.verified_sha and res.main_sha:
+                self._mark_verified(job, t.id, res.verified_sha, res.main_sha)
         return "landed"
+
+    def _mark_verified(self, job: Job, task_id: str, sha: str, main: str) -> None:
+        """Owner ruling (p3-09 PR 3, option B): post `vigil/verified` on the commit landing
+        sent, naming the main it was verified on. The main ruleset does not require it yet,
+        so a refused post (the App without `statuses: write`, GitHub down) is recorded as
+        `status_failed` and landing goes on."""
+        mark = getattr(self.publisher, "mark_verified", None)
+        if mark is None:
+            return
+        try:
+            mark(job.repo, sha, main=main, job_id=job.id)
+        except Exception as e:
+            log.warning("vigil/verified for %s failed: %s", task_id, e)
+            self.store.add_event(
+                "status_failed",
+                {"task": task_id, "sha": sha, "main": main, "error": redact(str(e))[:300]},
+                Provenance.HUMAN, job_id=job.id, task_id=task_id,
+            )  # fmt: skip
 
     @staticmethod
     def _rework_note(rework: dict[str, Any]) -> str:
@@ -6016,6 +6037,15 @@ class GitHubPublisher:
                 regenerate=regenerate_docs_tables, pulls=RestPulls(self.http, tok.token),
                 title=title, body=body, existing=existing, token=tok.token,
             )  # fmt: skip
+
+    def mark_verified(self, repo: str, sha: str, *, main: str, job_id: str | None = None) -> None:
+        """p3-09 PR 3: `vigil/verified` on `sha`, with a `statuses: write` token minted on its
+        own (never in a worker's), revoked after."""
+        from vigild.github.app import STATUS_PERMISSIONS
+        from vigild.github.status import post_verified
+
+        with self.app.lease(repo, STATUS_PERMISSIONS, job_id=job_id) as tok:
+            post_verified(self.http, tok.token, repo, sha, main=main)
 
 
 class GitHubPRs:

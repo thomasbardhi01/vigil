@@ -350,3 +350,30 @@ def test_a_failure_between_the_rework_writes_leaves_no_job_in_building_without_i
     state = w.store.get_job(job).state
     record = w.store.get_artifact(job, "rework.json", tid)
     assert not (state is S.BUILDING and record is None), state
+
+
+def test_landing_posts_vigil_verified_on_each_verified_sha(world: World) -> None:
+    """Owner ruling (p3-09 PR 3, option B): vigild posts `vigil/verified` on each task's
+    `verified_sha`, naming the main it was verified on."""
+    w = world
+    job = _held_in_review(w)
+    _main_edit(w, "docs/unrelated.md", "someone else's new file\n")
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.READY
+    for t in w.store.list_tasks(job):
+        row = w.store.q("SELECT verified_sha, verified_main FROM tasks WHERE id=?", (t.id,))[0]
+        assert {"repo": REPO, "sha": row["verified_sha"], "main": row["verified_main"]} in (
+            w.publisher.statuses
+        )
+
+
+def test_a_failed_status_post_records_it_and_the_job_still_reaches_ready(world: World) -> None:
+    """The status is advisory (the ruleset does not require it): until the App holds
+    `statuses: write`, a refused post is recorded and landing goes on."""
+    w = world
+    job = _held_in_review(w)
+    w.publisher.status_error = RuntimeError("the App lacks statuses: write")
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.READY
+    failed = [e for e in w.store.events(job_id=job) if e.type == "status_failed"]
+    assert failed and "statuses" in failed[0].data["error"]

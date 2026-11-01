@@ -386,6 +386,14 @@ class BarePublisher:
         )
 
     updates: list[dict[str, Any]] = field(default_factory=list)
+    statuses: list[dict[str, Any]] = field(default_factory=list)
+    status_error: Exception | None = None
+
+    def mark_verified(self, repo: str, sha: str, *, main: str, job_id: str | None = None) -> None:
+        """p3-09 PR 3: `vigil/verified` on the commit landing sent."""
+        if self.status_error is not None:
+            raise self.status_error
+        self.statuses.append({"repo": repo, "sha": sha, "main": main})
 
     def land(self, **kw: Any) -> Any:
         """vigild's real landing (p3-09), against the local bare repo."""
