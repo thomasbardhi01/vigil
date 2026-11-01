@@ -25,10 +25,27 @@ reviewer, auditor or coord packet includes them
 | `landing-and-trust-ladder.md` | Conflict-free landing, Lauren Tan's trust ladder, the one-app question, and Vigil as a service | 2026-10-31 | §7, R15–R21, p3-09, p3-05, p3-47, p3-48 |
 | `rust-and-retrieval.md` | Vigil and Rust: code-retrieval evidence, Rust AI infrastructure, and a Rust target stack | 2026-11-01 | R26, p3-63, experiment #17's design |
 | `the-lab-assessment.md` | "The Lab" inside Vigil: assessment of the ChatGPT research-lab proposal | 2026-11-01 | R27, p3-64–p3-68, experiments #25–#26 (an advisor assessment of an owner-supplied report with unverified citations) |
+| `local-model-loop-review.md` | Vigil × ADR-0007: Verified-Trace SFT, Best-of-n, Jev Calibration, Typed-Decision Uses, and the Hosted-Trace Bridge | 2026-11-01 | ADR-0007's amendments (2026-11-01), experiments #13, #21, E9, #32, the decider row |
 
 Paths inside the reports (`/home/claude/reports/…`, `/home/claude/vigil/…`)
 are the research environment's, not this repo's; the report each one names is
 the file above with that title.
+
+## Hosted traces: the eval-only lane
+
+From the local-model loop review (owner, 2026-11-01). Traces from hosted models (Claude, the
+mirror reviewer, any other hosted provider) never train the local model. They contribute only
+through an eval-only lane:
+- **eval cases:** hosted-solved tasks become eval-split items, scored only by hidden tests; a
+  hosted patch is never shown to a local worker;
+- **hidden-test drafts:** a hosted model may draft hidden tests, which are never training targets;
+- **planted-defect catalogs:** hosted-generated defects seed the review ladder's evaluations;
+- **scalar difficulty labels:** a hosted pass or fail stratifies tasks, as a label, never as a
+  loss target.
+
+Mirror reviewer verdicts are self-grading and are never labels. Distillation from Claude, Grok or
+OpenAI outputs into a local model is not permitted by those vendors' terms (per the review,
+unverified; not legal advice).
 
 ## Claims under test
 

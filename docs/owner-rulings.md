@@ -123,6 +123,7 @@ applied.
 - **2026-10-28**: The long-term fix for docs table conflicts is #96 (one file per feature, generated tables).
 
 ## Not adopted (don't re-propose)
+- **2026-11-01** (the local-model loop review): Merge-gate criterion scoring by the decider as a gate; advisory at most. Nothing a model says decides landing.
 - **2026-11-01** (The Lab brief): Self-committing experiment loops onto main.
 - **2026-11-01** (The Lab brief): An LLM judge for experiments.
 - **2026-11-01** (The Lab brief): A home-grown harness as a worker.

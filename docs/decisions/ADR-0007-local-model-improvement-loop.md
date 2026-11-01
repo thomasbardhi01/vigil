@@ -94,3 +94,14 @@ Each step needs the one before it:
 - **Distil from hosted models:** not adopted. Hosted runs stay `eval-only`, under the private-repo rule and the design's provenance rule.
 - **Train on every pass the worker reports:** not adopted. Test results come only from the verifier.
 - **RL on weights:** not adopted (ADR-0006 I).
+
+## Amendments (2026-11-01)
+The owner's amendments after the local-model loop review (`docs/research/local-model-loop-review.md`, an unverified source). They add to the decision above; where one changes its text, the amendment wins and the original stays as written.
+
+- **(a) The ≥300-trace gate is a trigger, not an expected win.** Published few-hundred-trace gains come from stronger-teacher traces into weak bases; own-model traces are expected to give single-digit gains. E3 is a **learning curve** at 100, 200 and 300 traces × 3 seeds, run before the held-out bar (part 4).
+- **(b) The bar for the 8–9B student is cost-normalised.** It must beat both the 35B's Best@n at **matched tower-hours** and the 35B's pass@1, not only the student's own base.
+- **(c) The eval split is at least 100 tasks,** so the pre-registered McNemar test has power (part 4's "exact numbers" are fixed with n ≥ 100).
+- **(d) Best-of-n selects by deployment-legal signals only:** worker-visible tests, the reviewer, and an optional critic. **Hidden tests score; they never select** (selecting by them turns Best@n into pass@k). This replaces part 5 step 2's "let the verifier pick". n = 8, with pass@1/2/4/8, Best@8 and pass^3 reported from the same samples. Pre-registered before the run: temperature, seeds per (task, sample index), the quant and the llama.cpp build hash.
+- **(e) Provenance is computed on loss-bearing tokens.** A train-split task card must be human- or local-authored, so no hosted text reaches a train trace even as input.
+- **(f) A new provenance class, `public-open`:** permissively licensed datasets from open-weight teachers (Nemotron-SFT-SWE-v2, Nebius SWE-rebench trajectories), each licence checked. It is used only as a separate ablation arm, never mixed into `local`, and the exporter keeps the two apart.
+- **(g) Collection filters,** on top of part 3: verified-pass only; at most 3 traces per task; de-duplicated; a trace that edits but never runs a test is dropped; an Opus hackability audit (test edits, skip markers, weakened assertions) on every kept trace.

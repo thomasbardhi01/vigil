@@ -14,11 +14,11 @@ unknown
 
 ## Configuration
 
-Two arms: tower-qwen and Sonnet.
+Two arms: tower-qwen and Sonnet. The tower arm is also reported as Best@8 by deployment-legal selection (worker-visible tests, reviewer, optional critic; hidden tests score, never select), with pass@1/2/4/8 and pass^3 from the same samples, at matched tower-hours (ADR-0007 amendments b, d).
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 
-unknown
+Pre-registered before any run (ADR-0007 amendment d): temperature, seeds per (task, sample index), the quant and the llama.cpp build hash for a tower arm. Other pins unknown.
 
 ## Task set and admission audit
 
@@ -42,7 +42,7 @@ unknown
 
 ## Limitations
 
-unknown
+20 tasks cannot power a paired McNemar test; the decision-grade eval split is ≥100 tasks (ADR-0007 amendment c). Vendor scores for Qwen3.6-35B-A3B (73.4% Verified, Alibaba's scaffold) are never the comparison; only Vigil's own runs count.
 
 ## Reproduction command
 
