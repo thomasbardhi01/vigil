@@ -203,12 +203,17 @@ def _h(x: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _has_marker(x: Any) -> bool:
-    if isinstance(x, dict):
-        return "cache_control" in x or any(_has_marker(v) for v in x.values())
-    if isinstance(x, list):
-        return any(_has_marker(v) for v in x)
-    return False
+def _has_marker(m: Any) -> bool:
+    """A message carries a cache breakpoint: on itself or on one of its top-level content
+    blocks, where the API reads them. A `cache_control` key inside a tool's input or a
+    tool result's content is data, not a marker."""
+    if not isinstance(m, dict):
+        return False
+    blocks = m.get("content")
+    return "cache_control" in m or (
+        isinstance(blocks, list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in blocks)
+    )
 
 
 @dataclass(frozen=True)
@@ -263,8 +268,9 @@ def miss_part(prev: PrefixShape, new: PrefixShape, body: dict[str, Any]) -> dict
             return {"part": "missing_message", "index": i}
         if prev.messages[i] != new.messages[i]:
             m = (body.get("messages") or [])[i]
-            return {"part": "message", "index": i, "role": m.get("role") if isinstance(m, dict)
-                    else None}  # fmt: skip
+            role = m.get("role") if isinstance(m, dict) else None
+            return {"part": "message", "index": i,
+                    "role": role if role in ("user", "assistant") else None}  # fmt: skip
     return {"part": "none", "index": None}
 
 
@@ -640,17 +646,21 @@ class Gateway:
         max_out = int(body.get("max_tokens") or DEFAULT_MAX_TOKENS)
         return worst_case_usd(self.prices, model, raw_len, max_out, cached_tokens)
 
-    def _match(self, session_id: str, body: dict[str, Any]) -> PrefixRecord | None:
-        """The session's previous call, if this request starts with exactly its input: it
-        finished within `PREFIX_TTL_S`, reported its usage, and its whole input (model,
-        thinking, tools, system, messages) is by hash the start of this one's. Nothing the
-        request claims about caching is read. Takes no lock."""
+    def _match(
+        self, session_id: str, body: dict[str, Any], new: PrefixShape | None
+    ) -> PrefixRecord | None:
+        """The session's previous call, if this request repeats its input up to its last
+        cache marker (all of it without one): it finished within the TTL its writes asked
+        for, reported its usage, and its head (model, thinking, tools, system) and those
+        messages are by hash this one's, markers stripped. Nothing the request claims about
+        caching is read. Takes no lock."""
         rec = self._prefix.get(session_id)
         # the window follows the write that made the entry, not this request (owner, 2026-11-01)
         valid = PREFIX_TTL_5M_S if rec is None or rec.ttl == "5m" else PREFIX_TTL_S  # 1h, capped
         if rec is None or rec.prompt_tokens <= 0 or self._now() - rec.at > valid:
             return None
-        new = prefix_shape(body)
+        if new is None:
+            return None
         where = miss_part(rec.shape, new, body)
         if where["part"] == "none":
             return rec
@@ -710,12 +720,15 @@ class Gateway:
         s = rec.shape
         if s.marker >= 0 and s.marker < len(s.messages) - 1:
             # matched up to the previous call's last marker: what follows it is estimated anew
+            # the previous call's uncached input (its post-marker messages included) is held
+            # at the write rate too, so a prefix the provider did not cache is never free
             base = s.cum[s.marker]
             read = min(rec.cached_tokens, rec.prompt_tokens)
             rest = math.ceil(max(0, chars - base) / CHARS_PER_TOKEN)
+            write = rec.prompt_tokens - read + rest
             if self._task_is_miss(session_id, task_id):
-                return 0, read + rest, "task_miss"
-            return read, rest, "prefix"
+                return 0, read + write, "task_miss"
+            return read, write, "prefix"
         tail = math.ceil(max(0, chars - s.chars) / CHARS_PER_TOKEN)
         if self._task_is_miss(session_id, task_id):
             return 0, rec.prompt_tokens + tail, "task_miss"
@@ -918,7 +931,7 @@ class Gateway:
         msgs = body.get("messages")
         fp: PrefixShape | None = prefix_shape(body) if isinstance(msgs, list) else None
         chars = fp.chars if fp else 0
-        rec = self._match(session_id, body)
+        rec = self._match(session_id, body, fp)
         counted = None
         if (
             rec is None

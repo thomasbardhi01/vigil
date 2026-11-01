@@ -1301,6 +1301,42 @@ def test_a_rewritten_message_after_the_previous_marker_still_matches_up_to_the_m
     n1 = _cc([*turns[:5], rewritten, *turns[5:]], marker_at=7)
     h = _pre(gw, tok, n1)
     assert h.reason == "prefix" and h.cached_tokens == 9_000
+    # everything after the previous marker anew, plus the previous call's uncached input
+    rest = math.ceil((prefix_shape(n1).chars - prefix_shape(n).cum[4]) / CHARS_PER_TOKEN)
+    assert h.amount == pytest.approx(
+        _usd(gw, tokens_cache_read=9_000, tokens_cache_write_5m=3 + rest, tokens_out=OUT)
+    )
+
+
+def test_a_marker_prefix_the_provider_did_not_cache_is_held_at_the_write_rate(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Review round 1, finding 1: the previous call reported no cache use (a prefix under the
+    model's minimum, a failed write). Matching up to its marker must not make that prefix
+    free: all of its input is held at the write rate, plus what follows the marker."""
+    turns = _cc_turns(3)
+    note = {"role": "user", "content": [{"type": "text", "text": "NOTE " + "n" * 500}]}
+    n = _cc([*turns[:5], note], marker_at=4)
+    upstream.usage = {"input_tokens": 9_000}
+    upstream.count = 9_000
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, n).status_code == 200
+    clock[0] += 10
+    n1 = _cc([*turns[:5], *turns[5:]], marker_at=6)
+    h = _pre(gw, tok, n1)
+    rest = math.ceil((prefix_shape(n1).chars - prefix_shape(n).cum[4]) / CHARS_PER_TOKEN)
+    assert h.reason == "prefix" and h.cached_tokens == 0
+    assert h.amount == pytest.approx(_usd(gw, tokens_cache_write_5m=9_000 + rest, tokens_out=OUT))
+
+
+def test_a_cache_control_key_inside_a_tool_input_is_not_a_marker() -> None:
+    """Review round 1, finding 2: only a message's own or its top-level blocks' markers
+    count; a `cache_control` key in a tool's input is data."""
+    turns = _cc_turns(2)
+    body = _cc(turns, marker_at=2)
+    body["messages"][3]["content"][1]["input"]["cache_control"] = MARK
+    assert prefix_shape(body).marker == 2
 
 
 @pytest.mark.parametrize("change", ["system", "message"])
@@ -1330,3 +1366,25 @@ def test_a_missed_prefix_records_where_it_diverged_and_no_content(
     blob = json.dumps(ev.data)
     for text in ("SYSTEM", "edited", "TASK", "ppp", "rrr"):
         assert text not in blob
+
+
+def test_a_miss_records_no_role_it_does_not_know_and_nothing_without_a_record(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Review round 1, findings 3 and 8: the event copies a role only if it is user or
+    assistant; a session's first call (no previous record) records nothing."""
+    turns = _cc_turns(2)
+    n = _cc(turns[:3], marker_at=2)
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    _pre(gw, tok, n)
+    assert not [e for e in store.events() if e.type == "prefix_miss"]
+    upstream.usage = {"input_tokens": 3, "cache_read_input_tokens": 7_000}
+    assert _post(client, tok, n).status_code == 200
+    clock[0] += 10
+    n1 = _cc(turns, marker_at=4)
+    n1["messages"][1]["role"] = "SECRET-LIKE " + "x" * 50
+    _pre(gw, tok, n1)
+    (ev,) = [e for e in store.events() if e.type == "prefix_miss"]
+    assert ev.data["index"] == 1 and ev.data["role"] is None
+    assert "SECRET" not in json.dumps(ev.data)
