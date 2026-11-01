@@ -88,6 +88,13 @@ Checked against the live pricing page on 2026-11-01 for UI-3a: the Opus 5.5 and 
 
 Sources: https://platform.claude.com/docs/en/about-claude/models/overview · https://platform.claude.com/docs/en/about-claude/pricing
 
+**Claude Code: authentication and credential use** (https://code.claude.com/docs/en/legal-and-compliance, section "Authentication and credential use", read 2026-11-01):
+- Subscription OAuth is "intended exclusively for purchasers of Claude Free, Pro, Max, Ultra, Team, and Enterprise subscription plans and is designed to support ordinary use of Claude Code and other native Anthropic applications".
+- Developers, Agent SDK included, "should use API key authentication"; Anthropic does not permit routing requests through Free, Pro, Max or Ultra plan credentials on behalf of users, and "developers may not collect, store, or intermediate Claude.ai credentials or session tokens — sign-in to a Claude account must complete through Anthropic's own flow".
+- Explicitly allowed: "an end user signing in to the unmodified Claude Code binary with their own Claude subscription, including where a platform hosts Claude Code".
+- Same page, Usage policy: "Advertised usage limits for Pro, Max, and Ultra plans assume ordinary, individual usage of Claude Code and the Agent SDK."
+- Consequences: UI-3a's `claude-sub` backend is the unmodified CLI the owner signs in to through Anthropic's own login, and vigild never reads, stores or injects that credential. Experiment #24 (a gateway-held subscription token injected into worker containers) is blocked on a written answer from Anthropic; workers stay on the API key.
+
 ## Facts the architecture relies on
 
 **Claude Agent SDK and Claude Code**

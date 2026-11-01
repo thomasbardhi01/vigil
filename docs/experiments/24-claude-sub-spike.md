@@ -1,6 +1,6 @@
 # Experiment #24: claude-sub spike
 
-- **Status:** planned (G2, p3-60; pinned, the owner reads it and mints the token)
+- **Status:** blocked on a written answer from Anthropic (2026-11-01): a gateway-held subscription token injected into worker containers is close to "store or intermediate" credentials, and parallel workers may not be "ordinary, individual usage" (`docs/sources.md`, Claude Code terms). Workers stay on the API key. Was: planned (G2, p3-60; pinned, the owner reads it and mints the token).
 - **Item / ruling:** p3-60; R24
 - **Budget line:** unknown
 
