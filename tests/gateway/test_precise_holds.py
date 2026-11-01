@@ -1454,3 +1454,26 @@ def test_the_lookback_boundary_is_20_blocks(
     new = prefix_shape(n1)
     assert max(new.marks) - prefix_shape(n).prefix_end() == distance
     assert _pre(gw, tok, n1).reason == reason
+
+
+def test_a_string_content_repeats_its_one_text_block_form(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The live replay (2026-11-01): Claude Code ends request N with a mid-conversation system
+    message whose content is one text block carrying the marker, and re-sends it in N+1 as a
+    plain string. The provider reads both the same; so does the match."""
+    turns = _cc_turns(2)
+    note = {"role": "system", "content": [{"type": "text", "text": "NOTE " + "n" * 500,
+                                            "cache_control": MARK}]}  # fmt: skip
+    n = _cc(turns[:3], marker_at=-1)
+    n["messages"].append(note)
+    tok = _cc_session(client, gw, store, budget, upstream, n)
+    clock[0] += 10
+    n1 = _cc(turns, marker_at=-1)
+    n1["messages"][3:3] = [{"role": "system", "content": "NOTE " + "n" * 500}]
+    n1["messages"].append({"role": "system", "content": [
+        {"type": "text", "text": "NOTE2", "cache_control": MARK}]})  # fmt: skip
+    h = _pre(gw, tok, n1)
+    assert h.reason == "prefix", [e.data for e in store.events() if e.type == "prefix_miss"]
+    assert h.cached_tokens == 9_000

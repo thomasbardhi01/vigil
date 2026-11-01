@@ -197,6 +197,19 @@ def _strip_cache_control(x: Any) -> Any:
     return x
 
 
+def _as_blocks(content: Any) -> Any:
+    """A string content is one text block: the provider reads `"x"` and
+    `[{"type": "text", "text": "x"}]` the same, and Claude Code sends a message one way with
+    its marker and the other way a turn later (the live replay, 2026-11-01)."""
+    return [{"type": "text", "text": content}] if isinstance(content, str) else content
+
+
+def _canon_message(m: Any) -> Any:
+    return (
+        {**m, "content": _as_blocks(m["content"])} if isinstance(m, dict) and "content" in m else m
+    )
+
+
 def _h(x: Any) -> str:
     text = json.dumps(_strip_cache_control(x), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)  # fmt: skip
@@ -247,13 +260,19 @@ class PrefixShape:
 def prefix_shape(body: dict[str, Any]) -> PrefixShape:
     msgs = body.get("messages")
     msgs = msgs if isinstance(msgs, list) else []
-    parts = [body.get("model"), body.get("thinking"), body.get("tools"), body.get("system")]
+    parts = [
+        body.get("model"),
+        body.get("thinking"),
+        body.get("tools"),
+        _as_blocks(body.get("system")),
+    ]
+    canon = [_canon_message(m) for m in msgs]
     head_bytes = len(
         json.dumps(_strip_cache_control(parts), sort_keys=True, separators=(",", ":"),
                    ensure_ascii=False).encode()
     )  # fmt: skip
     cum, n = [], head_bytes
-    for m in msgs:
+    for m in canon:
         n += len(json.dumps(_strip_cache_control(m), sort_keys=True, separators=(",", ":"),
                             ensure_ascii=False).encode())  # fmt: skip
         cum.append(n)
@@ -278,7 +297,7 @@ def prefix_shape(body: dict[str, Any]) -> PrefixShape:
         ends.append(pos)
     return PrefixShape(
         head=(_h(parts[0]), _h(parts[1]), _h(parts[2]), _h(parts[3])),
-        messages=tuple(_h(m) for m in msgs),
+        messages=tuple(_h(m) for m in canon),
         marker=marker,
         cum=tuple(cum) if cum else (head_bytes,),
         head_blocks=head_blocks,
@@ -316,7 +335,7 @@ def miss_part(prev: PrefixShape, new: PrefixShape, body: dict[str, Any]) -> dict
             m = (body.get("messages") or [])[i]
             role = m.get("role") if isinstance(m, dict) else None
             return {"part": "message", "index": i,
-                    "role": role if role in ("user", "assistant") else None}  # fmt: skip
+                    "role": role if role in ("user", "assistant", "system") else None}  # fmt: skip
     return {"part": "none", "index": None}
 
 
