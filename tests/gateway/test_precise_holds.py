@@ -1439,3 +1439,18 @@ def test_a_new_marker_3_blocks_past_the_old_one_is_held_as_a_prefix(
     h = _pre(gw, tok, _cc(turns[:7], marker_at=6))
     assert h.reason == "prefix" and h.cached_tokens == 9_000
     assert not [e for e in store.events() if e.type == "prefix_miss"]
+
+
+@pytest.mark.parametrize(
+    ("marker_at", "distance", "reason"), [(17, 20, "prefix"), (18, 21, "count")]
+)
+def test_the_lookback_boundary_is_20_blocks(
+    marker_at: int, distance: int, reason: str, client: TestClient, gw: Gateway, store: Store,
+    budget: Budget, upstream: Upstream, clock: list[float],
+) -> None:  # fmt: skip
+    """Review: exactly 20 blocks past the previous marker is still read; 21 is not."""
+    tok, turns, n = _guard_session(client, gw, store, budget, upstream, clock)
+    n1 = _cc(turns, marker_at=marker_at)
+    new = prefix_shape(n1)
+    assert max(new.marks) - prefix_shape(n).prefix_end() == distance
+    assert _pre(gw, tok, n1).reason == reason
