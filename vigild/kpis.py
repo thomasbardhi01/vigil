@@ -32,6 +32,8 @@ KPIS = (
     "revert_fix_job_rate",
     "cost_per_merged_pr",
     "median_spec_to_merge_hours",
+    # p3-09 (owner, 2026-11-01): PRs merged without going through landing; G1's exit reads it
+    "merged_unverified",
 )
 
 
@@ -47,6 +49,9 @@ def compute(store: Store) -> dict[str, Any]:
     trans = _transitions(store)
     merged = {j: t for j, t in trans.items() if any(to == "merged" for _, to, _ in t)}
     result: dict[str, Any] = dict.fromkeys(KPIS)
+    result["merged_unverified"] = store.q(
+        "SELECT COUNT(*) AS n FROM events WHERE type='merged_unverified'"
+    )[0]["n"]
     if merged:
         first_pass = [
             j

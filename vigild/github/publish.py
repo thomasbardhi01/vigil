@@ -107,6 +107,37 @@ class RestPulls:
         if r.status_code != 200:
             raise PublishError(f"closing {repo}#{number} failed (HTTP {r.status_code})")
 
+    def update_pull(self, repo: str, url: str, *, title: str, body: str) -> None:
+        """Rewrite a PR's title and body from the head vigild landed (#221)."""
+        number = int(url.rstrip("/").rsplit("/", 1)[-1])
+        r = self.http.patch(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"title": redact(title), "body": redact(body)},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"updating {repo}#{number} failed (HTTP {r.status_code})")
+
+    def head(self, repo: str, number: int) -> str:
+        """A PR's head commit (the merge binding: it must be the verified SHA)."""
+        r = self.http.get(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"reading {repo}#{number} failed (HTTP {r.status_code})")
+        return str(r.json()["head"]["sha"])
+
     def state(self, repo: str, number: int) -> str:
         """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
         r = self.http.get(
@@ -161,8 +192,14 @@ def publish(
     token: str | None = None,
     existing: str | None = None,
     push: bool = True,
+    replace: str | None = None,
 ) -> str:
-    """Check, push `head` to `branch`, and open a draft PR into `base`. With
+    """Check, push `head` to `branch`, and open a draft PR into `base`. `replace`
+    (p3-09, a REWORK only; owner 2026-11-01) names `<task>/<n>`: the head was rebuilt on a
+    new base, so the branch is replaced, not fast-forwarded, and only when its tip is what
+    vigild itself last sent; that tip is first kept as `refs/vigil/rework/<task>/<n>`, and
+    the open PR's title and body are rebuilt (#221). Every other publish only
+    fast-forwards. With
     `existing` (a fix round on a published branch, phase 2a), the same checks
     and the push, and the PR that's already open stands. With `push=False` (a
     bench job's no-op publisher) the same checks run and the commit that would be
@@ -181,8 +218,8 @@ def publish(
     try:
         # Tier 1: the job's `.vigil/` artifacts stay in the vault; what goes to the
         # target repo is the same tree without them (the base's own `.vigil` kept)
-        send = ws.public_commit(repo, head, base_sha, branch)
-        if existing and ws.published_sha(repo, branch) is None and send != head:
+        send = ws.public_commit(repo, head, base_sha, branch, fresh=replace is not None)
+        if existing and ws.published_sha(repo, branch) is None and send != head and not replace:
             raise LegacyBranch(
                 f"{branch} predates artifact stripping and carries .vigil/; vigild never "
                 "forces a branch: the owner must clean it by hand, or re-plan"
@@ -193,7 +230,33 @@ def publish(
         outside = out_of_scope(sent, scope)  # what is sent, too
         if outside:
             raise PublishError(f"files in the commit sent are outside the scope: {outside}")
-        if push:
+        if push and replace is not None:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+/[0-9]+", replace):
+                raise PublishError(f"bad REWORK id {replace!r}")
+            tip = ws.remote_tip(repo, branch, token)
+            if tip is not None and tip != ws.published_sha(repo, branch):
+                raise BranchMoved(
+                    f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
+                    "last sent, and a REWORK replaces only vigild's own send"
+                )
+            ref = f"refs/vigil/rework/{replace}"
+            try:
+                kept = ws._git(ws.vault(repo), "rev-parse", "--verify", "--quiet", ref)
+            except WorkspaceError:
+                kept = None
+            if tip is not None and kept is None and tip != send:
+                # the old tip is kept before anything replaces it, once: a retried replace
+                # (a crash after the push) never overwrites it with the new tip
+                ws._git(ws.vault(repo), "update-ref", ref, tip)
+            try:
+                ws.push(repo, send, branch, token, tip)
+            except WorkspaceError as e:
+                if "stale info" in str(e):
+                    raise BranchMoved(
+                        f"{branch} moved on the remote after vigild read it: nothing is overwritten"
+                    ) from e
+                raise
+        elif push:
             tip = ws.remote_tip(repo, branch, token)
             if (
                 tip is not None
@@ -226,7 +289,10 @@ def publish(
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
     if existing:
-        return existing  # the open PR's title and body are never rewritten here
+        update = getattr(pulls, "update_pull", None)
+        if replace is not None and update is not None:  # #221: rebuilt from the new head
+            update(repo, existing, title=redact(title), body=redact(body))
+        return existing  # otherwise the open PR's title and body stand
     # the one redactor, for every caller: the title and body carry coord and worker text
     return pulls.create_pull(
         repo, head=branch, base=base, title=redact(title), body=redact(body), draft=True

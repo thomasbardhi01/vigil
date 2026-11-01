@@ -750,7 +750,9 @@ class Workspace:
             raise WorkspaceError(str(e)) from e
         return all(redact(m) == m for m in messages.split("\0"))
 
-    def public_commit(self, repo: str, head: str, base_sha: str, branch: str) -> str:
+    def public_commit(
+        self, repo: str, head: str, base_sha: str, branch: str, *, fresh: bool = False
+    ) -> str:
         """The commit to send for the vault's `head`: `head` itself when its
         top-level `.vigil` is the base's and nothing went to `branch` before;
         otherwise a commit of the same tree with that entry replaced by the base's
@@ -762,7 +764,8 @@ class Workspace:
         if not (SHA.match(head) and SHA.match(base_sha)):
             raise WorkspaceError("bad sha")
         vault = self.vault(repo)
-        prev = self.published_sha(repo, branch)
+        # `fresh` (a REWORK on a new base, p3-09): built on the base, not on the last send
+        prev = None if fresh else self.published_sha(repo, branch)
         try:
             raw_message = git(vault, "log", "-1", "--format=%B", head, raw=True)
         except GitError as e:
