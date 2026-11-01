@@ -218,6 +218,77 @@ def prefix_digest(body: dict[str, Any], n: int) -> tuple[str, int]:
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
+def _h(x: Any) -> str:
+    text = json.dumps(_strip_cache_control(x), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)  # fmt: skip
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _has_marker(x: Any) -> bool:
+    if isinstance(x, dict):
+        return "cache_control" in x or any(_has_marker(v) for v in x.values())
+    if isinstance(x, list):
+        return any(_has_marker(v) for v in x)
+    return False
+
+
+@dataclass(frozen=True)
+class PrefixShape:
+    """A request's input as the prefix match sees it (owner, 2026-11-01): the head
+    (model, thinking, tools, system), one hash per message, all with cache markers stripped;
+    the index of the last message that carries a marker (-1 if none), and the UTF-8 bytes
+    of the head plus each message so far. Hashes and lengths only, never content."""
+
+    head: tuple[str, str, str, str]
+    messages: tuple[str, ...]
+    marker: int
+    cum: tuple[int, ...]  # cum[i]: bytes of the head and messages 0..i
+
+    @property
+    def chars(self) -> int:
+        return self.cum[-1] if self.cum else 0
+
+
+def prefix_shape(body: dict[str, Any]) -> PrefixShape:
+    msgs = body.get("messages")
+    msgs = msgs if isinstance(msgs, list) else []
+    parts = [body.get("model"), body.get("thinking"), body.get("tools"), body.get("system")]
+    head_bytes = len(
+        json.dumps(_strip_cache_control(parts), sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode()
+    )  # fmt: skip
+    cum, n = [], head_bytes
+    for m in msgs:
+        n += len(json.dumps(_strip_cache_control(m), sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False).encode())  # fmt: skip
+        cum.append(n)
+    marker = max((i for i, m in enumerate(msgs) if _has_marker(m)), default=-1)
+    return PrefixShape(
+        head=(_h(parts[0]), _h(parts[1]), _h(parts[2]), _h(parts[3])),
+        messages=tuple(_h(m) for m in msgs),
+        marker=marker,
+        cum=tuple(cum) if cum else (head_bytes,),
+    )
+
+
+def miss_part(prev: PrefixShape, new: PrefixShape, body: dict[str, Any]) -> dict[str, Any]:
+    """Where a new request first stops matching the previous call's prefix: a head part, or
+    a message index and what differs there. Indexes and names only, never content."""
+    for name, a, b in zip(("model", "thinking", "tools", "system"), prev.head, new.head,
+                          strict=True):  # fmt: skip
+        if a != b:
+            return {"part": name, "index": None}
+    upto = prev.marker if prev.marker >= 0 else len(prev.messages) - 1
+    for i in range(upto + 1):
+        if i >= len(new.messages):
+            return {"part": "missing_message", "index": i}
+        if prev.messages[i] != new.messages[i]:
+            m = (body.get("messages") or [])[i]
+            return {"part": "message", "index": i, "role": m.get("role") if isinstance(m, dict)
+                    else None}  # fmt: skip
+    return {"part": "none", "index": None}
+
+
 @dataclass(frozen=True)
 class PrefixRecord:
     """What a session's last finished call left in the provider's cache, as far as
@@ -226,9 +297,7 @@ class PrefixRecord:
     the prompt total (input + cache reads + cache writes) and the part of it in the
     provider's cache after the call (reads and writes; owner, 2026-11-01), and when."""
 
-    digest: str
-    messages: int
-    chars: int
+    shape: PrefixShape
     cached_tokens: int
     at: float
     prompt_tokens: int = 0
@@ -339,7 +408,7 @@ class Hold:
     cached_tokens: int = 0  # the input tokens the hold priced at the cache-read rate (#79)
     plain: float | None = None  # the same hold priced as a miss (day, month, metering failure)
     premium: float = 0.0  # plain - amount: held against the day and the month (R23)
-    fingerprint: tuple[str, int, int] | None = None  # this input: digest, messages, chars
+    fingerprint: PrefixShape | None = None  # this input's shape (hashes and lengths)
     # why the input was held as it was: prefix, count, estimate or task_miss
     reason: str = ""
 
@@ -602,12 +671,27 @@ class Gateway:
         valid = PREFIX_TTL_5M_S if rec is None or rec.ttl == "5m" else PREFIX_TTL_S  # 1h, capped
         if rec is None or rec.prompt_tokens <= 0 or self._now() - rec.at > valid:
             return None
-        msgs = body.get("messages")
-        if not isinstance(msgs, list) or len(msgs) < rec.messages:
-            return None
-        if prefix_digest(body, rec.messages)[0] != rec.digest:
-            return None
-        return rec
+        new = prefix_shape(body)
+        where = miss_part(rec.shape, new, body)
+        if where["part"] == "none":
+            return rec
+        self._prefix_miss(session_id, rec.shape, new, where)
+        return None
+
+    def _prefix_miss(
+        self, session_id: str, prev: PrefixShape, new: PrefixShape, where: dict[str, Any]
+    ) -> None:
+        """The diagnostic (owner, 2026-11-01): why a request did not match the previous call's
+        prefix, as indexes and names only. It never breaks the call."""
+        try:
+            self.store.add_event(
+                "prefix_miss",
+                {**where, "prev_messages": len(prev.messages), "new_messages": len(new.messages),
+                 "prev_marker": prev.marker, "new_marker": new.marker},
+                Provenance.HUMAN, session_id=session_id,
+            )  # fmt: skip
+        except Exception:
+            log.exception("could not record prefix_miss for %s", session_id)
 
     def _task_is_miss(self, session_id: str, task_id: str | None) -> bool:
         """After an overshoot every later call on the task is held as a miss (R23). The
@@ -644,7 +728,16 @@ class Gateway:
             if counted is not None:
                 return 0, counted, "count"
             return 0, math.ceil(raw_len / CHARS_PER_TOKEN), "estimate"
-        tail = math.ceil(max(0, chars - rec.chars) / CHARS_PER_TOKEN)
+        s = rec.shape
+        if s.marker >= 0 and s.marker < len(s.messages) - 1:
+            # matched up to the previous call's last marker: what follows it is estimated anew
+            base = s.cum[s.marker]
+            read = min(rec.cached_tokens, rec.prompt_tokens)
+            rest = math.ceil(max(0, chars - base) / CHARS_PER_TOKEN)
+            if self._task_is_miss(session_id, task_id):
+                return 0, read + rest, "task_miss"
+            return read, rest, "prefix"
+        tail = math.ceil(max(0, chars - s.chars) / CHARS_PER_TOKEN)
         if self._task_is_miss(session_id, task_id):
             return 0, rec.prompt_tokens + tail, "task_miss"
         read = min(rec.cached_tokens, rec.prompt_tokens)
@@ -751,7 +844,7 @@ class Gateway:
         fp = hold.fingerprint
         if fp is not None and prompt > 0:
             self._prefix[gs.session_id] = PrefixRecord(
-                fp[0], fp[1], fp[2], cached, self._now(), prompt, write_ttl(hold.body)
+                fp, cached, self._now(), prompt, write_ttl(hold.body)
             )
         else:
             self._prefix.pop(gs.session_id, None)
@@ -844,11 +937,8 @@ class Gateway:
         thinking = isinstance(th, dict) and th.get("type") == "enabled" and "budget_tokens" in th
         ttl = write_ttl(body)
         msgs = body.get("messages")
-        fp: tuple[str, int, int] | None = None
-        if isinstance(msgs, list):
-            digest, n_chars = prefix_digest(body, len(msgs))
-            fp = (digest, len(msgs), n_chars)
-        chars = fp[2] if fp else 0
+        fp: PrefixShape | None = prefix_shape(body) if isinstance(msgs, list) else None
+        chars = fp.chars if fp else 0
         rec = self._match(session_id, body)
         counted = None
         if (

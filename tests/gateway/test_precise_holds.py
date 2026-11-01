@@ -29,7 +29,7 @@ from tests.gateway.test_gateway import PA, _session, budget, client, gw  # noqa:
 from vigild.budget import Budget
 from vigild.config import Config
 from vigild.db import Store
-from vigild.gateway.service import CHARS_PER_TOKEN, Gateway, GatewayError, prefix_digest
+from vigild.gateway.service import CHARS_PER_TOKEN, Gateway, GatewayError, prefix_shape
 from vigild.jobs.model import Role
 from vigild.metering.calls import CallUsage
 
@@ -150,8 +150,8 @@ def _post(client: TestClient, tok: str, body: dict[str, Any]) -> httpx2.Response
 
 def _tail_tokens(first: dict[str, Any], second: dict[str, Any]) -> int:
     """The bytes the second request appended to the first, as the gateway estimates them."""
-    a = prefix_digest(first, len(first["messages"]))[1]
-    b = prefix_digest(second, len(second["messages"]))[1]
+    a = prefix_shape(first).chars
+    b = prefix_shape(second).chars
     return math.ceil((b - a) / CHARS_PER_TOKEN)
 
 
@@ -1217,3 +1217,116 @@ def test_every_metered_call_records_its_hold_and_why(
     assert [r["hold_reason"] for r in rows] == ["count", "prefix", "estimate"]
     for r, held in zip(rows, (first_hold, second_hold, third_hold), strict=True):
         assert r["hold_usd"] == pytest.approx(held)
+
+
+# --- prefix match on Claude Code-shaped requests (owner, 2026-11-01; the w3 finding) -------
+#
+# Placeholder content only: the structure (system block list with a marker, tools, user and
+# assistant turns with tool_use and tool_result blocks, where the markers sit) follows the
+# real requests; no prompt text.
+
+MARK = {"type": "ephemeral"}
+
+
+def _cc_turns(k: int) -> list[dict[str, Any]]:
+    """k rounds: a user turn, then an assistant tool call and its result."""
+    msgs: list[dict[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "TASK " + "p" * 6_000}]}
+    ]
+    for i in range(k):
+        msgs.append({"role": "assistant", "content": [
+            {"type": "text", "text": f"step {i}"},
+            {"type": "tool_use", "id": f"tu_{i}", "name": "Read", "input": {"file": f"f{i}"}},
+        ]})  # fmt: skip
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"tu_{i}", "content": "r" * 3_000},
+        ]})  # fmt: skip
+    return msgs
+
+
+def _cc(msgs: list[dict[str, Any]], marker_at: int) -> dict[str, Any]:
+    body = {
+        "model": MODEL,
+        "max_tokens": OUT,
+        "system": [{"type": "text", "text": "SYSTEM " + "s" * 4_000, "cache_control": MARK}],
+        "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}],
+        "messages": json.loads(json.dumps(msgs)),
+    }
+    if marker_at >= 0:
+        body["messages"][marker_at]["content"][-1]["cache_control"] = MARK
+    return body
+
+
+def _cc_session(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, up: Upstream,
+    first: dict[str, Any],
+) -> str:  # fmt: skip
+    up.usage = {"input_tokens": 3, "cache_read_input_tokens": 7_000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 2_000}}  # fmt: skip
+    up.count = 9_003
+    _sid, tok = _sess(store, budget, gw, 1.0)
+    assert _post(client, tok, first).status_code == 200
+    return tok
+
+
+def test_a_marker_moved_to_the_newest_message_still_matches_the_prefix(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """The owner's hypothesis: request N has its marker on its last message k; request N+1
+    repeats messages 0..k without it and adds new ones, marker on the newest. The match
+    ignores markers: prefix pricing, hold_reason=prefix."""
+    turns = _cc_turns(3)
+    n = _cc(turns[:5], marker_at=4)
+    tok = _cc_session(client, gw, store, budget, upstream, n)
+    clock[0] += 10
+    n1 = _cc(turns, marker_at=6)
+    h = _pre(gw, tok, n1)
+    assert h.reason == "prefix" and h.cached_tokens == 9_000
+
+
+def test_a_rewritten_message_after_the_previous_marker_still_matches_up_to_the_marker(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Request N's marker sits on message k and an unmarked message follows it (a per-turn
+    note); request N+1 rewrites that message. Everything up to the marker is what the
+    provider cached, so the match holds there: prefix, the rest estimated at the write rate."""
+    turns = _cc_turns(3)
+    note = {"role": "user", "content": [{"type": "text", "text": "NOTE " + "n" * 500}]}
+    n = _cc([*turns[:5], note], marker_at=4)
+    tok = _cc_session(client, gw, store, budget, upstream, n)
+    clock[0] += 10
+    rewritten = {"role": "user", "content": [{"type": "text", "text": "NOTE2 " + "m" * 400}]}
+    n1 = _cc([*turns[:5], rewritten, *turns[5:]], marker_at=7)
+    h = _pre(gw, tok, n1)
+    assert h.reason == "prefix" and h.cached_tokens == 9_000
+
+
+@pytest.mark.parametrize("change", ["system", "message"])
+def test_a_missed_prefix_records_where_it_diverged_and_no_content(
+    change: str, client: TestClient, gw: Gateway, store: Store, budget: Budget,
+    upstream: Upstream, clock: list[float],
+) -> None:  # fmt: skip
+    """The diagnostic: a miss records the first diverging part (a head part, or a message
+    index and its role) as names and indexes only; the hold stays miss-priced (count)."""
+    turns = _cc_turns(2)
+    n = _cc(turns[:3], marker_at=2)
+    tok = _cc_session(client, gw, store, budget, upstream, n)
+    clock[0] += 10
+    n1 = _cc(turns, marker_at=4)
+    if change == "system":
+        n1["system"][0]["text"] = "SYSTEM CHANGED " + "s" * 10
+    else:
+        n1["messages"][1]["content"][0]["text"] = "edited step"
+    h = _pre(gw, tok, n1)
+    assert h.reason == "count"
+    (ev,) = [e for e in store.events() if e.type == "prefix_miss"]
+    if change == "system":
+        assert ev.data["part"] == "system" and ev.data["index"] is None
+    else:
+        assert ev.data["part"] == "message" and ev.data["index"] == 1
+        assert ev.data["role"] == "assistant"
+    blob = json.dumps(ev.data)
+    for text in ("SYSTEM", "edited", "TASK", "ppp", "rrr"):
+        assert text not in blob
