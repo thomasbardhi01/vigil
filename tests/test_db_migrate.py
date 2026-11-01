@@ -328,3 +328,56 @@ def test_the_landing_step_is_last_after_the_call_holds_and_idempotent(tmp_path: 
     db.migrate(store.conn)
     db.migrate(store.conn)
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
+
+
+def test_after_every_step_each_row_type_is_still_created(tmp_path: Path) -> None:
+    """Owner, 2026-11-01 (after create_task's positional insert broke on `_m21_landing`'s
+    columns): a database built from the original schema and run through every MIGRATIONS
+    step still takes a row of each kind its writers create; and no INSERT anywhere in
+    vigild/ relies on column order, so a later step's column can't break a writer."""
+    import re
+
+    from vigild.budget import Budget
+    from vigild.config import load
+    from vigild.jobs.model import Role
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    path = tmp_path / "every-row.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    conn.commit()
+    conn.close()
+    store = Store.open(path)  # every step, in order
+    job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    store.create_task(job.id, {"task_id": f"{job.id}-w1"}, "claude")
+    s = store.create_session(job.id, Role.WORKER, task_id=f"{job.id}-w1")
+    store.add_event("state", {"to": "x"}, "human", job_id=job.id, session_id=s.id)
+    store.add_artifact(job.id, "spec.md", "spec", "claude")
+    item = store.create_inbox_item("questions", "page", job.id, "t", {"k": 1})
+    store.add_approval(job.id, item.id, "owner", "api", None)
+    store.add_transcript(s.id, "sdk-1", None, [{"type": "user"}])
+    store.create_replay(job.id, f"{job.id}-w1", "a" * 40, "v1", "0" * 64)
+    store.create_batch("b", [{"repo": "o/r", "base": "main", "title": "t", "request": "r",
+                             "notes": []}])  # fmt: skip
+    cfg = load(Path(__file__).resolve().parents[1] / "configs")
+    budget = Budget(store, cfg.budgets)
+    budget.reserve(session_id=s.id, task_id=f"{job.id}-w1", amount=0.01, purpose="t")
+    record_call(
+        store, PriceTable(cfg.prices),
+        session_id=s.id, task_id=f"{job.id}-w1", job_id=job.id, purpose="session",
+        provider="anthropic", backend_preset="claude-sonnet", model="claude-sonnet-5-5",
+        usage=CallUsage(tokens_in=1, tokens_out=1), hold_usd=0.01, hold_reason="count",
+    )  # fmt: skip
+    for table in ("jobs", "tasks", "sessions", "events", "artifacts", "inbox_items",
+                  "approvals", "transcripts", "replays", "batches", "reservations",
+                  "model_calls"):  # fmt: skip
+        assert store.q(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"] >= 1, table  # noqa: S608
+
+    positional = re.compile(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+\"?[\w{}]+\"?\s+(?!\()", re.I)
+    root = Path(__file__).resolve().parents[1] / "vigild"
+    bad = []
+    for f in sorted(root.rglob("*.py")):
+        flat = re.sub(r'"\s*\n\s*f?"', "", f.read_text())  # join split string literals
+        bad += [f"{f.relative_to(root)}: {m.group(0)}" for m in positional.finditer(flat)]
+    assert bad == [], bad
