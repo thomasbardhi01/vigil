@@ -19,6 +19,7 @@ applied.
 - **2026-10-28** (usage lines superseded 2026-10-31 by R5): Caps are the stop: $25 a day, $2 a task, WIP 4; usage lines 60% and 75% weekly.
 
 ## Merging and PRs
+- **2026-11-01** (p3-09 PR 3, card option B): the vigil-worker App gets `statuses: write`, minted only on its own; vigild posts the `vigil/verified` commit status on each task's `verified_sha`; the main ruleset is unchanged for now (it has no bypass actors, so requiring `vigil/verified` would block every `feat/*` PR, which nothing posts it for). Revisit the required check at G3, or when coord's own work goes through jobs, pinned to the vigil-worker App as its only source. `vigil doctor` checks the App holds exactly its permission set.
 - **2026-10-31** (R4): Auto-land scope: Earned per (repo, shape) by the ladder (p3-31) **only after post-merge watch with auto-revert exists** (p3-44 grows a revert); the permanent never-list is money, auth, consent, migrations and pinned paths; deps and architecture leave the permanent list and are admitted only by ADR; review depth and eligibility read the risk score (p3-29); review-after-landing is reachable at the top rung, never below it; merge identity needs ADR-0002. **Ruling:** **Adopt** (owner 10-31: earn it, don't ban it).
 - **2026-10-28**: Coord marks a PR ready on a clean review, not on green CI; auto-merge waits for CI.
 - **2026-10-28**: Rebase a PR onto main only, never onto a branch still under review; a stack the owner set up is retargeted after its base merges.
