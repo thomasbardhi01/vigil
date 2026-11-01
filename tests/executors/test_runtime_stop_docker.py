@@ -7,7 +7,7 @@ import time
 import pytest
 
 from vigild.config import Config
-from vigild.executors.runtime import LABEL, DockerRuntime
+from vigild.executors.runtime import LABEL, DockerRuntime, instance_labels
 
 pytestmark = pytest.mark.docker
 
@@ -19,7 +19,7 @@ def test_stop_kills_the_sessions_container(cfg: Config) -> None:
         cfg.vigild.images.claude_executor,
         entrypoint=["sleep", "600"],
         detach=True,
-        labels={LABEL: sid},
+        labels={LABEL: sid, **instance_labels(cfg)},
     )
     try:
         assert rt.client.containers.list(filters={"label": f"{LABEL}={sid}"})
@@ -29,5 +29,22 @@ def test_stop_kills_the_sessions_container(cfg: Config) -> None:
                 break
             time.sleep(0.1)
         assert not rt.client.containers.list(filters={"label": f"{LABEL}={sid}"})
+    finally:
+        c.remove(force=True)
+
+
+def test_stop_spares_container_without_instance_label(cfg: Config) -> None:
+    rt = DockerRuntime(cfg)
+    sid = "s-stop-test-other"
+    c = rt.client.containers.run(
+        cfg.vigild.images.claude_executor,
+        entrypoint=["sleep", "600"],
+        detach=True,
+        labels={LABEL: sid},
+    )
+    try:
+        rt.stop(sid)
+        time.sleep(1)
+        assert rt.client.containers.list(filters={"label": f"{LABEL}={sid}"})
     finally:
         c.remove(force=True)
