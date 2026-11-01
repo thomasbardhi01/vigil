@@ -942,3 +942,45 @@ def test_rework_replace_after_a_crash_before_the_record_is_recorded_not_pushed_a
     assert ws.published_sha(REPO, BRANCH) == sent
     assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == sent
     assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
+
+
+def test_hold_lands_one_job_per_repo_and_the_earliest_approved_waiter_goes_next() -> None:
+    """p3-09 PR 3: a lander holds its repo; waiters go in approval order once it lets go;
+    another repo is never held up."""
+    import threading
+
+    q = _landing().LandingQueue()
+    order: list[str] = []
+    first = q.hold("o/a", "j0", approved_at="2026-11-01T09:00:00+00:00")
+    first.__enter__()
+
+    def lander(job: str, at: str, repo: str = "o/a") -> threading.Thread:
+        def run() -> None:
+            with q.hold(repo, job, approved_at=at):
+                order.append(job)
+
+        th = threading.Thread(target=run)
+        th.start()
+        return th
+
+    late = lander("j2", "2026-11-01T10:05:00+00:00")
+    early = lander("j1", "2026-11-01T10:00:00+00:00")
+    other = lander("k1", "2026-11-01T11:00:00+00:00", repo="o/b")
+    other.join(timeout=5)
+    assert order == ["k1"]  # o/b did not wait on o/a
+    for _ in range(100):  # both o/a waiters are queued before the holder lets go
+        if len(q._waiting.get("o/a", [])) == 2:
+            break
+        threading.Event().wait(0.01)
+    first.__exit__(None, None, None)
+    late.join(timeout=5)
+    early.join(timeout=5)
+    assert order == ["k1", "j1", "j2"]
+
+
+def test_hold_lets_go_when_the_landing_raises() -> None:
+    q = _landing().LandingQueue()
+    with pytest.raises(RuntimeError), q.hold("o/a", "j1", approved_at="2026-11-01T10:00:00+00:00"):
+        raise RuntimeError("the verifier failed")
+    with q.hold("o/a", "j2", approved_at="2026-11-01T10:05:00+00:00"):
+        pass  # not held forever by j1

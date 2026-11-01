@@ -377,3 +377,35 @@ def test_a_failed_status_post_records_it_and_the_job_still_reaches_ready(world: 
     assert w.store.get_job(job).state is S.READY
     failed = [e for e in w.store.events(job_id=job) if e.type == "status_failed"]
     assert failed and "statuses" in failed[0].data["error"]
+
+
+def test_landing_runs_inside_the_repo_s_landing_hold_with_the_approval_time(
+    world: World,
+) -> None:
+    """p3-09 PR 3: the runner lands a job's PRs holding its repo's landing slot, queued by
+    the time the job was approved."""
+    from contextlib import contextmanager
+
+    w = world
+    job = _held_in_review(w)
+    seen: list[tuple[str, str, str]] = []
+    land = w.runner._land_prs
+
+    @contextmanager
+    def hold(repo: str, task: str, *, approved_at: str) -> Any:
+        seen.append((repo, task, approved_at))
+        yield
+
+    def landing(job_id: str) -> str:
+        assert seen and seen[-1][1] == job_id  # inside the hold
+        return land(job_id)
+
+    w.runner.landing_queue.hold = hold  # type: ignore[method-assign]
+    w.runner._land_prs = landing  # type: ignore[method-assign]
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.READY
+    approved = [
+        e.ts for e in w.store.events(job_id=job)
+        if e.type == "state" and e.data.get("to") == "approved"
+    ]  # fmt: skip
+    assert seen == [(REPO, job, approved[-1])]

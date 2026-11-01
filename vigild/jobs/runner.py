@@ -83,7 +83,7 @@ from vigild.gateway.service import (
     Gateway,
     worst_case_usd,
 )
-from vigild.github.landing import LandResult, merge_allowed
+from vigild.github.landing import LandingQueue, LandResult, merge_allowed
 from vigild.github.publish import (
     BranchMoved,
     LegacyBranch,
@@ -359,6 +359,7 @@ class JobRunner:
             self.gateway.stop_session = stop
         self.workspace = workspace
         self.publisher = publisher
+        self.landing_queue = LandingQueue()  # one lander per repo (p3-09 PR 3)
         self.bench_publisher = BenchPublisher(workspace)  # a bench job never gets `publisher`
         self.telemetry = telemetry
         self.dev_images = dev_images
@@ -4760,7 +4761,10 @@ class JobRunner:
                 resumable=not legacy,
             )
             return "done"
-        landed = self._land_prs(job_id)  # p3-09: rebase, re-verify, bind, before the card
+        # p3-09: rebase, re-verify, bind, before the card; one lander per repo, first
+        # approved first (PR 3)
+        with self.landing_queue.hold(job.repo, job_id, approved_at=self._approved_at(job_id)):
+            landed = self._land_prs(job_id)
         if landed != "landed":
             return "dispatch" if landed == "rework" else "done"
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
@@ -4867,6 +4871,16 @@ class JobRunner:
              "dependency by hand, or re-plan the job that needs it"},
         )  # fmt: skip
         return False
+
+    def _approved_at(self, job_id: str) -> str:
+        """When the job was last approved (its last move to approved), else when it was
+        made: the landing queue's order."""
+        rows = self.store.q(
+            "SELECT ts FROM events WHERE job_id=? AND type='state'"
+            " AND json_extract(data, '$.to')='approved' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        )
+        return str(rows[0]["ts"]) if rows else self.store.get_job(job_id).created_at
 
     def _land_prs(self, job_id: str) -> str:
         """p3-09: land every live task's PR before the ready card (#172, #221). Each is

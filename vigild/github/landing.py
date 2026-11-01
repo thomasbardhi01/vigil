@@ -21,7 +21,8 @@ from __future__ import annotations
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -70,8 +71,25 @@ class LandingQueue:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._turn = threading.Condition(self._lock)
         self._waiting: dict[str, list[tuple[datetime, str]]] = {}
         self._landing: dict[str, str] = {}
+
+    @contextmanager
+    def hold(self, repo: str, task: str, *, approved_at: str) -> Iterator[None]:
+        """Land `task` holding `repo`'s one landing slot (p3-09 PR 3): wait while another
+        lander holds it; among the waiters, the earliest approved goes next. The slot is let
+        go however the landing ends."""
+        self.add(repo, task, approved_at=approved_at)
+        with self._turn:
+            while repo in self._landing or self._waiting[repo][0][1] != task:
+                self._turn.wait()
+            self._waiting[repo].pop(0)
+            self._landing[repo] = task
+        try:
+            yield
+        finally:
+            self.done(repo, task)
 
     def add(self, repo: str, task: str, *, approved_at: str) -> None:
         with self._lock:
@@ -93,6 +111,7 @@ class LandingQueue:
         with self._lock:
             if self._landing.get(repo) == task:
                 del self._landing[repo]
+            self._turn.notify_all()
 
 
 # --- the vault side -------------------------------------------------------------------
