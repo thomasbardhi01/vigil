@@ -447,3 +447,375 @@ def test_an_earlier_commit_message_with_a_secret_is_never_published(
     sent = ws.public_commit(REPO, head, base, BRANCH)
     history = git(ws.vault(REPO), "log", "--format=%B", f"{base}..{sent}")
     assert "A1b2C3d4E5f6" not in history
+
+
+# --- p3-09: landing queue and rebase-on-land (#172, closes #221) -----------------------
+#
+# Failing tests first (owner, 2026-11-01): they pin `vigild.github.landing`, which does not
+# exist yet. vigild lands a verified PR itself: in the vault it rebases the `vigil/*` branch
+# on the remote's current main, runs the verifier on the rebased head, records the commit
+# it then sends as `verified_sha`, and pushes it with a lease. A merge is accepted only
+# when the PR head is that SHA. A conflict in a generated file is regenerated and retried
+# once; any other conflict, or a red verdict, is REWORK (a fresh worker), never resolved
+# by a model. The design is in docs/plans/p3-09-landing.md.
+
+GEN = "docs/feature-map.md"
+
+
+def _landing() -> Any:
+    import importlib
+
+    return importlib.import_module("vigild.github.landing")
+
+
+def _main_commit(seed: Path, bare: Path, path: str, text: str, msg: str) -> str:
+    """Someone else's PR lands on main: commit on the seed clone, push to the remote."""
+    git(seed, "pull", "-q", "--ff-only", "origin", "main")
+    (seed / path).write_text(text)
+    git(seed, "add", path)
+    git(seed, "commit", "-q", "-m", msg)
+    git(seed, "push", "-q", "origin", "main")
+    return git(seed, "rev-parse", "HEAD")
+
+
+@dataclass
+class Verifier:
+    """Stands in for `vigild/verifier.py`: records every SHA it ran on and answers green
+    unless told otherwise."""
+
+    green: bool = True
+    ran: list[str] = field(default_factory=list)
+
+    def __call__(self, sha: str) -> bool:
+        self.ran.append(sha)
+        return self.green
+
+
+@dataclass
+class Regen:
+    """Stands in for the generator (`scripts/gen-docs-tables.py`): rewrites the generated
+    files in the checkout it is handed, and counts its runs."""
+
+    text: str = "# Feature map\nrate limit\nmain's row\n"
+    runs: int = 0
+
+    def __call__(self, checkout: Path, paths: list[str]) -> None:
+        self.runs += 1
+        for p in paths:
+            (checkout / p).write_text(self.text)
+
+
+@dataclass
+class EditablePulls(FakePulls):
+    """A PR that already exists: `update_pull` rewrites its title and body (#221)."""
+
+    updates: list[dict[str, Any]] = field(default_factory=list)
+
+    def update_pull(self, repo: str, url: str, *, title: str, body: str) -> None:
+        self.updates.append({"url": url, "title": title, "body": body})
+
+
+def _land(
+    ws: Workspace, base: str, head: str, pulls: FakePulls, verify: Verifier,
+    *, generated: list[str] | None = None, regen: Regen | None = None,
+    existing: str | None = None, body: str = "b",
+) -> Any:  # fmt: skip
+    return _landing().land(
+        ws, repo=REPO, task_id=TID, branch=BRANCH, head=head, base_sha=base, base="main",
+        scope=["docs/feature-map.md"], generated=generated or [], verify=verify,
+        regenerate=regen or Regen(), pulls=pulls, title="t", body=body, existing=existing,
+        token=None,
+    )  # fmt: skip
+
+
+def test_rebase_reverify_lands_the_rebased_head_and_records_its_sha(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """Main moved (an unrelated file): the branch is rebased on it in the vault, the
+    verifier runs on the rebased head, not the worker's, and the commit pushed is the one
+    recorded as `verified_sha`, a descendant of the new main."""
+    ws, base, head, bare = setup
+    new_main = _main_commit(fixture_repo["seed"], bare, "docs/runbook.md", "# Runbook\nv2\n", "x")
+    verify = Verifier()
+    res = _land(ws, base, head, FakePulls(bare), verify)
+    assert res.outcome == "landed"
+    assert verify.ran == [res.vault_head] and res.vault_head != head
+    assert ws.is_ancestor(REPO, new_main, res.vault_head)
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == res.verified_sha
+    assert ws.published_sha(REPO, BRANCH) == res.verified_sha
+    assert ws.is_ancestor(REPO, new_main, res.verified_sha)
+
+
+def test_rebase_reverify_red_on_the_rebased_sha_is_rework_and_nothing_is_pushed(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, "docs/runbook.md", "# Runbook\nv2\n", "x")
+    res = _land(ws, base, head, FakePulls(bare), Verifier(green=False))
+    assert res.outcome == "rework" and res.verified_sha is None
+    assert "verifier" in res.reason
+    assert ws.published_sha(REPO, BRANCH) is None  # nothing sent
+
+
+def test_rebase_reverify_a_logic_conflict_is_rework_with_its_files_and_no_resolution(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """Main changed the same lines of a file the task leases that is not generated: no
+    model resolves it; REWORK names the files, and the verifier never runs."""
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, GEN, "# Feature map\nsomething else\n", "x")
+    verify = Verifier()
+    res = _land(ws, base, head, FakePulls(bare), verify)
+    assert res.outcome == "rework"
+    assert res.conflicts == [GEN] and verify.ran == []
+    assert ws.published_sha(REPO, BRANCH) is None
+
+
+def test_rebase_reverify_a_generated_only_conflict_is_regenerated_and_retried_once(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """The only conflict is in a generated file: vigild takes main's side, reruns the
+    generator once, verifies the result and lands it."""
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, GEN, "# Feature map\nmain's row\n", "x")
+    regen, verify = Regen(), Verifier()
+    res = _land(ws, base, head, FakePulls(bare), verify, generated=[GEN], regen=regen)
+    assert res.outcome == "landed" and regen.runs == 1
+    assert verify.ran == [res.vault_head]
+    assert ws.read_blob(REPO, res.verified_sha, GEN) == regen.text
+
+
+def test_rebase_reverify_a_generated_conflict_that_recurs_is_rework_after_one_retry(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:  # fmt: skip
+    """Main moves again while the regenerated head is being built: one retry only."""
+    ws, base, head, bare = setup
+    seed = fixture_repo["seed"]
+    _main_commit(seed, bare, GEN, "# Feature map\nmain's row\n", "x")
+
+    class Racing(Regen):
+        def __call__(self, checkout: Path, paths: list[str]) -> None:
+            super().__call__(checkout, paths)
+            _main_commit(seed, bare, GEN, f"# Feature map\nrace {self.runs}\n", "race")
+
+    regen = Racing()
+    res = _land(ws, base, head, FakePulls(bare), Verifier(), generated=[GEN], regen=regen)
+    assert res.outcome == "rework" and regen.runs <= 2
+    assert ws.published_sha(REPO, BRANCH) is None
+
+
+def test_rebase_reverify_republish_rebuilds_the_pr_title_and_body_from_the_current_head(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """#221: landing an open PR rewrites its body from the head it lands (redacted), so it
+    never describes an earlier attempt; the body names the verified SHA."""
+    ws, base, head, bare = setup
+    pulls = EditablePulls(bare)
+    url = _pub(ws, base, head, pulls)
+    _main_commit(fixture_repo["seed"], bare, "docs/runbook.md", "# Runbook\nv2\n", "x")
+    res = _land(ws, base, head, pulls, Verifier(), existing=url, body="attempt 2 body")
+    assert res.outcome == "landed"
+    (upd,) = pulls.updates
+    assert upd["url"] == url and "attempt 2 body" in upd["body"]
+    assert res.verified_sha[:12] in upd["body"]
+
+
+def test_sha_binding_a_merge_is_accepted_only_when_the_pr_head_is_the_verified_sha() -> None:
+    m = _landing()
+    sha = "a" * 40
+    assert m.merge_allowed(pr_head=sha, verified_sha=sha) is True
+    assert m.merge_allowed(pr_head="b" * 40, verified_sha=sha) is False
+    assert m.merge_allowed(pr_head=sha, verified_sha=None) is False  # never verified
+
+
+def test_sha_binding_a_push_to_the_branch_after_landing_unbinds_the_verdict(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """Someone pushes to the `vigil/*` branch after vigild landed it: the PR head is no
+    longer the verified SHA, so the merge is refused (and BranchMoved still guards the
+    next push)."""
+    ws, base, head, bare = setup
+    res = _land(ws, base, head, FakePulls(bare), Verifier())
+    pushed = _other_commit(bare, res.verified_sha, "a hand push")
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", pushed)
+    m = _landing()
+    tip = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert m.merge_allowed(pr_head=tip, verified_sha=res.verified_sha) is False
+
+
+def test_stale_a_landed_pr_whose_leased_paths_changed_on_main_must_be_reverified(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """The staleness sweep: before a card says "ready", a PR verified on a main that has
+    since changed a path its task leases is stale (re-rebase and re-verify); a change to
+    other paths is not."""
+    ws, base, head, bare = setup
+    seed = fixture_repo["seed"]
+    res = _land(ws, base, head, FakePulls(bare), Verifier())
+    m = _landing()
+    scope = ["docs/feature-map.md"]
+    _main_commit(seed, bare, "docs/runbook.md", "# Runbook\nv3\n", "unrelated")
+    assert m.is_stale(ws, repo=REPO, verified_on=res.main_sha, scope=scope, token=None) is False
+    _main_commit(seed, bare, GEN, "# Feature map\nanother row\n", "leased path")
+    assert m.is_stale(ws, repo=REPO, verified_on=res.main_sha, scope=scope, token=None) is True
+
+
+def test_stale_the_sweep_relands_a_stale_pr_before_it_is_ready(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    ws, base, head, bare = setup
+    first = _land(ws, base, head, FakePulls(bare), Verifier())
+    _main_commit(fixture_repo["seed"], bare, "docs/runbook.md", "# Runbook\nv9\n", "main moved")
+    verify = Verifier()
+    again = _land(ws, base, head, FakePulls(bare), verify)
+    assert again.outcome == "landed" and again.verified_sha != first.verified_sha
+    assert verify.ran == [again.vault_head]
+
+
+def test_the_landing_queue_is_one_lander_per_repo_first_approved_first() -> None:
+    """One landing mutex per repo, FIFO by approval time; repos do not wait on each other."""
+    q = _landing().LandingQueue()
+    q.add("o/a", "t2", approved_at="2026-11-01T10:05:00+00:00")
+    q.add("o/a", "t1", approved_at="2026-11-01T10:00:00+00:00")
+    q.add("o/b", "u1", approved_at="2026-11-01T10:10:00+00:00")
+    assert q.take("o/a") == "t1"
+    assert q.take("o/a") is None  # t1 is landing: the repo's one lander is busy
+    assert q.take("o/b") == "u1"  # another repo is not held up
+    q.done("o/a", "t1")
+    assert q.take("o/a") == "t2"
+
+
+def test_every_git_call_in_landing_goes_through_gitsafe(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """p3-09 (owner, 2026-11-01): landing runs git only through `vigild.gitsafe`: every git
+    process it starts carries gitsafe's hardening (no hooks, no system or global config, no
+    external diff), and the module never imports `subprocess` itself."""
+    import ast
+    import inspect
+    import subprocess as sp
+
+    from vigild import gitsafe
+
+    m = _landing()
+    tree = ast.parse(inspect.getsource(m))
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import | ast.ImportFrom)
+                for a in n.names} | {n.module for n in ast.walk(tree)
+                if isinstance(n, ast.ImportFrom) and n.module}  # fmt: skip
+    assert not imported & {"subprocess", "os"}, imported
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, GEN, "# Feature map\nmain's row\n", "x")
+    real = sp.run
+    seen: list[list[str]] = []
+
+    def spy(argv: Any, *a: Any, **kw: Any) -> Any:
+        cwd = Path(str(kw.get("cwd", "")))
+        # vigild's own git, in its data dir (the fake GitHub's helper git is not landing's)
+        if isinstance(argv, list) and argv and argv[0] == "git" and ws.data_dir in cwd.parents:
+            seen.append(argv)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(sp, "run", spy)
+    res = _land(ws, base, head, FakePulls(bare), Verifier(), generated=[GEN], regen=Regen())
+    assert res.outcome == "landed"
+    assert seen, "landing ran no git at all"
+    hardening = list(gitsafe.HARDENING)
+    for argv in seen:
+        assert argv[1 : 1 + len(hardening)] == hardening, argv[:6]
+
+
+# --- the review of the landing library (2026-11-01) ----------------------------------
+
+
+def test_rebase_reverify_a_non_ascii_generated_conflict_is_regenerated(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """merge-tree names are read NUL-separated, so a non-ASCII path still matches the
+    generated list instead of coming back C-quoted."""
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    gen = "docs/fé.md"
+    seed, bare = fixture_repo["seed"], fixture_repo["bare"]
+    _main_commit(seed, bare, gen, "base\n", "a generated file")
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    (clone / gen).write_text("worker\n")
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    _main_commit(seed, bare, gen, "main\n", "main changed it")
+    regen = Regen()
+    res = _landing().land(
+        ws, repo=REPO, task_id=TID, branch=BRANCH, head=head, base_sha=base, base="main",
+        scope=[gen], generated=[gen], verify=Verifier(), regenerate=regen,
+        pulls=FakePulls(bare), title="t", body="b", existing=None, token=None,
+    )  # fmt: skip
+    assert res.outcome == "landed" and regen.runs == 1
+
+
+def test_rebase_reverify_a_change_already_on_main_is_not_sent(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, GEN, "# Feature map\nrate limit\n", "same change")
+    verify = Verifier()
+    res = _land(ws, base, head, FakePulls(bare), verify)
+    assert res.outcome == "rework" and "already on main" in res.reason
+    assert verify.ran == [] and ws.published_sha(REPO, BRANCH) is None
+
+
+def test_rebase_reverify_never_regenerates_over_a_workers_symlink(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    """A symlink the worker committed must never lead the generator off the checkout."""
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
+    base = ws.base_sha(TID)
+    (clone / "docs" / "feature-map.md").write_text("# Feature map\nrate limit\n")
+    (clone / "docs" / "home").symlink_to("/Users")
+    r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
+    head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
+    _main_commit(fixture_repo["seed"], fixture_repo["bare"], GEN, "# Feature map\nmain\n", "x")
+    regen = Regen()
+    with pytest.raises(PublishError, match="symlink"):
+        _landing().land(
+            ws, repo=REPO, task_id=TID, branch=BRANCH, head=head, base_sha=base, base="main",
+            scope=["docs/**"], generated=[GEN], verify=Verifier(), regenerate=regen,
+            pulls=FakePulls(fixture_repo["bare"]), title="t", body="b", existing=None,
+            token=None,
+        )  # fmt: skip
+    assert regen.runs == 0
+
+
+def test_sha_binding_landing_again_after_a_hand_push_is_branch_moved(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    """A hand push to the `vigil/*` branch after landing: the next landing refuses
+    (BranchMoved) and overwrites nothing."""
+    ws, base, head, bare = setup
+    first = _land(ws, base, head, FakePulls(bare), Verifier())
+    pushed = _other_commit(bare, first.verified_sha, "a hand push")
+    git(bare, "update-ref", f"refs/heads/{BRANCH}", pushed)
+    _main_commit(fixture_repo["seed"], bare, "docs/runbook.md", "# Runbook\nv4\n", "x")
+    with pytest.raises(PublishError) as raised:
+        _land(ws, base, head, FakePulls(bare), Verifier())
+    assert type(raised.value).__name__ == "BranchMoved"
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == pushed
+
+
+def test_stale_a_change_to_a_generated_file_counts(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path]
+) -> None:
+    ws, base, head, bare = setup
+    res = _land(ws, base, head, FakePulls(bare), Verifier())
+    _main_commit(fixture_repo["seed"], bare, "docs/table.md", "rows\n", "a generated table")
+    m = _landing()
+    kw = {"repo": REPO, "verified_on": res.main_sha, "scope": [GEN], "token": None}
+    assert m.is_stale(ws, **kw) is False
+    assert m.is_stale(ws, generated=["docs/table.md"], **kw) is True
+
+
+def test_the_landing_queue_orders_approval_times_as_instants() -> None:
+    q = _landing().LandingQueue()
+    q.add("o/a", "later", approved_at="2026-11-01T10:30:00+00:00")
+    q.add("o/a", "earlier", approved_at="2026-11-01T06:00:00-04:00")  # 10:00 UTC
+    assert q.take("o/a") == "earlier"
