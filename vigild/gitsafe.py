@@ -18,6 +18,7 @@ import base64
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 HARDENING = (
     "-c", "core.hooksPath=/dev/null",
@@ -64,18 +65,11 @@ def git_env(token: str | None = None) -> dict[str, str]:
     return env
 
 
-def git(
-    cwd: Path,
-    *args: str,
-    token: str | None = None,
-    timeout: int = 600,
-    raw: bool = False,
-    stdin: str | None = None,
-    env: dict[str, str] | None = None,
-    ok: tuple[int, ...] = (0,),
-) -> str:
-    """`ok`: the exit codes that are not a failure (`merge-tree` exits 1 on a conflict)."""
-    out = subprocess.run(
+def _run(
+    cwd: Path, args: tuple[str, ...], token: str | None, timeout: int, raw: bool,
+    stdin: str | None, env: dict[str, str] | None,
+) -> subprocess.CompletedProcess[Any]:  # fmt: skip
+    return subprocess.run(
         ["git", *HARDENING, *args],
         cwd=cwd,
         env={**git_env(token), **(env or {})},
@@ -85,11 +79,42 @@ def git(
         check=False,
         input=stdin,
     )
-    if out.returncode not in ok:
-        err = out.stderr if isinstance(out.stderr, str) else out.stderr.decode(errors="replace")
-        raise GitError(f"git {args[0]} failed: {err.strip()[:300]}")
+
+
+def _fail(args: tuple[str, ...], out: subprocess.CompletedProcess[Any]) -> GitError:
+    err = out.stderr if isinstance(out.stderr, str) else out.stderr.decode(errors="replace")
+    return GitError(f"git {args[0]} failed: {err.strip()[:300]}")
+
+
+def _text(out: subprocess.CompletedProcess[Any], raw: bool) -> str:
     stdout = out.stdout if isinstance(out.stdout, str) else out.stdout.decode(errors="replace")
     return stdout.strip() if not raw else stdout
+
+
+def git(
+    cwd: Path,
+    *args: str,
+    token: str | None = None,
+    timeout: int = 600,
+    raw: bool = False,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    out = _run(cwd, args, token, timeout, raw, stdin, env)
+    if out.returncode != 0:
+        raise _fail(args, out)
+    return _text(out, raw)
+
+
+def git_rc(
+    cwd: Path, *args: str, ok: tuple[int, ...], raw: bool = False, timeout: int = 600
+) -> tuple[int, str]:
+    """The exit code and output, for a command whose non-zero exits in `ok` carry meaning
+    (`merge-tree` exits 1 on a conflict). Any other exit raises, as `git` does."""
+    out = _run(cwd, args, None, timeout, raw, None, None)
+    if out.returncode not in ok:
+        raise _fail(args, out)
+    return out.returncode, _text(out, raw)
 
 
 def git_bytes(cwd: Path, *args: str, timeout: int = 600) -> bytes:

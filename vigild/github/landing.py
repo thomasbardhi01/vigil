@@ -23,14 +23,15 @@ import tempfile
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
 from vigild.github.publish import BRANCH, PROTECTED, BranchMoved, PublishError, out_of_scope
-from vigild.gitsafe import GitError, git
+from vigild.gitsafe import GitError, git, git_rc
 from vigild.intake.paths import in_scope
 from vigild.redact import redact
-from vigild.workspace import VIGIL_DIR, Workspace, WorkspaceError
+from vigild.workspace import SHA, VIGIL_DIR, Workspace, WorkspaceError
 
 Verify = Callable[[str], bool]  # the verifier on a vault SHA: green or not
 Regenerate = Callable[[Path, list[str]], None]  # the repo's generator, run on a checkout
@@ -66,14 +67,14 @@ class LandingQueue:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._waiting: dict[str, list[tuple[str, str]]] = {}
+        self._waiting: dict[str, list[tuple[datetime, str]]] = {}
         self._landing: dict[str, str] = {}
 
     def add(self, repo: str, task: str, *, approved_at: str) -> None:
         with self._lock:
             q = self._waiting.setdefault(repo, [])
             if task not in (t for _, t in q) and self._landing.get(repo) != task:
-                q.append((approved_at, task))
+                q.append((datetime.fromisoformat(approved_at), task))
                 q.sort()
 
     def take(self, repo: str) -> str | None:
@@ -111,20 +112,19 @@ def _main(ws: Workspace, repo: str) -> str:
 def _merge(ws: Workspace, repo: str, base_sha: str, main: str, head: str) -> tuple[str, list[str]]:
     """The task's change (base..head) applied onto `main`: the merged tree, and the paths
     that conflicted (the tree then carries conflict markers in them)."""
-    # exit 0: clean; exit 1: conflicts, listed after the tree; anything else raises
-    out = git(
-        ws.vault(repo),
-        "merge-tree",
-        "--write-tree",
-        "--name-only",
-        "--no-messages",
-        f"--merge-base={base_sha}",
-        main,
-        head,
-        ok=(0, 1),
-    )
-    lines = [ln for ln in out.splitlines() if ln]
-    return lines[0], sorted(set(lines[1:]))
+    # exit 0: clean; exit 1: conflicts, listed after the tree, NUL-separated (names are
+    # never quoted); anything else raises
+    rc, out = git_rc(
+        ws.vault(repo), "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z",
+        f"--merge-base={base_sha}", main, head, ok=(0, 1), raw=True,
+    )  # fmt: skip
+    fields = [f for f in out.split("\0") if f]
+    if not fields or not SHA.match(fields[0].strip()):
+        raise WorkspaceError("merge-tree gave no tree")
+    tree, conflicts = fields[0].strip(), sorted(set(fields[1:]))
+    if (rc == 1) != bool(conflicts):
+        raise WorkspaceError(f"merge-tree exit {rc} disagrees with its conflict list")
+    return tree, conflicts
 
 
 def _with_main_side(ws: Workspace, repo: str, tree: str, main: str, paths: list[str]) -> str:
@@ -132,24 +132,34 @@ def _with_main_side(ws: Workspace, repo: str, tree: str, main: str, paths: list[
     return _edit_tree(ws, repo, tree, {p: _blob(ws, repo, main, p) for p in paths})
 
 
-def _blob(ws: Workspace, repo: str, sha: str, path: str) -> str | None:
-    try:
-        return ws._git(ws.vault(repo), "rev-parse", "--verify", "--quiet", f"{sha}:{path}")
-    except WorkspaceError:
+def _blob(ws: Workspace, repo: str, sha: str, path: str) -> tuple[str, str] | None:
+    """(mode, blob) of a regular file at `path` in `sha`, or None if there is none; a
+    directory, symlink or submodule there is refused, never written as a file."""
+    out = ws._git(ws.vault(repo), "ls-tree", "-z", sha, "--", path)
+    entry = out.split("\0")[0]
+    if not entry:
         return None
+    meta, _, _ = entry.partition("\t")
+    mode, kind, oid = meta.split(" ")
+    if kind != "blob" or mode not in ("100644", "100755"):
+        raise WorkspaceError(f"generated path {path!r} is not a regular file on main ({mode})")
+    return mode, oid
 
 
-def _edit_tree(ws: Workspace, repo: str, tree: str, blobs: dict[str, str | None]) -> str:
-    """`tree` with each path set to a blob (None removes it), through a scratch index."""
+def _edit_tree(
+    ws: Workspace, repo: str, tree: str, blobs: dict[str, tuple[str, str] | None]
+) -> str:
+    """`tree` with each path set to (mode, blob) (None removes it), through a scratch index."""
     vault = ws.vault(repo)
     with tempfile.TemporaryDirectory() as tmp:
         env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
         git(vault, "read-tree", tree, env=env)
-        for path, blob in blobs.items():
-            if blob is None:
+        for path, entry in blobs.items():
+            if entry is None:
                 git(vault, "update-index", "--force-remove", "--", path, env=env)
             else:
-                git(vault, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
+                mode, oid = entry
+                git(vault, "update-index", "--add", "--cacheinfo", f"{mode},{oid},{path}", env=env)
         return git(vault, "write-tree", env=env)
 
 
@@ -158,6 +168,13 @@ def _regenerate(
 ) -> str:
     """Run the repo's generator on a checkout of `tree` and write the generated files back."""
     vault = ws.vault(repo)
+    links = [
+        e.partition("\t")[2]
+        for e in git(vault, "ls-tree", "-r", "-z", tree).split("\0")
+        if e.startswith(("120000 ", "160000 "))
+    ]
+    if links:  # a worker's symlink must never lead the generator off the checkout
+        raise WorkspaceError(f"refusing to regenerate over symlinks or submodules: {links[:5]}")
     with tempfile.TemporaryDirectory() as tmp:
         checkout = Path(tmp) / "tree"
         checkout.mkdir()
@@ -165,11 +182,13 @@ def _regenerate(
         git(vault, "read-tree", tree, env=env)
         git(vault, "checkout-index", "--all", "--force", env=env)
         regenerate(checkout, list(paths))
-        blobs = {}
+        blobs: dict[str, tuple[str, str] | None] = {}
         for p in paths:
             f = checkout / p
+            if f.is_symlink() or (f.exists() and not f.is_file()):
+                raise WorkspaceError(f"the generator left {p!r} as something other than a file")
             blobs[p] = (
-                git(vault, "hash-object", "-w", "--no-filters", "--", str(f))
+                ("100644", git(vault, "hash-object", "-w", "--no-filters", "--", str(f)))
                 if f.is_file()
                 else None
             )
@@ -262,6 +281,11 @@ def land(
                     continue  # main moved while regenerating: the one retry
             rebased = _commit(ws, repo, tree, main, head)
             sent_paths = [p for _, p in ws.changed(repo, main, rebased)]
+            if not [p for p in sent_paths if p.lower().split("/")[0] != VIGIL_DIR]:
+                return LandResult(
+                    "rework", main_sha=main, vault_head=rebased,
+                    reason="the change is already on main: landing it changes nothing",
+                )  # fmt: skip
             outside = out_of_scope(
                 [p for p in sent_paths if p.lower().split("/")[0] != VIGIL_DIR],
                 [*scope, *generated],
@@ -288,7 +312,16 @@ def land(
                     f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
                     "last sent, and nothing is overwritten"
                 )
-            ws.push(repo, send, branch, token, tip)
+            try:
+                ws.push(repo, send, branch, token, tip)
+            except WorkspaceError as e:
+                if "stale info" in str(e):  # the branch moved after vigild read it
+                    seen = tip[:12] if tip else "no branch"
+                    raise BranchMoved(
+                        f"{branch} moved on the remote after vigild read it ({seen}): "
+                        "nothing is overwritten"
+                    ) from e
+                raise
             ws.record_published(repo, branch, send)
             text = redact(_body(body, send, main))
             if existing:
@@ -307,13 +340,21 @@ def land(
 
 
 def is_stale(
-    ws: Workspace, *, repo: str, verified_on: str | None, scope: Sequence[str], token: str | None
+    ws: Workspace,
+    *,
+    repo: str,
+    verified_on: str | None,
+    scope: Sequence[str],
+    token: str | None,
+    generated: Sequence[str] = (),
 ) -> bool:
     """A landed PR is stale when main changed a path its task leases (today its scope
-    globs; p3-05's leases later) since the main it was verified on."""
+    globs; p3-05's leases later), or a generated file it regenerated, since the main it
+    was verified on."""
     if not verified_on:
         return True
     main = _main(ws, repo)
     if main == verified_on:
         return False
-    return any(in_scope(p, list(scope)) for _, p in ws.changed(repo, verified_on, main))
+    paths = [*scope, *generated]
+    return any(in_scope(p, paths) for _, p in ws.changed(repo, verified_on, main))
