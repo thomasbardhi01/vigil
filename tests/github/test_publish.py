@@ -984,3 +984,43 @@ def test_hold_lets_go_when_the_landing_raises() -> None:
         raise RuntimeError("the verifier failed")
     with q.hold("o/a", "j2", approved_at="2026-11-01T10:05:00+00:00"):
         pass  # not held forever by j1
+
+
+def test_hold_refuses_a_job_that_already_holds_its_repo() -> None:
+    """Round 1: re-entering the slot a job holds would wait forever; it raises instead."""
+    q = _landing().LandingQueue()
+    at = "2026-11-01T10:00:00+00:00"
+    with (
+        q.hold("o/a", "j1", approved_at=at),
+        pytest.raises(RuntimeError, match="already holds"),
+        q.hold("o/a", "j1", approved_at=at),
+    ):
+        pass
+
+
+def test_hold_by_the_same_job_from_two_threads_lands_both_in_turn() -> None:
+    """Round 1: the second caller for the same job waits for the first and then goes;
+    neither raises on an empty queue."""
+    import threading
+
+    q = _landing().LandingQueue()
+    done: list[str] = []
+    gate = threading.Event()
+
+    def land(tag: str) -> None:
+        with q.hold("o/a", "j1", approved_at="2026-11-01T10:00:00+00:00"):
+            gate.wait(timeout=5)
+            done.append(tag)
+
+    a = threading.Thread(target=land, args=("a",))
+    a.start()
+    for _ in range(100):
+        if q._landing.get("o/a") == "j1":
+            break
+        threading.Event().wait(0.01)
+    b = threading.Thread(target=land, args=("b",))
+    b.start()
+    gate.set()
+    a.join(timeout=5)
+    b.join(timeout=5)
+    assert sorted(done) == ["a", "b"]

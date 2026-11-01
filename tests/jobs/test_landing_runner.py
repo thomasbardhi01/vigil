@@ -487,3 +487,23 @@ def test_a_stale_ready_job_that_conflicts_goes_back_for_rework(world: World) -> 
     # with one ready card, naming the new verified_sha
     cards = _ready_cards(w, job)
     assert len(cards) == 1 and _verified_sha(w, tid) in json.dumps(cards[0].body)
+
+
+def test_a_second_poll_after_a_clean_re_landing_does_not_land_again(
+    world: World, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Round 1: once re-landed, `verified_main` is the new main, so the real staleness check
+    on the next poll finds nothing: one `relanded` event, one ready card."""
+    import vigild.jobs.runner as runner_mod
+
+    w = world
+    job = _to_ready(w)
+    real = runner_mod.is_stale
+    _main_edit(w, "docs/unrelated.md", "someone else's file\n")
+    monkeypatch.setattr(runner_mod, "is_stale", lambda *a, **k: True)
+    w.runner.poll_prs()
+    assert len([e for e in w.store.events(job_id=job) if e.type == "relanded"]) == 1
+    monkeypatch.setattr(runner_mod, "is_stale", real)
+    w.runner.poll_prs()
+    assert len([e for e in w.store.events(job_id=job) if e.type == "relanded"]) == 1
+    assert len(_ready_cards(w, job)) == 1

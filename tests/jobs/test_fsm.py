@@ -455,8 +455,9 @@ def test_a_stale_ready_job_goes_back_for_rework_by_vigild_alone(store: Store) ->
     ready is unchanged."""
     jid = _job(store, S.READY)
     tid = _worker(store, jid, pr=True, report=True)
-    with pytest.raises(TransitionError, match="only vigild"):
-        transition(store, jid, S.BUILDING, Actor.COORD, evidence=_rework(tid))
+    for actor, channel in ((Actor.OWNER, "inbox"), (Actor.COORD, None)):
+        with pytest.raises(TransitionError, match="only vigild"):
+            transition(store, jid, S.BUILDING, actor, channel=channel, evidence=_rework(tid))
     assert transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid)).state is (
         S.BUILDING
     )

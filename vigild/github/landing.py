@@ -74,18 +74,30 @@ class LandingQueue:
         self._turn = threading.Condition(self._lock)
         self._waiting: dict[str, list[tuple[datetime, str]]] = {}
         self._landing: dict[str, str] = {}
+        self._holder: dict[str, int] = {}  # the thread that holds each repo's slot
 
     @contextmanager
     def hold(self, repo: str, task: str, *, approved_at: str) -> Iterator[None]:
         """Land `task` holding `repo`'s one landing slot (p3-09 PR 3): wait while another
         lander holds it; among the waiters, the earliest approved goes next. The slot is let
         go however the landing ends."""
+        with self._turn:
+            if self._landing.get(repo) == task and self._holder.get(repo) == threading.get_ident():
+                raise RuntimeError(f"{task} already holds {repo}'s landing slot")
         self.add(repo, task, approved_at=approved_at)
         with self._turn:
-            while repo in self._landing or self._waiting[repo][0][1] != task:
+            while True:
+                q = self._waiting.get(repo) or []
+                if repo not in self._landing and q and q[0][1] == task:
+                    break
+                if repo not in self._landing and not any(t == task for _, t in q):
+                    # another caller for this job took its entry and has let go: queue again
+                    self._add(repo, task, approved_at)
+                    continue
                 self._turn.wait()
             self._waiting[repo].pop(0)
             self._landing[repo] = task
+            self._holder[repo] = threading.get_ident()
         try:
             yield
         finally:
@@ -93,10 +105,14 @@ class LandingQueue:
 
     def add(self, repo: str, task: str, *, approved_at: str) -> None:
         with self._lock:
-            q = self._waiting.setdefault(repo, [])
-            if task not in (t for _, t in q) and self._landing.get(repo) != task:
-                q.append((datetime.fromisoformat(approved_at), task))
-                q.sort()
+            self._add(repo, task, approved_at)
+
+    def _add(self, repo: str, task: str, approved_at: str) -> None:
+        """Called with the lock held."""
+        q = self._waiting.setdefault(repo, [])
+        if task not in (t for _, t in q) and self._landing.get(repo) != task:
+            q.append((datetime.fromisoformat(approved_at), task))
+            q.sort()
 
     def take(self, repo: str) -> str | None:
         with self._lock:
@@ -111,6 +127,7 @@ class LandingQueue:
         with self._lock:
             if self._landing.get(repo) == task:
                 del self._landing[repo]
+                self._holder.pop(repo, None)
             self._turn.notify_all()
 
 
