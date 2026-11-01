@@ -409,3 +409,81 @@ def test_landing_runs_inside_the_repo_s_landing_hold_with_the_approval_time(
         if e.type == "state" and e.data.get("to") == "approved"
     ]  # fmt: skip
     assert seen == [(REPO, job, approved[-1])]
+
+
+def _ready_cards(w: World, job: str) -> list[Any]:
+    return [i for i in w.store.list_inbox() if i.job_id == job and i.kind == "ready_to_merge"]
+
+
+def _questions(w: World, job: str) -> list[Any]:
+    return [i for i in w.store.list_inbox() if i.job_id == job and i.kind != "ready_to_merge"]
+
+
+def _to_ready(w: World) -> str:
+    job = _held_in_review(w)
+    w.runner.review(job)
+    assert w.store.get_job(job).state is S.READY
+    w.runner.pr_state = lambda repo, url: "open"  # type: ignore[method-assign,assignment]
+    return job
+
+
+def _verified_sha(w: World, tid: str) -> str:
+    return str(w.store.q("SELECT verified_sha FROM tasks WHERE id=?", (tid,))[0]["verified_sha"])
+
+
+def test_a_change_on_main_outside_the_leased_paths_leaves_a_ready_job_alone(
+    world: World,
+) -> None:
+    w = world
+    job = _to_ready(w)
+    tid = f"{job}-w1"
+    old = _verified_sha(w, tid)
+    _main_edit(w, "docs/unrelated.md", "someone else's file\n")
+    w.runner.poll_prs()
+    assert _verified_sha(w, tid) == old
+    assert not [e for e in w.store.events(job_id=job) if e.type == "relanded"]
+
+
+def test_a_stale_ready_job_is_landed_again_and_its_card_reissued_with_no_question(
+    world: World, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """p3-09 PR 3, the staleness sweep (owner, 2026-11-01, tier A): a ready job whose leased
+    paths changed on main since verified_main is landed again before its card stands; the
+    card is re-issued naming the new verified_sha; no question reaches the owner."""
+    import vigild.jobs.runner as runner_mod
+
+    w = world
+    job = _to_ready(w)
+    tid = f"{job}-w1"
+    old = _verified_sha(w, tid)
+    questions = [i.id for i in _questions(w, job)]
+    _main_edit(w, "docs/unrelated.md", "someone else's file\n")  # main moved; rebase is clean
+    monkeypatch.setattr(runner_mod, "is_stale", lambda *a, **k: True)
+    w.runner.poll_prs()
+    new = _verified_sha(w, tid)
+    assert new != old and w.store.get_job(job).state is S.READY
+    cards = _ready_cards(w, job)
+    assert len(cards) == 1 and new in json.dumps(cards[0].body)
+    assert [e for e in w.store.events(job_id=job) if e.type == "relanded"]
+    assert [i.id for i in _questions(w, job)] == questions
+
+
+def test_a_stale_ready_job_that_conflicts_goes_back_for_rework(world: World) -> None:
+    """The same sweep, when main rewrote a leased file the task changed: REWORK, as from
+    in_review (a card and a fresh worker); the stale ready card is resolved."""
+    w = world
+    job = _to_ready(w)
+    tid = f"{job}-w1"
+    (path, *_) = _changed(w, tid)
+    before = len(_workers(w, tid))
+    _main_edit(w, path, "someone else's whole new content\n")
+    w.runner.poll_prs()
+    moves = [e.data for e in w.store.events(job_id=job) if e.type == "state"]
+    rework = [m for m in moves if m["from"] == "ready" and m["to"] == "building"]
+    assert rework and rework[0]["evidence"]["action"] == "rework"
+    assert any(q.kind == "landing_rework" for q in _questions(w, job))
+    assert len(_workers(w, tid)) > before
+    # this world's fresh worker finishes at once: rebuilt, reviewed, landed, ready again,
+    # with one ready card, naming the new verified_sha
+    cards = _ready_cards(w, job)
+    assert len(cards) == 1 and _verified_sha(w, tid) in json.dumps(cards[0].body)

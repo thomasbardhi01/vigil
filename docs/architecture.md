@@ -259,6 +259,7 @@ stateDiagram-v2
   ready --> building: owner, inbox only (fix with findings; back through in_review)
   in_review --> ready: reviews clean, sampled audits clean, no PR head with .vigil/, every PR landed (p3-09)
   in_review --> building: landing REWORK (vigild only; a logic conflict or red on the rebased head; at most 2 per task)
+  ready --> building: re-landing REWORK of a stale ready job (vigild only; the same guards, p3-09 PR 3)
   ready --> merged: every PR merged (vigild's PR poll)
   merged --> verifying
   verifying --> done: clean verify record (phase 6)
@@ -294,6 +295,18 @@ stateDiagram-v2
   (`landing_rework_limit`). **The merge binding:** the PR poll records a task merged only if
   the PR's head is its `verified_sha`; otherwise it pages (`merge_unverified`) and records
   nothing. No model resolves a conflict on this path.
+  **One lander per repo (p3-09 PR 3):** a job lands holding its repo's slot
+  (`LandingQueue.hold`); waiters go in order of their last approval; other repos never wait.
+  Each landed commit gets the `vigil/verified` commit status (option B: the ruleset does not
+  require it yet; a refused post is a `status_failed` event and landing goes on).
+  **The staleness sweep (tier A, owner 2026-11-01):** the PR poll checks every ready job; one
+  whose leased paths changed on main since a task's `verified_main` (`is_stale`) is landed
+  again under the hold. A clean re-landing re-issues the ready card naming the new
+  `verified_sha` and records `relanded`, asking the owner nothing; a conflict or a red
+  verdict is a REWORK (`ready -> building`, the same guards and pages), whose card replaces
+  the ready one. The REWORK record (`rework.json`) is written in the same transaction as the
+  move to building, and a publish retried after a crash that finds its commit already on the
+  remote records it without pushing again.
 - **`in_review` invariant (phase 1 run, finding #4).** A job enters
   `in_review` only if every task in its **current plan** (the latest
   `plan.md`) has an open PR for that plan's work: the task exists, is

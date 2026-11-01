@@ -83,7 +83,7 @@ from vigild.gateway.service import (
     Gateway,
     worst_case_usd,
 )
-from vigild.github.landing import LandingQueue, LandResult, merge_allowed
+from vigild.github.landing import LandingQueue, LandResult, is_stale, merge_allowed
 from vigild.github.publish import (
     BranchMoved,
     LegacyBranch,
@@ -4224,6 +4224,8 @@ class JobRunner:
                 if gaps:
                     self._hold_without_pr(job.id, gaps, f"PR closed: {sorted(closed_tasks)}")
                 continue
+            if self.store.get_job(job.id).state is JobState.READY:
+                self._sweep_stale(self.store.get_job(job.id))
             live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
             if not live or any(t.state != "merged" for t in live):
                 continue
@@ -4246,6 +4248,55 @@ class JobRunner:
             merged_jobs.append(job.id)
             self._resume_dependents(job.id)
         return merged_jobs
+
+    def _sweep_stale(self, job: Job) -> None:
+        """p3-09 PR 3, the staleness sweep (owner, 2026-11-01, tier A): a ready job whose leased
+        paths changed on main since a task's `verified_main` is landed again before its card
+        stands. A clean re-landing re-issues the ready card naming the new `verified_sha` and
+        asks the owner nothing (a `relanded` event for the morning report); a conflict or a
+        red verdict is a REWORK, which pages as from in_review."""
+        if job.source == "bench":
+            return
+        stale = False
+        for t in self.store.list_tasks(job.id):
+            if t.state in DEAD_TASK or t.state in ("merged", "closed"):
+                continue
+            verified, main = self._verified(t.id)
+            if not verified:
+                continue  # landed before p3-09: nothing bound, nothing to re-land
+            scope = [*(t.contract["spec"].get("files_in_scope") or []),
+                     *artifact_paths(job.id, t.id)]  # fmt: skip
+            try:
+                if is_stale(self.workspace, repo=job.repo, verified_on=main, scope=scope,
+                            token=None):  # fmt: skip
+                    stale = True
+                    break
+            except Exception:
+                log.warning("staleness check of %s failed", t.id, exc_info=True)
+                return
+        if not stale:
+            return
+        before = {t.id: self._verified(t.id)[0] for t in self.store.list_tasks(job.id)}
+        with self.landing_queue.hold(job.repo, job.id, approved_at=self._approved_at(job.id)):
+            if self.store.get_job(job.id).state is not JobState.READY:
+                return  # merged, fixed or killed while it waited for the slot
+            landed = self._land_prs(job.id)
+        if landed == "rework":
+            self.dispatch(job.id)
+            return
+        if landed != "landed":
+            return  # paged by the landing step
+        after = {t: self._verified(t)[0] for t in before}
+        for item in self.store.list_inbox():
+            if item.job_id == job.id and item.kind == "ready_to_merge":
+                self.store.resolve_inbox_item(item.id, "vigild")
+        self.store.add_event(
+            "relanded",
+            {"tasks": {t: {"old": before[t], "new": after[t]} for t in before
+                       if before[t] != after[t]}},
+            Provenance.HUMAN, job_id=job.id,
+        )  # fmt: skip
+        self._ready(job.id)
 
     def _verified(self, task_id: str) -> tuple[str | None, str | None]:
         """The task's `verified_sha` and the main it was verified on (p3-09)."""
@@ -5134,6 +5185,9 @@ class JobRunner:
                 resumable=False,
             )  # fmt: skip
             return "done"
+        for item in self.store.list_inbox():
+            if item.job_id == job_id and item.kind == "ready_to_merge":
+                self.store.resolve_inbox_item(item.id, "vigild")  # the job is back in building
         self.store.create_inbox_item(
             "questions", "landing_rework", job_id,
             f"{task_id}: REWORK at landing ({reason.replace('_', ' ')})",

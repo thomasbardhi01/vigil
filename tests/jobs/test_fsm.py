@@ -447,3 +447,16 @@ def test_a_rework_without_files_is_refused_naming_its_own_reason(store: Store, r
     assert f"a {reason.replace('_', '-')} REWORK names the conflicting files" in text
     if reason != "logic_conflict":
         assert "logic-conflict" not in text
+
+
+def test_a_stale_ready_job_goes_back_for_rework_by_vigild_alone(store: Store) -> None:
+    """p3-09 PR 3 (owner, 2026-11-01): a ready job whose re-landing conflicts or goes red
+    takes ready -> building as a REWORK, under the same guards; the owner's fix edge from
+    ready is unchanged."""
+    jid = _job(store, S.READY)
+    tid = _worker(store, jid, pr=True, report=True)
+    with pytest.raises(TransitionError, match="only vigild"):
+        transition(store, jid, S.BUILDING, Actor.COORD, evidence=_rework(tid))
+    assert transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid)).state is (
+        S.BUILDING
+    )
