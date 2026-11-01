@@ -432,3 +432,18 @@ def test_a_third_rework_of_a_task_is_refused(store: Store) -> None:
         store._force_state(jid, S.IN_REVIEW)
     with pytest.raises(TransitionError, match="at most 2"):
         transition(store, jid, S.BUILDING, Actor.VIGILD, evidence=_rework(tid))
+
+
+@pytest.mark.parametrize("reason", ["outside_scope", "generated_conflict", "logic_conflict"])
+def test_a_rework_without_files_is_refused_naming_its_own_reason(store: Store, reason: str) -> None:
+    """Owner, 2026-11-01 (#260 review): the refusal names the reason it was given, not
+    "logic-conflict" for every one."""
+    jid = _job(store, S.IN_REVIEW)
+    tid = _worker(store, jid, pr=True, report=True)
+    with pytest.raises(TransitionError) as raised:
+        transition(store, jid, S.BUILDING, Actor.VIGILD,
+                   evidence=_rework(tid, reason=reason, files=[]))  # fmt: skip
+    text = str(raised.value)
+    assert f"a {reason.replace('_', '-')} REWORK names the conflicting files" in text
+    if reason != "logic_conflict":
+        assert "logic-conflict" not in text

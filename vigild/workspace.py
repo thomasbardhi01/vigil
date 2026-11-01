@@ -682,8 +682,11 @@ class Workspace:
 
     def push(self, repo: str, head: str, branch: str, token: str | None, lease: str | None) -> None:
         """Push `head` to `branch` only if the remote tip is still `lease` (the SHA
-        publish checked; None means the branch must not exist yet). The caller has
-        already refused a non-fast-forward: a lease alone would let git make one."""
+        publish checked; None means the branch must not exist yet). A plain publish has
+        already refused a non-fast-forward: a lease alone would let git make one. A REWORK
+        (`publish(replace=)`, p3-09) skips that check on purpose: it replaces the branch
+        with a head rebuilt on a new main, only over vigild's own last send, the old tip
+        kept first; the lease is then the only guard against a concurrent push."""
         if is_bench_repo(repo):
             raise WorkspaceError(f"{repo} is a bench repo: nothing is pushed")
         self._git(

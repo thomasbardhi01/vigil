@@ -5069,8 +5069,26 @@ class JobRunner:
                 failing = [str(f) for f in (after.get("failed") or [])] or failing
         evidence = {"action": "rework", "step": "landing", "task": task_id, "reason": reason,
                     "files": files, "failing": failing, "main": res.main_sha}  # fmt: skip
+        pub = self._landing_inputs(task_id) or {}
         try:
-            transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD, evidence=evidence)
+            # one transaction (owner, 2026-11-01): the job is never in building without its
+            # rework record, and a refused transition writes neither
+            with self.store.tx():
+                transition(self.store, job_id, JobState.BUILDING, Actor.VIGILD, evidence=evidence)
+                n = sum(
+                    1 for e in self.store.events(job_id=job_id)
+                    if e.type == "state"
+                    and (e.data.get("evidence") or {}).get("action") == "rework"
+                    and (e.data.get("evidence") or {}).get("task") == task_id
+                )  # fmt: skip
+                rework = {"reason": reason, "files": files, "failing": failing,
+                          "main": res.main_sha, "old_base": pub.get("base_sha"),
+                          "old_head": pub.get("head"), "n": n, "publish": f"{task_id}/{n}",
+                          "done": False}  # fmt: skip
+                self.store.add_artifact(
+                    job_id, "rework.json", json.dumps(rework), Provenance.HUMAN, task_id=task_id
+                )
+                self.store.update_task(task_id, state="fix")
         except TransitionError as e:
             self._block(job_id, f"landing REWORK refused for {task_id}: {e}")
             self._page(
@@ -5081,20 +5099,6 @@ class JobRunner:
                 resumable=False,
             )  # fmt: skip
             return "done"
-        pub = self._landing_inputs(task_id) or {}
-        n = sum(
-            1 for e in self.store.events(job_id=job_id)
-            if e.type == "state" and (e.data.get("evidence") or {}).get("action") == "rework"
-            and (e.data.get("evidence") or {}).get("task") == task_id
-        )  # fmt: skip
-        rework = {"reason": reason, "files": files, "failing": failing, "main": res.main_sha,
-                  "old_base": pub.get("base_sha"), "old_head": pub.get("head"), "n": n,
-                  "publish": f"{task_id}/{n}", "done": False}  # fmt: skip
-        with self.store.tx():
-            self.store.add_artifact(
-                job_id, "rework.json", json.dumps(rework), Provenance.HUMAN, task_id=task_id
-            )
-            self.store.update_task(task_id, state="fix")
         self.store.create_inbox_item(
             "questions", "landing_rework", job_id,
             f"{task_id}: REWORK at landing ({reason.replace('_', ' ')})",

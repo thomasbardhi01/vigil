@@ -328,7 +328,7 @@ def _rework(c: Ctx) -> list[str]:
     if reason not in REWORK_REASONS:
         errs.append(f"a REWORK names its reason, one of {list(REWORK_REASONS)}")
     if reason in ("logic_conflict", "outside_scope", "generated_conflict") and not ev.get("files"):
-        errs.append("a logic-conflict REWORK names the conflicting files")
+        errs.append(f"a {reason.replace('_', '-')} REWORK names the conflicting files")
     if reason == "red_on_rebased" and not ev.get("failing"):
         errs.append("a red-on-rebased REWORK names the failing tests")
     task = ev.get("task")

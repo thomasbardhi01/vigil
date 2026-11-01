@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.conftest import git
 from tests.jobs.test_coord_loop import (  # noqa: F401
     REPO,
@@ -323,3 +325,28 @@ def test_landing_never_runs_a_generator_on_the_host() -> None:
 
     with pytest.raises(PublishError, match="no sandboxed generator"):
         regenerate_docs_tables(Path("/nonexistent"), ["docs/table.md"])
+
+
+def test_a_failure_between_the_rework_writes_leaves_no_job_in_building_without_its_record(
+    world: World,
+) -> None:
+    """Owner, 2026-11-01 (#260 review): the REWORK transition and its rework.json are one
+    transaction. vigild fails writing the record: the job is not in building without it."""
+    w = world
+    job = _held_in_review(w)
+    tid = f"{job}-w1"
+    (path, *_) = _changed(w, tid)
+    _main_edit(w, path, "someone else's whole new content\n")
+    real = w.store.add_artifact
+
+    def failing(job_id: str, name: str, *a: Any, **k: Any) -> Any:
+        if name == "rework.json":
+            raise RuntimeError("vigild failed between the two writes")
+        return real(job_id, name, *a, **k)
+
+    w.store.add_artifact = failing  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        w.runner.review(job)
+    state = w.store.get_job(job).state
+    record = w.store.get_artifact(job, "rework.json", tid)
+    assert not (state is S.BUILDING and record is None), state
