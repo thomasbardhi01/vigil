@@ -176,6 +176,12 @@ def backup(
         envvar="VIGIL_BACKUP_SSH_KEY",
         help="Path of the backup-only ssh key (passed to ssh by path, never read).",
     ),
+    rsync: str = typer.Option(
+        "",
+        "--rsync",
+        envvar="VIGIL_RSYNC",
+        help="GNU rsync binary (default: /opt/homebrew/bin/rsync, else rsync on PATH).",
+    ),
 ) -> None:
     """Back up the database (SQLite online backup, mode 600) and the vault
     (rsync) into a dated set; keep N days. Never reads ~/.config/vigil/."""
@@ -193,6 +199,7 @@ def backup(
                 Path(dest),
                 RsyncRemote.parse(remote, ssh_key or None),
                 keep_days=keep_days,
+                rsync=rsync or None,
             )
         except BackupError as e:
             typer.echo(f"backup failed: {e}")
@@ -203,7 +210,10 @@ def backup(
         typer.echo(f"backed up {res.stamp} and shipped it to {res.event['remote']}")
         return
     try:
-        made = run_backup(_data_dir(data_dir or None), Path(dest), keep_days=keep_days)
+        from vigild.backup import resolve_rsync, using_rsync
+
+        with using_rsync(resolve_rsync(rsync or None)):
+            made = run_backup(_data_dir(data_dir or None), Path(dest), keep_days=keep_days)
     except BackupError as e:
         typer.echo(f"backup failed: {e}")
         raise typer.Exit(1) from e

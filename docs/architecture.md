@@ -494,10 +494,20 @@ directory under filter rules `--include=/<stamp>`, `--include=/<stamp>/***`,
 `--exclude=*`: the exclude protects every other remote path. The result is
 recorded as an `events` row `type: backup` (provenance `human`; fields `ok`,
 `stamp`, `remote`, `sizes`, `integrity`, `fsck`, `remote_verified`,
-`retention_removed`, `local_pruned`, `duration_s`, `error`), written by the CLI
+`retention_removed`, `local_pruned`, `rsync`, `duration_s`, `error`), written by the CLI
 through `Store`. `/api/health` adds `backup` to `degraded` when the newest event
 with `ok: true` is over 36 h old or there is none; it is read from the store on
 every request.
+
+**GNU rsync only.** The tower's rrsync is GNU rsync and rejects macOS's
+`/usr/bin/rsync` (openrsync). Every rsync call in `vigild/backup.py` (local copies,
+ship, verify, list, retention) runs one binary, resolved once per run: `--rsync`,
+else `VIGIL_RSYNC`, else `/opt/homebrew/bin/rsync` when executable, else `rsync` on
+`PATH`. `run_nightly` first runs `<rsync> --version`; anything that is not GNU rsync
+3.1 or newer (openrsync, unparseable) is refused before any copy: nothing is copied
+or shipped, a failed `backup` event records the error and `rsync: {path, version}`,
+the CLI exits 1, and `/api/health` lists `backup-rsync` (besides `backup`) while the
+latest event is such a refusal. The directory-mtime filter in `_rsync_diff` stays.
 
 Every record table carries `provenance: claude | local | human`, enforced
 by a CHECK constraint. `human` means not model output: you, or vigild's own

@@ -38,6 +38,12 @@ def _bare_repo(path: Path) -> None:
     git(path.parent, "init", "--quiet", "--bare", str(path))
 
 
+@pytest.fixture(autouse=True)
+def _local_rsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test-only: this Mac's rsync is openrsync; skip the production GNU check."""
+    monkeypatch.setattr(backup, "_TEST_SKIP_RSYNC_CHECK", True)
+
+
 @pytest.fixture
 def data(tmp_path: Path) -> Path:
     root = tmp_path / "data"
@@ -360,3 +366,119 @@ def test_health_reads_the_store_each_request(
     assert "backup" in _degraded(client, tokens)
     _record(services.store, True, 1)
     assert "backup" not in _degraded(client, tokens)
+
+
+# --- GNU rsync only -----------------------------------------------------------------
+
+OPENRSYNC = "#!/bin/sh\necho 'openrsync: protocol version 29'\n"
+GNU = "#!/bin/sh\necho 'rsync  version 3.4.1  protocol version 32'\n"
+
+
+def _fake(path: Path, text: str) -> str:
+    path.write_text(text)
+    path.chmod(0o755)
+    return str(path)
+
+
+@pytest.fixture
+def real_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switch the test-only version-check skip off: the production path."""
+    monkeypatch.setattr(backup, "_TEST_SKIP_RSYNC_CHECK", False)
+
+
+def test_openrsync_is_refused_before_any_copy(
+    data: Path, tmp_path: Path, real_check: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake(tmp_path / "rsync", OPENRSYNC)
+    remote = LocalRemote(tmp_path / "remote")
+    res = _run(data, tmp_path, remote, rsync=fake)
+    assert not res.ok
+    assert res.event["ok"] is False
+    assert res.event["error"] == (
+        f"rsync is openrsync (or not GNU rsync >= 3.1) at {fake}; "
+        "install GNU rsync (brew install rsync) or set VIGIL_RSYNC"
+    )
+    assert res.event["rsync"] == {"path": fake, "version": "openrsync: protocol version 29"}
+    assert not (tmp_path / "local").exists()
+    assert _names(remote) == []
+    assert _events(data)[-1]["ok"] is False
+
+
+def test_unparseable_and_old_gnu_are_refused(tmp_path: Path) -> None:
+    for text in ("garbage", "rsync  version 3.0.9  protocol version 30", ""):
+        fake = _fake(tmp_path / "r", f"#!/bin/sh\necho '{text}'\n")
+        with pytest.raises(backup.RsyncRefused):
+            backup.check_gnu_rsync(fake)
+
+
+def test_gnu_version_passes(tmp_path: Path) -> None:
+    assert (
+        backup.check_gnu_rsync(_fake(tmp_path / "r", GNU))
+        == "rsync  version 3.4.1  protocol version 32"
+    )
+
+
+def test_gnu_check_then_full_run(data: Path, tmp_path: Path, real_check: None) -> None:
+    import shutil
+
+    real = shutil.which("rsync")
+    assert real
+    # The fake reports GNU for --version and execs the real rsync otherwise.
+    fake = _fake(
+        tmp_path / "rsync",
+        f'#!/bin/sh\nif [ "$1" = "--version" ]; then echo "rsync  version 3.4.1  protocol'
+        f' version 32"; exit 0; fi\nexec {real} "$@"\n',
+    )
+    res = _run(data, tmp_path, LocalRemote(tmp_path / "remote"), rsync=fake)
+    assert res.ok, res.event
+    assert res.event["rsync"]["path"] == fake  # type: ignore[index]
+
+
+def test_health_lists_backup_rsync(
+    client: TestClient, services: Services, tokens: Tokens, data: Path, tmp_path: Path
+) -> None:
+    services.store.add_event("backup", {"ok": False, "stamp": "s", "rsync_refused": True}, "human")
+    d = _degraded(client, tokens)
+    assert "backup" in d and "backup-rsync" in d
+    services.store.add_event("backup", {"ok": False, "stamp": "t"}, "human")
+    assert "backup-rsync" not in _degraded(client, tokens)
+
+
+def test_resolution_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    brew = "/opt/homebrew/bin/rsync"
+    monkeypatch.setattr(backup, "_is_executable", lambda p: p == brew)
+    monkeypatch.delenv("VIGIL_RSYNC", raising=False)
+    assert backup.resolve_rsync("/x/cli") == "/x/cli"
+    monkeypatch.setenv("VIGIL_RSYNC", "/x/env")
+    assert backup.resolve_rsync("/x/cli") == "/x/cli"
+    assert backup.resolve_rsync(None) == "/x/env"
+    monkeypatch.delenv("VIGIL_RSYNC")
+    assert backup.resolve_rsync(None) == brew
+    monkeypatch.setattr(backup, "_is_executable", lambda p: False)
+    assert backup.resolve_rsync(None) == "rsync"
+
+
+def test_every_subprocess_call_uses_the_resolved_binary(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_run = subprocess.run
+    argv0: list[str] = []
+
+    def spy(args: list[str], *a: object, **k: object) -> subprocess.CompletedProcess[str]:
+        if args[0] != "git" and "git" not in str(args[0]).rsplit("/", 1)[-1]:
+            argv0.append(args[0])
+        return real_run(args, *a, **k)  # type: ignore[call-overload,no-any-return]
+
+    import shutil
+
+    real = shutil.which("rsync")
+    assert real
+    monkeypatch.setattr(backup.subprocess, "run", spy)
+    res = _run(data, tmp_path, LocalRemote(tmp_path / "remote"), rsync=real)
+    assert res.ok, res.event
+    assert argv0 and set(argv0) == {real}
+
+
+def test_no_bare_rsync_literal_in_backup_py() -> None:
+    src = Path(backup.__file__).read_text()
+    assert '["rsync",' not in src and '\n            "rsync",' not in src
