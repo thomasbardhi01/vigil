@@ -25,6 +25,7 @@ reviewer, auditor or coord packet includes them
 | `landing-and-trust-ladder.md` | Conflict-free landing, Lauren Tan's trust ladder, the one-app question, and Vigil as a service | 2026-10-31 | §7, R15–R21, p3-09, p3-05, p3-47, p3-48 |
 | `rust-and-retrieval.md` | Vigil and Rust: code-retrieval evidence, Rust AI infrastructure, and a Rust target stack | 2026-11-01 | R26, p3-63, experiment #17's design |
 | `the-lab-assessment.md` | "The Lab" inside Vigil: assessment of the ChatGPT research-lab proposal | 2026-11-01 | R27, p3-64–p3-68, experiments #25–#26 (an advisor assessment of an owner-supplied report with unverified citations) |
+| `factory-topology-and-advisor-seats.md` | Make factories projects, keep advisors strong | 2026-11-01 | R29–R33; experiments #37a, #37b; p3-03, p3-13, p3-23 |
 | `local-model-loop-review.md` | Vigil × ADR-0007: Verified-Trace SFT, Best-of-n, Jev Calibration, Typed-Decision Uses, and the Hosted-Trace Bridge | 2026-11-01 | ADR-0007's amendments (2026-11-01), experiments #13, #21, E9, #32, the decider row |
 
 Paths inside the reports (`/home/claude/reports/…`, `/home/claude/vigil/…`)
