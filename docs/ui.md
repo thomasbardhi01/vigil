@@ -39,15 +39,17 @@ These CSS variables are the only colours:
 | `--void` | `#05080B` | Page. |
 | `--graphite` | `#121A22` | Panels; hairlines at 30%. |
 | `--steel` | `#364D61` | Idle state, borders, graph bodies. |
-| `--sonar` | `#92DDF9` | Detection, attention, the selected row, verification, live activity. Used sparingly. |
+| `--sonar` | `#B8E7F8` | Detection, attention, the selected row, verification, live activity. Used sparingly. Paler ice since 2026-11-01 (was `#92DDF9`). |
+| `--glow` | `#D6F1FB` | The halo tint around point-cloud dots, the orb and the sonar pulse. Never text. |
 | `--signal` | `#EAF6FC` | Primary text. |
 
 - **Needs-you pair:** `--signal` text on a `--steel` background marks
   anything that needs you: cap reached, guard denial, failed, escalated.
-- **Contrast is re-measured before the hexes are final.** The needs-you
-  pair must pass WCAG AA at 12–13 px, as the 2026-10-22 measurement did for
-  the old pair (`--ink` on `#346E93`, 4.69:1). Until that measurement is
-  recorded here, the values above are provisional.
+- **Contrast, measured 2026-11-01** (WCAG relative luminance; AA for 12–13 px text is
+  4.5:1): `--signal` on `--steel` (the needs-you pair) 7.98:1; `--sonar` on `--void`
+  15.13:1, on `--graphite` 13.22:1, on `--steel` 6.62:1; `--void` on `--sonar` 15.13:1;
+  `--signal` on `--void` 18.25:1. All pass AA. `--sonar` is now close to `--signal` in
+  colour, so a sonar highlight is never the only cue: state stays a word plus a glyph.
 - **Borders** are hairlines only. **Corners** are never rounded more than
   2px. **Icons:** none from icon packs.
 
@@ -62,14 +64,35 @@ These CSS variables are the only colours:
 
 ### Imagery
 
-- Renders appear on the landing page, as `/watch`'s ambient background and
-  in empty states only.
+- **Full background:** the login page, `/watch` and empty states
+  (`docs/design/vigil-bg-mast.webp`).
+- **The dim variant behind `/talk`,** with frosted panels over it
+  (`docs/design/vigil-bg-mast-dim.webp`).
+- Sources and prompts for every file: `docs/design/README.md`.
 - They are served from the repo, never fetched, each at most 200 KB. The
   page's data budget is unchanged: under 100 KB before images.
 - Operational pages (`/`, `/jobs`, `/job/:id`, `/review`) stay flat: data
-  first, atmosphere second.
+  first, atmosphere second. At most the dim variant at about 6% opacity,
+  behind the left nav only.
 - Further renders are generated as needed (ChatGPT is fine for source
   art). The repo keeps the files and their prompts.
+
+### The advisor's avatar: the sonar orb
+
+Reference: `docs/design/vigil-orb-states.png`. Two rings of near-white dots
+(`--signal` cores) with a pale `--glow` halo; the inner ring's dots smaller and
+dimmer. Built in UI-3a as one inline SVG of at most 2 KB, with a CSS class per
+state:
+- **idle:** a slow breathe;
+- **thinking:** the dots orbit, unevenly;
+- **speaking:** the outer ring ripples outward;
+- **waiting on the owner:** one dot bright, the rest dim;
+- **alert:** the rings tighten, all bright.
+
+At 16 px it is a single ring of 8–12 dots. No motion under
+`prefers-reduced-motion`. The state is also named in text beside it (a word
+plus a glyph). Later, coord gets the same dots in a square grid, and workers a
+single row.
 
 ### Motion
 
