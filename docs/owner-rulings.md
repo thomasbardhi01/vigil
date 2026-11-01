@@ -70,6 +70,7 @@ applied.
 
 ## Repos (ParkAgent, visibility)
 - **2026-10-31** (R10): ParkAgent. **Ruling:** Public now; after the flip tower-only; `repos.yaml` gains `tower-qwen` for ParkAgent **before any rule-6 job on it** (this is what unblocks product traffic).
+- **2026-10-31** (restates the 10-28 line's standing parts): Coord may submit vigild jobs on thomasbardhi01/vigil; only the owner submits anything for ParkAgent; 'never submit' applies only to unattended runs unless the run's brief says otherwise (#1).
 - **2026-10-28**: vigil stays public for now (rulesets and auto-merge need Pro on a private repo, Actions minutes, runner isolation); revisit after phase 2 with GitHub Pro and an isolated runner VM.
 - **2026-10-28** (superseded 2026-10-31 by R12: replan approval scope): Coord may submit vigild jobs on `thomasbardhi01/vigil`; only the owner approves a spec out of `spec_pending`, and only the owner submits anything for ParkAgent; "never submit" applies only to unattended runs unless the run's brief says otherwise (#1).
 - **2026-10-27**: Sandbox hosts are generic; code never names "the tower" (#43).
