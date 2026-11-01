@@ -14,7 +14,7 @@ unknown
 
 ## Configuration
 
-Two baselines: the by-hand owner workflow AND Strawman v1 (experiment #27), with owner-minutes recorded identically for both.
+Two baselines: the by-hand owner workflow AND Strawman v1 (experiment #27), with owner-minutes recorded identically for both. Owner-minutes come from one instrument in both arms: a per-task start/stop timer the owner runs. Tasks are matched but different, paired by shape and size, alternating which arm goes first.
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 

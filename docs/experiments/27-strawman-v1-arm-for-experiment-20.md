@@ -16,7 +16,7 @@ unknown
 
 ## Configuration
 
-Strawman v1: the spec is a placeholder until Brief B lands.
+Strawman v1: the spec is a placeholder until Brief B lands. Its property table is descriptive; C1's outcome measures (owner-min/PR, 30-day reverts) decide any rewrite of the thesis. Owner-minutes come from one instrument in both arms: a per-task start/stop timer the owner runs. Tasks are matched but different, paired by shape and size, alternating which arm goes first.
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 

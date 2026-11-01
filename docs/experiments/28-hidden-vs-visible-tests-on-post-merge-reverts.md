@@ -8,7 +8,7 @@
 
 ## Question
 
-unknown
+Among PRs that the visible tests alone would have passed, do the ones where hidden tests changed the outcome differ in post-merge reverts?
 
 ## Hypothesis
 
@@ -16,7 +16,7 @@ unknown
 
 ## Configuration
 
-Two arms: hidden tests on; visible tests only.
+Counterfactual, the primary design: every PR goes through the full gate; per PR, record whether hidden tests changed the outcome (failed a draft the visible tests passed, or forced a fix), and compare reverts among PRs the visible tests alone would have passed. No visible-only arm ships code. Brief D evaluates the design.
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 
