@@ -106,6 +106,8 @@ def record_call(
     truncated: bool = False,
     repo: str | None = None,
     call_key: str | None = None,
+    hold_usd: float | None = None,
+    hold_reason: str | None = None,
 ) -> float:
     """Insert the call's row. With a `call_key`, at most one row exists per key:
     a second record of the same key writes nothing and returns the stored cost."""
@@ -118,7 +120,7 @@ def record_call(
         _insert_call(
             store, cost, session_id, task_id, job_id, purpose, provider, backend_preset, model,
             usage, provider_cost_usd, status, latency_ms, timings, provenance, truncated, repo,
-            call_key,
+            call_key, hold_usd, hold_reason,
         )  # fmt: skip
     except sqlite3.IntegrityError:
         stored = call_cost_by_key(store, call_key) if call_key is not None else None
@@ -156,13 +158,15 @@ def _insert_call(
     truncated: bool,
     repo: str | None,
     call_key: str | None,
+    hold_usd: float | None = None,
+    hold_reason: str | None = None,
 ) -> None:
     store.x(
         "INSERT INTO model_calls (session_id, task_id, job_id, purpose, provider, backend_preset,"
         " model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write_5m,"
         " tokens_cache_write_1h, cost_usd, provider_cost_usd, status, latency_ms, timings, ts,"
-        " provenance, truncated, repo, call_key)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " provenance, truncated, repo, call_key, hold_usd, hold_reason)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             session_id,
             task_id,
@@ -186,6 +190,8 @@ def _insert_call(
             int(truncated),
             repo,
             call_key,
+            hold_usd,
+            hold_reason,
         ),
     )
 

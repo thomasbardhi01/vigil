@@ -247,11 +247,12 @@ def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
     """#29: the step is last in MIGRATIONS; on a database built from the schema of the step
     before it, it adds `model_calls.call_key` and a unique index, and two more runs change
     nothing."""
-    assert db.MIGRATIONS[-2].__name__ == "_m18_call_key"  # the calls index follows
+    names = [m.__name__ for m in db.MIGRATIONS]
+    assert names[names.index("_m18_call_key") + 1] == "_m19_calls_backend_index"
     path = tmp_path / "ck.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
-    for step in db.MIGRATIONS[:-2]:
+    for step in db.MIGRATIONS[: names.index("_m18_call_key")]:
         step(conn)
     conn.commit()
     assert "call_key" not in {r[1] for r in conn.execute("PRAGMA table_info(model_calls)")}
@@ -270,4 +271,32 @@ def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
     db.migrate(store.conn)
     db.migrate(store.conn)
     assert shape() == before
+    assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
+
+
+def test_the_call_holds_step_is_last_and_idempotent(tmp_path: Path) -> None:
+    """vi-0019 A1 carry-over (a): each metered call records the hold the gateway placed for
+    it and why (`model_calls.hold_usd`, `hold_reason`), so holds are recorded, not
+    reconstructed. The step is appended last; rows from before keep NULL; it runs twice."""
+    assert db.MIGRATIONS[-1].__name__ == "_m20_call_holds"
+    path = tmp_path / "holds.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:-1]:
+        step(conn)
+    conn.execute(
+        "INSERT INTO model_calls (purpose, provider, model, tokens_in, tokens_out,"
+        " tokens_cache_read, tokens_cache_write_5m, tokens_cache_write_1h, cost_usd, ts,"
+        " provenance) VALUES ('session', 'anthropic', 'm', 1, 1, 0, 0, 0, 0.01,"
+        " '2026-11-01T00:00:00+00:00', 'claude')"
+    )
+    conn.commit()
+    assert "hold_usd" not in {r[1] for r in conn.execute("PRAGMA table_info(model_calls)")}
+    conn.close()
+    store = Store.open(path)
+    assert {"hold_usd", "hold_reason"} <= _cols(store, "model_calls")
+    (row,) = store.q("SELECT hold_usd, hold_reason FROM model_calls")
+    assert row["hold_usd"] is None and row["hold_reason"] is None
+    db.migrate(store.conn)
+    db.migrate(store.conn)
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

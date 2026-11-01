@@ -497,6 +497,13 @@ def _m19_calls_backend_index(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS calls_backend_preset ON model_calls(backend_preset)")
 
 
+def _m20_call_holds(conn: sqlite3.Connection) -> None:
+    """vi-0019 A1 (owner, 2026-11-01): each metered call records the hold the gateway
+    placed for it and why (prefix, count, estimate, task_miss), so holds are recorded,
+    not reconstructed. Rows from before keep NULL."""
+    _add_columns(conn, "model_calls", {"hold_usd": "REAL", "hold_reason": "TEXT"})
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -517,6 +524,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m17_replay_kind,
     _m18_call_key,
     _m19_calls_backend_index,
+    _m20_call_holds,
 ]
 
 

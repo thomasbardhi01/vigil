@@ -223,8 +223,8 @@ class PrefixRecord:
     """What a session's last finished call left in the provider's cache, as far as
     vigild knows: the hash of its whole input, how many messages that was, its
     length (characters), what its usage reported (owner ruling R23, 2026-10-31 (#1)):
-    the prompt total (input + cache reads + cache writes) and the part of it read from
-    the cache (never writes, G1), and when."""
+    the prompt total (input + cache reads + cache writes) and the part of it in the
+    provider's cache after the call (reads and writes; owner, 2026-11-01), and when."""
 
     digest: str
     messages: int
@@ -339,6 +339,8 @@ class Hold:
     plain: float | None = None  # the same hold priced as a miss (day, month, metering failure)
     premium: float = 0.0  # plain - amount: held against the day and the month (R23)
     fingerprint: tuple[str, int, int] | None = None  # this input: digest, messages, chars
+    # why the input was held as it was: prefix, count, estimate or task_miss
+    reason: str = ""
 
 
 class HeldStream:
@@ -626,21 +628,25 @@ class Gateway:
     def _input_tokens(
         self, session_id: str, task_id: str | None, rec: PrefixRecord | None, chars: int,
         counted: int | None, raw_len: int,
-    ) -> tuple[int, int]:  # fmt: skip
-        """(tokens held at the read rate, tokens held at the write rate) for a call's
-        input (R23). A prefix that matches the previous call is that call's reported
-        prompt total; the part it reported as cache reads is held at the read rate, only
-        when nothing else of the session is in flight and its task has no overshoot; the
-        rest, and the bytes appended since, at the write rate (the tail estimated at
-        chars / 3). With no match the provider's own count, else chars / 3, all at the
-        write rate. Called under `_inflight_lock`."""
+    ) -> tuple[int, int, str]:  # fmt: skip
+        """(tokens held at the read rate, tokens held at the write rate, why) for a call's
+        input (R23). A prefix that matches the session's last *completed* call is that
+        call's reported prompt total; the part it reported as cached (reads and writes) is
+        held at the read rate whether or not another call of the session is in flight
+        (owner, 2026-11-01: vi-0019 A1, step a), unless its task has overshot; the rest,
+        and the bytes appended since (what a call in flight is still writing among them),
+        at the write rate (the tail estimated at chars / 3). With no match the provider's
+        own count, else chars / 3, all at the write rate. A miss goes through the
+        overshoot path (`_learn`). Called under `_inflight_lock`."""
         if rec is None:
-            return 0, counted if counted is not None else math.ceil(raw_len / CHARS_PER_TOKEN)
+            if counted is not None:
+                return 0, counted, "count"
+            return 0, math.ceil(raw_len / CHARS_PER_TOKEN), "estimate"
         tail = math.ceil(max(0, chars - rec.chars) / CHARS_PER_TOKEN)
-        if session_id in self._inflight or self._task_is_miss(session_id, task_id):
-            return 0, rec.prompt_tokens + tail
+        if self._task_is_miss(session_id, task_id):
+            return 0, rec.prompt_tokens + tail, "task_miss"
         read = min(rec.cached_tokens, rec.prompt_tokens)
-        return read, rec.prompt_tokens - read + tail
+        return read, rec.prompt_tokens - read + tail, "prefix"
 
     def _may_afford(self, session_id: str, model: str, want: int) -> bool:
         """The cheap pre-check before an exact count (which spends the shared key's
@@ -737,10 +743,9 @@ class Gateway:
         `cache_miss`, trips no breaker, pages the owner, makes every later call on the task
         a held miss, and the session's next call must first re-reserve the excess
         (`_hold_clamped`)."""
-        cached = usage.tokens_cache_read  # writes never earn the read rate (G1)
-        prompt = (
-            usage.tokens_in + cached + usage.tokens_cache_write_5m + usage.tokens_cache_write_1h
-        )
+        # what the provider holds after this call: its reads and its writes (owner, 2026-11-01)
+        cached = usage.tokens_cache_read + usage.tokens_cache_write_5m + usage.tokens_cache_write_1h
+        prompt = usage.tokens_in + cached
         fp = hold.fingerprint
         if fp is not None and prompt > 0:
             self._prefix[gs.session_id] = PrefixRecord(
@@ -862,7 +867,9 @@ class Gateway:
             ):
                 raise GatewayError(401, "authentication_error", "invalid or revoked session token")
             self._rereserve_miss(session_id, task_id)  # a cache miss owes a reservation (#79)
-            read, write = self._input_tokens(session_id, task_id, rec, chars, counted, len(raw))
+            read, write, why = self._input_tokens(
+                session_id, task_id, rec, chars, counted, len(raw)
+            )
 
             def price(o: int, miss: bool = False) -> float:
                 if miss:
@@ -904,7 +911,9 @@ class Gateway:
             except BudgetExceeded as e:
                 raise GatewayError(403, "permission_error", f"budget: {e}") from e
             if info is not None:
-                info.update(cached_tokens=read, plain=plain, premium=premium, fingerprint=fp)
+                info.update(
+                    cached_tokens=read, plain=plain, premium=premium, fingerprint=fp, reason=why
+                )
             self._inflight[session_id] = held + amount
             self._seen[session_id] = self._now()
         changed = out != body.get("max_tokens")
@@ -1033,7 +1042,7 @@ class Gateway:
         """Record a finished upstream call. If that fails the call's spend is
         unknown: stop the session, book the worst case, page the owner."""
         try:
-            cost = self._record(gs=gs, **kw)
+            cost = self._record(gs=gs, hold=hold, **kw)
         except Exception as e:
             self._metering_failed(hold, gs, kw["model"], kw["usage"], e)
             return
@@ -1211,6 +1220,7 @@ class Gateway:
             gs.session_id, amount, preset, body, raw, probe=probe,
             cached_tokens=info.get("cached_tokens", 0), plain=info.get("plain"),
             premium=info.get("premium", 0.0), fingerprint=info.get("fingerprint"),
+            reason=info.get("reason", ""),
         )  # fmt: skip
 
     # --- forwarding ------------------------------------------------------------------
@@ -1249,6 +1259,7 @@ class Gateway:
         stop_reason: str | None = None,
         repo: str | None = None,
         call_key: str | None = None,
+        hold: Hold | None = None,
     ) -> float:
         truncated = stop_reason == "max_tokens"
         if truncated and gs:
@@ -1283,6 +1294,8 @@ class Gateway:
             truncated=truncated,
             repo=gs.repo if gs else repo,
             call_key=call_key,
+            hold_usd=hold.amount if hold is not None else None,
+            hold_reason=(hold.reason or None) if hold is not None else None,
         )
 
     async def forward(
