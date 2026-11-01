@@ -239,8 +239,15 @@ def publish(
                     f"{branch} moved on the remote (tip {tip[:12]}): it is not what vigild "
                     "last sent, and a REWORK replaces only vigild's own send"
                 )
-            if tip is not None:  # the old tip is kept before anything replaces it
-                ws._git(ws.vault(repo), "update-ref", f"refs/vigil/rework/{replace}", tip)
+            ref = f"refs/vigil/rework/{replace}"
+            try:
+                kept = ws._git(ws.vault(repo), "rev-parse", "--verify", "--quiet", ref)
+            except WorkspaceError:
+                kept = None
+            if tip is not None and kept is None and tip != send:
+                # the old tip is kept before anything replaces it, once: a retried replace
+                # (a crash after the push) never overwrites it with the new tip
+                ws._git(ws.vault(repo), "update-ref", ref, tip)
             try:
                 ws.push(repo, send, branch, token, tip)
             except WorkspaceError as e:

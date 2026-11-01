@@ -888,3 +888,20 @@ def test_a_plain_publish_of_a_rebuilt_head_still_only_fast_forwards(
             existing=url)  # fmt: skip
     tip = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
     assert ws.is_ancestor(REPO, sent, tip)  # chained on the last send: a fast-forward
+
+
+def test_rework_replace_retried_after_a_crash_keeps_the_first_old_tip(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path
+) -> None:
+    """Round 2: a replace retried after the push (vigild died before clearing its mark)
+    never overwrites the kept old tip with the new one."""
+    ws, base, head, bare = setup
+    pulls = EditablePulls(bare)
+    url = _pub(ws, base, head, pulls)
+    old = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    for _ in range(2):
+        publish(ws, repo=REPO, head=head2, base_sha=base2, branch=BRANCH, base="main",
+                title="t2", body="rebuilt", pulls=pulls, scope=["docs/feature-map.md"],
+                existing=url, replace=f"{TID}/1")  # fmt: skip
+    assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old

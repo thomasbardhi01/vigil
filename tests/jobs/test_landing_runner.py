@@ -257,3 +257,47 @@ def test_a_rework_spends_from_the_same_task_cap(world: World) -> None:
         " ON s.id=m.session_id WHERE s.task_id=? AND s.role='worker'", (tid,)
     )[0]["s"]  # fmt: skip
     assert total <= cap + 1e-9
+
+
+def test_a_failed_rework_worker_s_retry_still_rebuilds_on_main_with_the_context(
+    world: World,
+) -> None:
+    """Round 2: the REWORK context stays until the rebuilt head is published. The REWORK
+    worker's first attempt fails; the owner retries; the retry's packet still says REWORK
+    and names the file, and the task lands."""
+    w = world
+    job = _held_in_review(w)
+    tid = f"{job}-w1"
+    (path, *_) = _changed(w, tid)
+    tries = [0]
+
+    def edit(spec: Any, task: dict[str, Any]) -> None:
+        if str(spec.task_id) == tid and "REWORK" in spec.packet and tries[0] == 0:
+            tries[0] += 1
+            (spec.clone / "README.md").write_text("out of scope\n")  # this attempt fails
+            return
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+
+    w.standin.worker_edit = edit
+    _main_edit(w, path, "someone else's whole new content\n")
+    w.runner.review(job)
+    item = next(
+        q for q in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if q["job_id"] == job and q["body"].get("kind") == "worker_failed"
+    )  # fmt: skip
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    last = _workers(w, tid)[-1]
+    assert "REWORK" in last and path in last
+    assert w.store.get_job(job).state is S.READY
+
+
+def test_a_pr_merged_by_hand_before_any_landing_is_recorded_merged(world: World) -> None:
+    """Round 2: the merge binding binds only what went through landing; the owner's merge
+    by hand while the job is in review (review B7), or a PR from before p3-09, is recorded."""
+    w = world
+    job = _held_in_review(w)
+    w.runner.pr_state = lambda repo, url: "merged"  # type: ignore[method-assign,assignment]
+    w.runner.pr_head = lambda repo, url: "e" * 40  # type: ignore[attr-defined]
+    w.runner.poll_prs()
+    assert w.store.get_job(job).state is S.MERGED

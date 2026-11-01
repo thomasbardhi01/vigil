@@ -3320,7 +3320,7 @@ class JobRunner:
         pr_url = self._task_pr(task_id) if published else None
         crashed = prev is not None and prev.status == "crashed"
         start = (prev.detail.get("checkpoint") if crashed and prev else None) or published
-        rework = contract.get("rework")
+        rework = self._rework_pending(job_id, task_id)
         if isinstance(rework, dict) and not crashed:
             start = None  # p3-09 REWORK: rebuilt from the current main, never the old head
         if start:
@@ -3380,7 +3380,7 @@ class JobRunner:
         # round's findings. Only a crashed worker resumes its own session (item 3); a
         # landed dependency is in the work tree already, so that worker starts fresh too.
         escalated = str(t.tier_reason or "").startswith("rule5")
-        fix_round = None if isinstance(contract.get("rework"), dict) else self._fix_round(t)
+        fix_round = None if isinstance(rework, dict) else self._fix_round(t)
         attempt = int(contract.get("attempt") or 1)
         forks = crashed
         fresh_fix: dict[str, str] | None = None
@@ -3403,14 +3403,9 @@ class JobRunner:
             }
             if escalated or attempt >= self.cfg.routing.escalate_attempt:
                 fresh_fix["history"] = self._findings_history(t, fix_round)
-        rework = contract.get("rework")
         rework_note = (
             {"landing_rework.md": self._rework_note(rework)} if isinstance(rework, dict) else {}
         )
-        if rework_note:  # told once: this session's packet carries it, no later one does
-            self.store.update_task(
-                task_id, contract={k: v for k, v in contract.items() if k != "rework"}
-            )
         packet = assemble_worker(
             clone, contract,
             untrusted=decisions.section(self.store, job_id) | self._answer(job_id, task_id)
@@ -3801,6 +3796,7 @@ class JobRunner:
         inputs are kept (`publish_refused`), so a retry can republish without a session."""
         contract = self.store.get_task(task_id).contract
         job_id = job.id
+        rework = self._rework_pending(job.id, task_id)
         try:
             url = self._publish(
                 job,
@@ -3821,8 +3817,7 @@ class JobRunner:
                     *vigild_paths(job_id),
                 ],
                 existing=pub["pr_url"],
-                **({"replace": contract["rework_publish"]}
-                   if contract.get("rework_publish") else {}),
+                **({"replace": rework["publish"]} if rework else {}),
             )  # fmt: skip
         except PublishError as e:
             self.store.add_event(
@@ -3834,8 +3829,8 @@ class JobRunner:
                 job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e), **moved}
             )
         head, branch, overlap = pub["head"], pub["branch"], pub["runner_file_change"]
-        if contract.get("rework_publish"):  # p3-09: the branch was replaced; record both ends
-            rid = str(contract["rework_publish"])
+        if rework:  # p3-09: the branch was replaced; record both ends
+            rid = str(rework["publish"])
             try:
                 old = self.workspace._git(
                     self.workspace.vault(job.repo), "rev-parse", "--verify", "--quiet",
@@ -3849,9 +3844,12 @@ class JobRunner:
                  "new_sha": self.workspace.published_sha(job.repo, branch), "branch": branch},
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
             )  # fmt: skip
-            self.store.update_task(
-                task_id, contract={k: v for k, v in contract.items() if k != "rework_publish"}
-            )
+            # the REWORK is done once its rebuilt head is out, not at dispatch: a failed
+            # REWORK worker's retry still starts from main with the context
+            self.store.add_artifact(
+                job_id, "rework.json", json.dumps({**rework, "done": True}), Provenance.HUMAN,
+                task_id=task_id,
+            )  # fmt: skip
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         facts = self._pub_facts(job.repo, branch, pub["base_sha"])  # vault git: outside the tx
         # #34: the state and the event with its URL land together, or neither does
@@ -4261,8 +4259,12 @@ class JobRunner:
         if self.pr_head is None:
             return True  # no GitHub App: nothing reads a head (tests, a bench host)
         if not verified:
-            head = "never landed"
-            return self._unverified_merge(job, task_id, url, head, None)
+            landed = self.store.q(
+                "SELECT 1 FROM events WHERE task_id=? AND type='landed' LIMIT 1", (task_id,),
+            )  # fmt: skip
+            if not landed:
+                return True  # never went through landing: merged by hand (B7) or before p3-09
+            return self._unverified_merge(job, task_id, url, "never landed", None)
         try:
             head = self.pr_head(job.repo, url)
         except Exception:
@@ -5020,6 +5022,15 @@ class JobRunner:
         hidden_ok = not hidden.get("present") or (hidden.get("outcome") == "pass")
         return after == "pass" and ac_ok and hidden_ok
 
+    def _rework_pending(self, job_id: str, task_id: str) -> dict[str, Any] | None:
+        """The task's REWORK still owed (p3-09): set by landing, done once its rebuilt
+        head is published. Kept as the task's `rework.json` artifact, never on the contract."""
+        art = self.store.get_artifact(job_id, "rework.json", task_id)
+        if art is None:
+            return None
+        rw: dict[str, Any] = json.loads(art.content)
+        return None if rw.get("done") else rw
+
     def _landed_by_main(self, job: Job, task_id: str, pub: dict[str, Any], res: LandResult) -> None:
         """Owner, 2026-11-01: a task whose change is already on main is closed as landed by
         main, with no worker; its PR, which would change nothing, is closed."""
@@ -5064,21 +5075,20 @@ class JobRunner:
                 resumable=False,
             )  # fmt: skip
             return "done"
-        t = self.store.get_task(task_id)
         pub = self._landing_inputs(task_id) or {}
         n = sum(
             1 for e in self.store.events(job_id=job_id)
             if e.type == "state" and (e.data.get("evidence") or {}).get("action") == "rework"
             and (e.data.get("evidence") or {}).get("task") == task_id
         )  # fmt: skip
-        contract = {
-            **t.contract,
-            "rework": {"reason": reason, "files": files, "failing": failing,
-                       "main": res.main_sha, "old_base": pub.get("base_sha"),
-                       "old_head": pub.get("head"), "n": n},
-            "rework_publish": f"{task_id}/{n}",
-        }  # fmt: skip
-        self.store.update_task(task_id, state="fix", contract=contract)
+        rework = {"reason": reason, "files": files, "failing": failing, "main": res.main_sha,
+                  "old_base": pub.get("base_sha"), "old_head": pub.get("head"), "n": n,
+                  "publish": f"{task_id}/{n}", "done": False}  # fmt: skip
+        with self.store.tx():
+            self.store.add_artifact(
+                job_id, "rework.json", json.dumps(rework), Provenance.HUMAN, task_id=task_id
+            )
+            self.store.update_task(task_id, state="fix")
         self.store.create_inbox_item(
             "questions", "landing_rework", job_id,
             f"{task_id}: REWORK at landing ({reason.replace('_', ' ')})",
