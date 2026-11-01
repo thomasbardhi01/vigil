@@ -9,14 +9,14 @@ Industrial world) with the paler ice accent the owner chose on 2026-11-01. How e
 |---|---|---|---|
 | `visual-identity-v2.png` | The Look v2 exploration sheet (owner, 2026-10-31) | Reference | Reference |
 | `vigil-orb-states.png` | The advisor's avatar, the "sonar orb": 5 states at full size, 32 px and 16 px | Reference for the inline SVG built in UI-3a | Final reference (PNG) |
-| `vigil-bg-mast.webp` | Point-cloud mast and factory skyline, full strength | Login, `/watch`, empty states | Working copy: WebP of a 1672×572 crop of a stacked preview. A 2560×1440 export replaces it under the same name. |
-| `vigil-bg-mast-dim.webp` | The same image, darker and blurrier | Behind `/talk` with frosted panels | Working copy: WebP of a 1672×368 crop. A 2560×1440 export replaces it under the same name. |
+| `vigil-bg-mast.webp` | Point-cloud mast and factory skyline, full strength | Login, `/watch`, empty states | Final, 2560×1440 (WebP, 78 KB). |
+| `vigil-bg-mast-dim.webp` | The same image, darker and blurrier | Behind `/talk` with frosted panels | Final, 2560×1440 (WebP, 23 KB). A thin stray band at the top edge of the export was trimmed (34 px) and the image re-scaled to 2560×1440. |
 
 Not committed: two superseded first-round images (a photographic mast on a foggy hill, and a
 point-cloud tower over a factory with a moon).
 
 **Shipping rules:** served from the repo, never fetched; WebP at most 200 KB each (the two
-backgrounds are 41 KB and 5 KB, `cwebp -q 82 -m 6`); operational pages (`/`, `/jobs`,
+backgrounds are 78 KB and 23 KB, `cwebp -q 82 -m 6`); operational pages (`/`, `/jobs`,
 `/job/:id`, `/review`) stay flat, with at most the dim variant at about 6% opacity behind the
 left nav.
 
