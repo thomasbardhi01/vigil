@@ -24,6 +24,7 @@ reviewer, auditor or coord packet includes them
 | `model-auto-routing.md` | Route on verifier outcomes, not on prompts | 2026-10-30 | §10, R13, p3-36–p3-40, p3-49 |
 | `landing-and-trust-ladder.md` | Conflict-free landing, Lauren Tan's trust ladder, the one-app question, and Vigil as a service | 2026-10-31 | §7, R15–R21, p3-09, p3-05, p3-47, p3-48 |
 | `rust-and-retrieval.md` | Vigil and Rust: code-retrieval evidence, Rust AI infrastructure, and a Rust target stack | 2026-11-01 | R26, p3-63, experiment #17's design |
+| `the-lab-assessment.md` | "The Lab" inside Vigil: assessment of the ChatGPT research-lab proposal | 2026-11-01 | R27, p3-64–p3-68, experiments #25–#26 (an advisor assessment of an owner-supplied report with unverified citations) |
 
 Paths inside the reports (`/home/claude/reports/…`, `/home/claude/vigil/…`)
 are the research environment's, not this repo's; the report each one names is
