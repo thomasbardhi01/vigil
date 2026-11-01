@@ -905,3 +905,40 @@ def test_rework_replace_retried_after_a_crash_keeps_the_first_old_tip(
                 title="t2", body="rebuilt", pulls=pulls, scope=["docs/feature-map.md"],
                 existing=url, replace=f"{TID}/1")  # fmt: skip
     assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
+
+
+def test_rework_replace_after_a_crash_before_the_record_is_recorded_not_pushed_again(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Owner, 2026-11-01: vigild pushed the rebuilt head and died before recording it. The
+    retry finds the remote tip already equal to what it would send: it records it and goes
+    on. No BranchMoved, no second push, and the kept ref is still the old tip."""
+    ws, base, head, bare = setup
+    pulls = EditablePulls(bare)
+    url = _pub(ws, base, head, pulls)
+    old = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    base2, head2 = _rebuilt_on_new_main(ws, tmp_path, fixture_repo)
+    kw: dict[str, Any] = dict(repo=REPO, head=head2, base_sha=base2, branch=BRANCH,
+                              base="main", title="t2", body="rebuilt", pulls=pulls,
+                              scope=["docs/feature-map.md"], existing=url,
+                              replace=f"{TID}/1")  # fmt: skip
+    record = ws.record_published
+
+    def crash(*a: Any) -> None:
+        raise SystemExit("vigild died after the push")
+
+    monkeypatch.setattr(ws, "record_published", crash)
+    with pytest.raises(SystemExit):
+        publish(ws, **kw)
+    sent = git(bare, "rev-parse", f"refs/heads/{BRANCH}")
+    assert sent != old
+    monkeypatch.setattr(ws, "record_published", record)
+    pushes: list[Any] = []
+    real_push = ws.push
+    monkeypatch.setattr(ws, "push", lambda *a, **k: (pushes.append(a), real_push(*a, **k)))
+    publish(ws, **kw)
+    assert pushes == []
+    assert ws.published_sha(REPO, BRANCH) == sent
+    assert git(bare, "rev-parse", f"refs/heads/{BRANCH}") == sent
+    assert git(ws.vault(REPO), "rev-parse", f"refs/vigil/rework/{TID}/1") == old
