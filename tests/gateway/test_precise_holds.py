@@ -1477,3 +1477,17 @@ def test_a_string_content_repeats_its_one_text_block_form(
     h = _pre(gw, tok, n1)
     assert h.reason == "prefix", [e.data for e in store.events() if e.type == "prefix_miss"]
     assert h.cached_tokens == 9_000
+
+
+def test_a_string_system_matches_its_one_text_block_form(
+    client: TestClient, gw: Gateway, store: Store, budget: Budget, upstream: Upstream,
+    clock: list[float],
+) -> None:  # fmt: skip
+    """Review round 1: the same holds for the top-level `system`."""
+    turns = _cc_turns(2)
+    n = _cc(turns[:3], marker_at=2)
+    tok = _cc_session(client, gw, store, budget, upstream, n)
+    clock[0] += 10
+    n1 = _cc(turns, marker_at=4)
+    n1["system"] = n["system"][0]["text"]
+    assert _pre(gw, tok, n1).reason == "prefix"
