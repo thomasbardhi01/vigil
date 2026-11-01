@@ -321,6 +321,10 @@ def test_the_landing_step_is_last_after_the_call_holds_and_idempotent(tmp_path: 
     conn.close()
     store = Store.open(path)
     assert {"verified_sha", "verified_main", "landed_sha"} <= _cols(store, "tasks")
+    # inserts name their columns: a task is still created on the widened table
+    job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    store.create_task(job.id, {"task_id": f"{job.id}-w1"}, "claude")
+    assert store.get_task(f"{job.id}-w1").state == "submitted"
     db.migrate(store.conn)
     db.migrate(store.conn)
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

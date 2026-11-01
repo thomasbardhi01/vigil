@@ -934,7 +934,9 @@ class Store:
     ) -> TaskRow:
         tid = str(contract["task_id"])
         self.x(
-            "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?)",
+            # named columns: later migration steps add columns (p3-09's `_m21_landing`)
+            "INSERT INTO tasks (id, job_id, contract, state, tier, tier_reason, backend_preset,"
+            " created_at, provenance) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 tid,
                 job_id,
