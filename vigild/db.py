@@ -504,6 +504,16 @@ def _m20_call_holds(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "model_calls", {"hold_usd": "REAL", "hold_reason": "TEXT"})
 
 
+def _m21_landing(conn: sqlite3.Connection) -> None:
+    """p3-09 (owner, 2026-11-01): each task records the commit vigild verified and sent
+    (`verified_sha`), the main it was rebased on and verified against (`verified_main`),
+    and the commit that landed (`landed_sha`). A merge is accepted only for `verified_sha`.
+    Rows from before keep NULL."""
+    _add_columns(
+        conn, "tasks", {"verified_sha": "TEXT", "verified_main": "TEXT", "landed_sha": "TEXT"}
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -525,6 +535,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m18_call_key,
     _m19_calls_backend_index,
     _m20_call_holds,
+    _m21_landing,
 ]
 
 

@@ -396,7 +396,9 @@ flowchart TD
 
 - `jobs`: one row per job: state, `blocked_from`, `parent_job_id` and
   `fix_depth` (lineage; depth ≤ 3), the coord session.
-- `tasks`: the contract as routed: `tier`, `tier_reason`, preset, state.
+- `tasks`: the contract as routed: `tier`, `tier_reason`, preset, state; and, once landed
+  (p3-09, `vigild/github/landing.py`), `verified_sha` (the commit vigild verified and sent,
+  the only head a merge is accepted for), `verified_main` and `landed_sha`.
 - `sessions`: one attempt in one container; role `coord`, `worker`,
   `reviewer`, `auditor` or `subagent`; parent session (the tree); status,
   branch, PR, cost, tokens, trace id.

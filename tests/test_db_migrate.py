@@ -278,11 +278,13 @@ def test_the_call_holds_step_is_last_and_idempotent(tmp_path: Path) -> None:
     """vi-0019 A1 carry-over (a): each metered call records the hold the gateway placed for
     it and why (`model_calls.hold_usd`, `hold_reason`), so holds are recorded, not
     reconstructed. The step is appended last; rows from before keep NULL; it runs twice."""
-    assert db.MIGRATIONS[-1].__name__ == "_m20_call_holds"
+    names = [m.__name__ for m in db.MIGRATIONS]
+    at = names.index("_m20_call_holds")
+    assert names[at - 1] == "_m19_calls_backend_index"  # appended after #29's index
     path = tmp_path / "holds.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
-    for step in db.MIGRATIONS[:-1]:
+    for step in db.MIGRATIONS[:at]:
         step(conn)
     conn.execute(
         "INSERT INTO model_calls (purpose, provider, model, tokens_in, tokens_out,"
@@ -297,6 +299,28 @@ def test_the_call_holds_step_is_last_and_idempotent(tmp_path: Path) -> None:
     assert {"hold_usd", "hold_reason"} <= _cols(store, "model_calls")
     (row,) = store.q("SELECT hold_usd, hold_reason FROM model_calls")
     assert row["hold_usd"] is None and row["hold_reason"] is None
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
+
+
+def test_the_landing_step_is_last_after_the_call_holds_and_idempotent(tmp_path: Path) -> None:
+    """p3-09 (owner, 2026-11-01: appended after `_m20_call_holds`): each task records the
+    commit vigild verified and sent (`verified_sha`), the main it was rebased on and verified
+    against (`verified_main`), and the commit that landed (`landed_sha`). Rows from before
+    keep NULL; the step runs twice."""
+    names = [m.__name__ for m in db.MIGRATIONS]
+    assert names[-2:] == ["_m20_call_holds", "_m21_landing"]
+    path = tmp_path / "landing.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:-1]:
+        step(conn)
+    conn.commit()
+    assert "verified_sha" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+    conn.close()
+    store = Store.open(path)
+    assert {"verified_sha", "verified_main", "landed_sha"} <= _cols(store, "tasks")
     db.migrate(store.conn)
     db.migrate(store.conn)
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

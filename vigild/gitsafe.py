@@ -72,7 +72,9 @@ def git(
     raw: bool = False,
     stdin: str | None = None,
     env: dict[str, str] | None = None,
+    ok: tuple[int, ...] = (0,),
 ) -> str:
+    """`ok`: the exit codes that are not a failure (`merge-tree` exits 1 on a conflict)."""
     out = subprocess.run(
         ["git", *HARDENING, *args],
         cwd=cwd,
@@ -83,7 +85,7 @@ def git(
         check=False,
         input=stdin,
     )
-    if out.returncode != 0:
+    if out.returncode not in ok:
         err = out.stderr if isinstance(out.stderr, str) else out.stderr.decode(errors="replace")
         raise GitError(f"git {args[0]} failed: {err.strip()[:300]}")
     stdout = out.stdout if isinstance(out.stdout, str) else out.stdout.decode(errors="replace")

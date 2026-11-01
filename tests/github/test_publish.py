@@ -684,3 +684,43 @@ def test_the_landing_queue_is_one_lander_per_repo_first_approved_first() -> None
     assert q.take("o/b") == "u1"  # another repo is not held up
     q.done("o/a", "t1")
     assert q.take("o/a") == "t2"
+
+
+def test_every_git_call_in_landing_goes_through_gitsafe(
+    setup: tuple[Workspace, str, str, Path], fixture_repo: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """p3-09 (owner, 2026-11-01): landing runs git only through `vigild.gitsafe`: every git
+    process it starts carries gitsafe's hardening (no hooks, no system or global config, no
+    external diff), and the module never imports `subprocess` itself."""
+    import ast
+    import inspect
+    import subprocess as sp
+
+    from vigild import gitsafe
+
+    m = _landing()
+    tree = ast.parse(inspect.getsource(m))
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import | ast.ImportFrom)
+                for a in n.names} | {n.module for n in ast.walk(tree)
+                if isinstance(n, ast.ImportFrom) and n.module}  # fmt: skip
+    assert not imported & {"subprocess", "os"}, imported
+    ws, base, head, bare = setup
+    _main_commit(fixture_repo["seed"], bare, GEN, "# Feature map\nmain's row\n", "x")
+    real = sp.run
+    seen: list[list[str]] = []
+
+    def spy(argv: Any, *a: Any, **kw: Any) -> Any:
+        cwd = Path(str(kw.get("cwd", "")))
+        # vigild's own git, in its data dir (the fake GitHub's helper git is not landing's)
+        if isinstance(argv, list) and argv and argv[0] == "git" and ws.data_dir in cwd.parents:
+            seen.append(argv)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(sp, "run", spy)
+    res = _land(ws, base, head, FakePulls(bare), Verifier(), generated=[GEN], regen=Regen())
+    assert res.outcome == "landed"
+    assert seen, "landing ran no git at all"
+    hardening = list(gitsafe.HARDENING)
+    for argv in seen:
+        assert argv[1 : 1 + len(hardening)] == hardening, argv[:6]

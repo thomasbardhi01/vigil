@@ -50,8 +50,9 @@ from, and a PR whose base moved conflicts or lands an unverified tree. After thi
 
 ## Schema (after the gateway PR merges, appended after `_m20_call_holds`)
 
-`jobs.verified_sha`, `jobs.landed_sha` and the per-task `main_sha` it was verified on (plan
-§11). Until then the tests use the vault's records only.
+`_m21_landing`, appended after `_m20_call_holds`: `tasks.verified_sha`, `tasks.verified_main`,
+`tasks.landed_sha`. On `tasks`, not `jobs` (plan §11), because a job can have several task
+PRs and each has its own verified head.
 
 ## Not in this item
 
