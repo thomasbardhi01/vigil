@@ -18,7 +18,7 @@ Two arms: `fork` (resume the failed attempt's transcript) and `fresh` (new conte
 
 ## Frozen revision and pins (model, harness, prompt revision, dev-image digest)
 
-unknown
+Pre-registered before any run (ADR-0007 amendment d): temperature, seeds per (task, sample index), the quant and the llama.cpp build hash for a tower arm. Other pins unknown.
 
 ## Task set and admission audit
 
@@ -42,7 +42,7 @@ unknown
 
 ## Limitations
 
-unknown
+A retry arm on the tower is scored by hidden tests only; nothing selects by them (ADR-0007 amendment d). A difference is credited only above the run-to-run spread of k ≥ 3 repeats.
 
 ## Reproduction command
 
